@@ -403,16 +403,24 @@ fn layout_sidebar(
             });
         }
 
-        // Inject the outline right under the active file row.
+        // Inject the outline right under the active file row, visually
+        // nested one step deeper than the file so it reads as a sub-part
+        // of the document rather than a sibling tree entry.
         if is_active {
+            // The active row's text starts at `indent + marker_width +
+            // pad`. The marker is a single char rendered at `size`; a
+            // cheap-enough approximation is 1em (== `size`). Step in one
+            // extra level so the first outline entry sits clearly to
+            // the right of the file name.
+            let file_text_x = indent + size + size * 0.25;
+            let base_indent = file_text_x + 6.0;
+            let step = 10.0;
             for o in outline {
                 let row_y_o = y;
                 y += row_h;
                 if row_y_o + row_h < 0.0 || row_y_o > height {
                     continue;
                 }
-                let base_indent = 14.0;
-                let step = 12.0;
                 let oindent = base_indent + (o.level.saturating_sub(1) as f32) * step;
                 let baseline_o = row_y_o + row_h * 0.5 + size * 0.35;
                 let color_o = theme.muted;
