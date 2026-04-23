@@ -665,7 +665,12 @@ impl App {
         if snap.sidebar_width <= 0.0 {
             return;
         }
-        let content_h = sidebar_content_height(&snap.theme, tree.len(), snap.sidebar_zoom);
+        let outline_len = if snap.source_path.is_some() {
+            crate::md::count_headings(&snap.source)
+        } else {
+            0
+        };
+        let content_h = sidebar_content_height(&snap.theme, tree.len(), outline_len, snap.sidebar_zoom);
         let max_scroll = (content_h - snap.viewport.height as f32).max(0.0);
         let mut s = self.shared.state.lock().unwrap();
         if s.sidebar_scroll > max_scroll {
@@ -682,7 +687,12 @@ impl App {
         if snap.sidebar_width <= 0.0 {
             return None;
         }
-        let content_h = sidebar_content_height(&snap.theme, tree.len(), snap.sidebar_zoom);
+        let outline_len = if snap.source_path.is_some() {
+            crate::md::count_headings(&snap.source)
+        } else {
+            0
+        };
+        let content_h = sidebar_content_height(&snap.theme, tree.len(), outline_len, snap.sidebar_zoom);
         sidebar_scrollbar_geom(
             snap.sidebar_width,
             snap.viewport.height as f32,
@@ -855,6 +865,38 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
         }
         HitAction::CopyCode(text) => {
             clipboard::copy(text);
+        }
+        HitAction::ScrollTo(y) => {
+            // Clamp against the actual doc height so clicking "Smallest
+            // heading" near the end doesn't scroll past the bottom.
+            let theme = Theme::light();
+            let (source, vw, vh, base_dir, sidebar_w, content_zoom) = {
+                let s = shared.state.lock().unwrap();
+                (
+                    s.source.clone(),
+                    s.viewport.width,
+                    s.viewport.height as f32,
+                    s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
+                    s.sidebar_width,
+                    s.content_zoom,
+                )
+            };
+            let mut images = shared.images.lock().unwrap();
+            let doc_h = measure(
+                &source,
+                vw,
+                vh as u32,
+                base_dir.as_deref(),
+                sidebar_w,
+                content_zoom,
+                &theme,
+                &shared.fonts,
+                &mut images,
+            );
+            drop(images);
+            let max_scroll = (doc_h - vh).max(0.0);
+            let mut s = shared.state.lock().unwrap();
+            s.scroll = (*y - 8.0).clamp(0.0, max_scroll);
         }
     }
     Some(action)

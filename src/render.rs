@@ -238,14 +238,19 @@ pub fn in_sidebar_scrollbar_strip(g: &SbGeom, sidebar_width: f32, x: f32, y: f32
     x >= strip_left && x < strip_right && y >= g.track_y && y < g.track_y + g.track_h
 }
 
-/// Total content height of the sidebar tree. Pure formula — no layout pass
-/// needed. Used by callers that need to clamp sidebar_scroll without
-/// re-laying out the whole document.
-pub fn sidebar_content_height(theme: &Theme, tree_len: usize, sidebar_zoom: f32) -> f32 {
+/// Total content height of the sidebar tree plus outline rows. Pure formula
+/// — no layout pass needed. Used by callers that need to clamp
+/// sidebar_scroll without re-laying out the whole document.
+pub fn sidebar_content_height(
+    theme: &Theme,
+    tree_len: usize,
+    outline_len: usize,
+    sidebar_zoom: f32,
+) -> f32 {
     let size = theme.body_size * 0.82 * sidebar_zoom;
     let row_h = size * 1.5;
     let top_pad = theme.margin_y * 0.5;
-    top_pad * 2.0 + row_h * tree_len as f32
+    top_pad * 2.0 + row_h * (tree_len + outline_len) as f32
 }
 
 /// Returns (pinned_hits, content_hits). Pinned hits (sidebar tree rows) are

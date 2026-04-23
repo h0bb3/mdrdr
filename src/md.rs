@@ -44,6 +44,33 @@ pub enum Block {
     },
 }
 
+/// Cheap pass to count top-level headings for sidebar-outline sizing,
+/// without constructing the full Block vec.
+pub fn count_headings(src: &str) -> usize {
+    let mut n = 0;
+    let mut in_fence = false;
+    for line in src.lines() {
+        let trim = line.trim_start();
+        if trim.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if trim.starts_with('#') {
+            let hashes = trim.chars().take_while(|c| *c == '#').count();
+            if hashes >= 1
+                && hashes <= 6
+                && trim.as_bytes().get(hashes).copied() == Some(b' ')
+            {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 pub fn parse(src: &str) -> Vec<Block> {
     let lines: Vec<&str> = src.lines().collect();
     parse_lines(&lines)

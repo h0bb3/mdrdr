@@ -302,6 +302,7 @@ fn action_json(a: &crate::layout::HitAction) -> String {
         Toggle(p) => format!("{{\"kind\":\"toggle\",\"path\":\"{}\"}}", json_escape(&p.display().to_string())),
         OpenUrl(u) => format!("{{\"kind\":\"url\",\"url\":\"{}\"}}", json_escape(u)),
         CopyCode(_) => "{\"kind\":\"copy_code\"}".to_string(),
+        ScrollTo(y) => format!("{{\"kind\":\"scroll_to\",\"y\":{:.3}}}", y),
     }
 }
 
@@ -416,8 +417,17 @@ fn clamp_sidebar_scroll(shared: &Arc<Shared>) {
     if snap.sidebar_width <= 0.0 {
         return;
     }
-    let content_h =
-        crate::render::sidebar_content_height(&snap.theme, tree.len(), snap.sidebar_zoom);
+    let outline_len = if snap.source_path.is_some() {
+        crate::md::count_headings(&snap.source)
+    } else {
+        0
+    };
+    let content_h = crate::render::sidebar_content_height(
+        &snap.theme,
+        tree.len(),
+        outline_len,
+        snap.sidebar_zoom,
+    );
     let max_scroll = (content_h - snap.viewport.height as f32).max(0.0);
     let mut s = shared.state.lock().unwrap();
     if s.sidebar_scroll > max_scroll {

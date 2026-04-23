@@ -81,6 +81,19 @@ pub enum HitAction {
     Toggle(PathBuf),
     OpenUrl(String),
     CopyCode(String),
+    /// Scroll the content panel to this document y-coord. Used by the
+    /// sidebar outline entries.
+    ScrollTo(f32),
+}
+
+/// A heading captured during content layout, used to build the sidebar
+/// outline under the active file.
+#[derive(Debug, Clone)]
+pub struct OutlineEntry {
+    pub level: u8,
+    pub text: String,
+    /// Document y-coord where the heading begins.
+    pub doc_y: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +118,8 @@ pub struct Layout {
     /// Total pixel height needed to render every tree row. Used to clamp
     /// sidebar scroll and decide whether to draw the sidebar scrollbar.
     pub sidebar_content_height: f32,
+    /// Headings discovered during content layout, in document order.
+    pub outline: Vec<OutlineEntry>,
 }
 
 #[derive(Copy, Clone)]
@@ -165,7 +180,12 @@ pub struct LayoutInput<'a> {
 }
 
 pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
-    let sidebar_width = if input.tree.is_some() && input.sidebar_width > 0.0 {
+    // Reserve sidebar space whenever a width is set — even when `tree`
+    // is None (e.g. `measure()` which skips sidebar drawing). Otherwise
+    // measurement uses a wider content column than rendering and the
+    // reported doc_height is too small, which makes max-scroll clamp
+    // before the real bottom of the document.
+    let sidebar_width = if input.sidebar_width > 0.0 {
         input.sidebar_width
     } else {
         0.0
@@ -186,10 +206,12 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
 
     let mut content_items: Vec<Placed> = Vec::new();
     let mut content_hit_targets: Vec<HitTarget> = Vec::new();
+    let mut outline: Vec<OutlineEntry> = Vec::new();
     let doc_height = {
         let mut ctx = Ctx {
             items: &mut content_items,
             content_hits: &mut content_hit_targets,
+            outline: &mut outline,
             y: content_theme.margin_y,
             content_left,
             content_right,
@@ -211,6 +233,7 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
         sidebar_content_height = layout_sidebar(
             tree,
             input.active_path,
+            &outline,
             sidebar_width,
             input.viewport_h as f32,
             input.sidebar_scroll,
@@ -230,6 +253,7 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
         doc_height,
         sidebar_width,
         sidebar_content_height,
+        outline,
     }
 }
 
@@ -239,6 +263,7 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
 fn layout_sidebar(
     tree: &[TreeEntry],
     active: Option<&Path>,
+    outline: &[OutlineEntry],
     width: f32,
     height: f32,
     sidebar_scroll: f32,
@@ -259,7 +284,9 @@ fn layout_sidebar(
     let size = theme.body_size * 0.82 * sidebar_zoom;
     let row_h = size * 1.5;
     let top_pad = theme.margin_y * 0.5;
-    let content_h = top_pad * 2.0 + row_h * tree.len() as f32;
+    // Outline rows render a touch smaller and at the same row height.
+    let outline_rows = if active.is_some() { outline.len() } else { 0 };
+    let content_h = top_pad * 2.0 + row_h * (tree.len() as f32 + outline_rows as f32);
     let mut y = top_pad - sidebar_scroll;
 
     for entry in tree {
@@ -373,6 +400,61 @@ fn layout_sidebar(
                 action,
             });
         }
+
+        // Inject the outline right under the active file row.
+        if is_active {
+            for o in outline {
+                let row_y_o = y;
+                y += row_h;
+                if row_y_o + row_h < 0.0 || row_y_o > height {
+                    continue;
+                }
+                let base_indent = 14.0;
+                let step = 12.0;
+                let oindent = base_indent + (o.level.saturating_sub(1) as f32) * step;
+                let baseline_o = row_y_o + row_h * 0.5 + size * 0.35;
+                let color_o = theme.muted;
+                let font_o = pick_font(fonts, FontId::Body);
+                let mut x_o = oindent;
+                let max_name_x = width - 8.0 - right_inset;
+                for ch in o.text.chars() {
+                    let m = font_o.metrics(ch, size);
+                    if x_o + m.advance_width > max_name_x {
+                        let e = font_o.metrics('…', size);
+                        items.push(Placed::Glyph {
+                            ch: '…',
+                            font: FontId::Body,
+                            size,
+                            x: x_o,
+                            baseline: baseline_o,
+                            color: color_o,
+                        });
+                        x_o += e.advance_width;
+                        break;
+                    }
+                    items.push(Placed::Glyph {
+                        ch,
+                        font: FontId::Body,
+                        size,
+                        x: x_o,
+                        baseline: baseline_o,
+                        color: color_o,
+                    });
+                    x_o += m.advance_width;
+                }
+                let clipped_top_o = row_y_o.max(0.0);
+                let clipped_bot_o = (row_y_o + row_h).min(height);
+                if clipped_bot_o > clipped_top_o {
+                    hits.push(HitTarget {
+                        x: 0.0,
+                        y: clipped_top_o,
+                        w: row_w,
+                        h: clipped_bot_o - clipped_top_o,
+                        action: HitAction::ScrollTo(o.doc_y),
+                    });
+                }
+            }
+        }
     }
 
     // Thin scrollbar stripe on the sidebar's right edge. Geometry comes
@@ -399,6 +481,7 @@ fn layout_sidebar(
 struct Ctx<'a> {
     items: &'a mut Vec<Placed>,
     content_hits: &'a mut Vec<HitTarget>,
+    outline: &'a mut Vec<OutlineEntry>,
     y: f32,
     content_left: f32,
     content_right: f32,
@@ -413,6 +496,7 @@ impl<'a> Ctx<'a> {
         match block {
             Block::Heading { level, inlines } => {
                 self.y += self.theme.body_size * 0.8;
+                let heading_start_y = self.y;
                 let size = heading_size(self.theme.heading_size, *level);
                 let style = Style {
                     bold: true,
@@ -424,6 +508,11 @@ impl<'a> Ctx<'a> {
                 };
                 self.paragraph(inlines, style, indent);
                 self.y += size * 0.15;
+                self.outline.push(OutlineEntry {
+                    level: *level,
+                    text: inlines_to_plain(inlines),
+                    doc_y: heading_start_y,
+                });
             }
             Block::Paragraph(inlines) => {
                 if let Some((alt, src)) = single_image(inlines) {
@@ -1032,6 +1121,26 @@ impl<'a> Ctx<'a> {
         y_top = emit_line(self, &mut line, &words, left, y_top);
         self.y = y_top;
     }
+}
+
+/// Flatten an inline tree to plain text (for the outline / accessibility).
+fn inlines_to_plain(inlines: &[Inline]) -> String {
+    let mut out = String::new();
+    for i in inlines {
+        match i {
+            Inline::Text(s) => out.push_str(s),
+            Inline::Code(s) => out.push_str(s),
+            Inline::Math(s) => out.push_str(s),
+            Inline::Bold(inner) | Inline::Italic(inner) => {
+                out.push_str(&inlines_to_plain(inner));
+            }
+            Inline::Link { text, .. } => {
+                out.push_str(&inlines_to_plain(text));
+            }
+            Inline::Image { alt, .. } => out.push_str(alt),
+        }
+    }
+    out
 }
 
 /// If `inlines` reduces to a single Image (optionally surrounded by
