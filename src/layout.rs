@@ -145,11 +145,13 @@ pub struct LayoutInput<'a> {
     pub viewport_h: u32,
     pub theme: &'a Theme,
     pub fonts: &'a Fonts,
+    /// Width of the file-tree sidebar. 0 → hidden.
+    pub sidebar_width: f32,
 }
 
 pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
-    let sidebar_width = if input.tree.is_some() {
-        SIDEBAR_WIDTH_DEFAULT
+    let sidebar_width = if input.tree.is_some() && input.sidebar_width > 0.0 {
+        input.sidebar_width
     } else {
         0.0
     };
@@ -177,7 +179,7 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
 
     let mut pinned_items = Vec::new();
     let mut hit_targets = Vec::new();
-    if let Some(tree) = input.tree {
+    if let (Some(tree), true) = (input.tree, sidebar_width > 0.0) {
         layout_sidebar(
             tree,
             input.active_path,

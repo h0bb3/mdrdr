@@ -67,6 +67,7 @@ pub struct RenderInput<'a> {
     pub tree: Option<&'a [TreeEntry]>,
     pub active_path: Option<&'a Path>,
     pub base_dir: Option<&'a Path>,
+    pub sidebar_width: f32,
 }
 
 pub fn render(input: &RenderInput, images: &mut ImageCache) -> Framebuffer {
@@ -81,6 +82,7 @@ pub fn render(input: &RenderInput, images: &mut ImageCache) -> Framebuffer {
             viewport_h: input.viewport.height,
             theme: input.theme,
             fonts: input.fonts,
+            sidebar_width: input.sidebar_width,
         },
         images,
     );
@@ -92,6 +94,7 @@ pub fn measure(
     viewport_w: u32,
     viewport_h: u32,
     base_dir: Option<&Path>,
+    sidebar_width: f32,
     theme: &Theme,
     fonts: &Fonts,
     images: &mut ImageCache,
@@ -107,6 +110,7 @@ pub fn measure(
             viewport_h,
             theme,
             fonts,
+            sidebar_width,
         },
         images,
     );
@@ -131,6 +135,7 @@ pub fn compute_hit_targets(input: &RenderInput, images: &mut ImageCache) -> Vec<
             viewport_h: input.viewport.height,
             theme: input.theme,
             fonts: input.fonts,
+            sidebar_width: input.sidebar_width,
         },
         images,
     );
@@ -147,7 +152,33 @@ fn draw(
     let mut fb = Framebuffer::new(viewport.width, viewport.height, theme.bg);
     draw_items(&mut fb, &lay.content_items, scroll, viewport, fonts);
     draw_items(&mut fb, &lay.pinned_items, 0.0, viewport, fonts);
+    draw_scrollbar(&mut fb, viewport, scroll, lay.doc_height, theme);
     fb
+}
+
+fn draw_scrollbar(
+    fb: &mut Framebuffer,
+    viewport: Viewport,
+    scroll: f32,
+    doc_height: f32,
+    theme: &Theme,
+) {
+    let vh = viewport.height as f32;
+    let vw = viewport.width as i32;
+    if doc_height <= vh + 1.0 {
+        return;
+    }
+    let track_w: i32 = 8;
+    let track_x = vw - track_w - 2;
+    let track_color: [u8; 4] = [theme.muted[0], theme.muted[1], theme.muted[2], 40];
+    fb.fill_rect(track_x, 0, track_w, viewport.height as i32, track_color);
+
+    let thumb_h = ((vh / doc_height) * vh).max(40.0);
+    let max_scroll = (doc_height - vh).max(1.0);
+    let frac = (scroll / max_scroll).clamp(0.0, 1.0);
+    let thumb_y = frac * (vh - thumb_h);
+    let thumb_color: [u8; 4] = [theme.muted[0], theme.muted[1], theme.muted[2], 180];
+    fb.fill_rect(track_x, thumb_y as i32, track_w, thumb_h as i32, thumb_color);
 }
 
 fn draw_items(

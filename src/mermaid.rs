@@ -386,9 +386,18 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
         }
     }
 
-    // Scale down to max_width if needed.
-    let scale = if total_w > max_width && max_width > 0.0 {
+    // Fit the diagram to the available width.
+    //   - If it's too wide, scale down so it exactly fits.
+    //   - If it's too narrow, scale up proportionally (capped at 1.6x) so
+    //     the graph actually uses the space. A small graph in a wide window
+    //     looked cramped otherwise.
+    let target = max_width * 0.92;
+    let scale = if max_width <= 0.0 || total_w <= 0.0 {
+        1.0
+    } else if total_w > max_width {
         max_width / total_w
+    } else if total_w < target {
+        (target / total_w).min(1.6)
     } else {
         1.0
     };

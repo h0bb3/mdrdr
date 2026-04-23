@@ -70,6 +70,7 @@ fn handle(
         ("POST", "/resize") => do_resize(&mut stream, &shared, &proxy, &q),
         ("POST", "/open") => do_open(&mut stream, &shared, &proxy, &q),
         ("POST", "/click") => do_click(&mut stream, &shared, &proxy, &q),
+        ("POST", "/sidebar") => do_sidebar(&mut stream, &shared, &proxy, &q),
         ("POST", "/quit") => do_quit(&mut stream, &proxy),
         ("GET", "/") => ok_text(&mut stream, INDEX),
         _ => not_found(&mut stream),
@@ -91,11 +92,12 @@ fn state_json(shared: &Arc<Shared>) -> String {
         .map(|t| format!("\"{}\"", json_escape(&t.root.display().to_string())))
         .unwrap_or_else(|| "null".to_string());
     format!(
-        "{{\"source_path\":{path_json},\"scroll\":{:.3},\"viewport\":{{\"w\":{},\"h\":{}}},\"source_len\":{},\"tree_root\":{root_json}}}",
+        "{{\"source_path\":{path_json},\"scroll\":{:.3},\"viewport\":{{\"w\":{},\"h\":{}}},\"source_len\":{},\"tree_root\":{root_json},\"sidebar_width\":{:.1}}}",
         s.scroll,
         s.viewport.width,
         s.viewport.height,
-        s.source.len()
+        s.source.len(),
+        s.sidebar_width,
     )
 }
 
@@ -147,6 +149,7 @@ fn screenshot(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<(
             tree: snap.tree_flat.as_deref(),
             active_path: snap.source_path.as_deref(),
             base_dir: base_dir.as_deref(),
+            sidebar_width: snap.sidebar_width,
         },
         &mut images,
     );
@@ -247,6 +250,41 @@ fn action_json(a: &crate::layout::HitAction) -> String {
         Open(p) => format!("{{\"kind\":\"open\",\"path\":\"{}\"}}", json_escape(&p.display().to_string())),
         Toggle(p) => format!("{{\"kind\":\"toggle\",\"path\":\"{}\"}}", json_escape(&p.display().to_string())),
     }
+}
+
+fn do_sidebar(
+    stream: &mut TcpStream,
+    shared: &Arc<Shared>,
+    proxy: &EventLoopProxy<UserEvent>,
+    q: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    {
+        let mut s = shared.state.lock().unwrap();
+        if let Some(w) = q.get("w").and_then(|v| v.parse::<f32>().ok()) {
+            let w = w.clamp(0.0, 1000.0);
+            s.sidebar_width = w;
+            if w > 0.0 {
+                s.sidebar_width_restore = w;
+            }
+        }
+        if let Some(v) = q.get("visible") {
+            let on = v == "1" || v.eq_ignore_ascii_case("true");
+            if on {
+                s.sidebar_width = if s.sidebar_width_restore > 0.0 {
+                    s.sidebar_width_restore
+                } else {
+                    260.0
+                };
+            } else {
+                if s.sidebar_width > 0.0 {
+                    s.sidebar_width_restore = s.sidebar_width;
+                }
+                s.sidebar_width = 0.0;
+            }
+        }
+    }
+    let _ = proxy.send_event(UserEvent::Redraw);
+    ok_json(stream, &state_json(shared))
 }
 
 fn do_quit(stream: &mut TcpStream, proxy: &EventLoopProxy<UserEvent>) -> std::io::Result<()> {
@@ -377,5 +415,7 @@ mdrdr api
   POST /resize?w=N&h=N   — resize viewport (state only; window follows on redraw)
   POST /open?path=P      — load a file
   POST /click?x=X&y=Y    — simulate a left click at screen coords
+  POST /sidebar?w=N      — set sidebar width (0 hides it)
+  POST /sidebar?visible=0|1
   POST /quit             — exit
 ";

@@ -35,6 +35,12 @@ pub struct AppState {
     pub viewport: Viewport,
     pub tree: Option<FileTree>,
     pub last_mouse: PhysicalPosition<f64>,
+    /// Current sidebar width. 0 → hidden. The last non-zero value is cached
+    /// in `sidebar_width_restore` so toggling brings it back.
+    pub sidebar_width: f32,
+    pub sidebar_width_restore: f32,
+    /// True while the user is dragging the sidebar's right edge.
+    pub sidebar_dragging: bool,
 }
 
 pub struct Shared {
@@ -53,6 +59,7 @@ impl Shared {
             viewport: s.viewport,
             tree_flat: s.tree.as_ref().map(|t| t.flatten()),
             theme: Theme::light(),
+            sidebar_width: s.sidebar_width,
         }
     }
 }
@@ -64,6 +71,7 @@ pub struct Snapshot {
     pub viewport: Viewport,
     pub tree_flat: Option<Vec<crate::tree::TreeEntry>>,
     pub theme: Theme,
+    pub sidebar_width: f32,
 }
 
 struct App {
@@ -121,18 +129,44 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                let mut s = self.shared.state.lock().unwrap();
-                s.last_mouse = position;
+                let (was_dragging, sidebar_w, tree_visible) = {
+                    let mut s = self.shared.state.lock().unwrap();
+                    s.last_mouse = position;
+                    (s.sidebar_dragging, s.sidebar_width, s.tree.is_some())
+                };
+                let _ = (sidebar_w, tree_visible);
+                if was_dragging {
+                    let new_w = (position.x as f32).clamp(120.0, 640.0);
+                    {
+                        let mut s = self.shared.state.lock().unwrap();
+                        s.sidebar_width = new_w;
+                        s.sidebar_width_restore = new_w;
+                    }
+                    self.request_redraw();
+                }
             }
 
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                let pos = {
+                let (pos, sidebar_w, tree_visible) = {
                     let s = self.shared.state.lock().unwrap();
-                    s.last_mouse
+                    (s.last_mouse, s.sidebar_width, s.tree.is_some())
                 };
-                click_at(&self.shared, pos.x as f32, pos.y as f32);
+                // Edge drag strip: 6px on either side of the sidebar's right edge.
+                if tree_visible && sidebar_w > 0.0
+                    && (pos.x as f32 - sidebar_w).abs() <= 6.0
+                {
+                    let mut s = self.shared.state.lock().unwrap();
+                    s.sidebar_dragging = true;
+                } else {
+                    click_at(&self.shared, pos.x as f32, pos.y as f32);
+                }
                 self.clamp_scroll();
                 self.request_redraw();
+            }
+
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                let mut s = self.shared.state.lock().unwrap();
+                s.sidebar_dragging = false;
             }
 
             WindowEvent::KeyboardInput {
@@ -161,12 +195,14 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     Key::Named(NamedKey::End) => {
                         let theme = Theme::light();
+                        let sidebar_w = self.shared.state.lock().unwrap().sidebar_width;
                         let mut images = self.shared.images.lock().unwrap();
                         let doc_h = measure(
                             &source,
                             vw,
                             vh as u32,
                             base_dir.as_deref(),
+                            sidebar_w,
                             &theme,
                             &self.shared.fonts,
                             &mut images,
@@ -179,6 +215,20 @@ impl ApplicationHandler<UserEvent> for App {
                     Key::Named(NamedKey::Escape) => {
                         event_loop.exit();
                         return;
+                    }
+                    Key::Character(c) if c == "b" => {
+                        let mut s = self.shared.state.lock().unwrap();
+                        if s.sidebar_width > 0.0 {
+                            s.sidebar_width_restore = s.sidebar_width;
+                            s.sidebar_width = 0.0;
+                        } else {
+                            s.sidebar_width = if s.sidebar_width_restore > 0.0 {
+                                s.sidebar_width_restore
+                            } else {
+                                260.0
+                            };
+                        }
+                        None
                     }
                     _ => None,
                 };
@@ -215,13 +265,14 @@ impl App {
 
     fn clamp_scroll(&self) {
         let theme = Theme::light();
-        let (source, vw, vh, base_dir) = {
+        let (source, vw, vh, base_dir, sidebar_w) = {
             let s = self.shared.state.lock().unwrap();
             (
                 s.source.clone(),
                 s.viewport.width,
                 s.viewport.height as f32,
                 s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
+                s.sidebar_width,
             )
         };
         let mut images = self.shared.images.lock().unwrap();
@@ -230,6 +281,7 @@ impl App {
             vw,
             vh as u32,
             base_dir.as_deref(),
+            sidebar_w,
             &theme,
             &self.shared.fonts,
             &mut images,
@@ -266,6 +318,7 @@ impl App {
                 tree: snap.tree_flat.as_deref(),
                 active_path: snap.source_path.as_deref(),
                 base_dir: base_dir.as_deref(),
+                sidebar_width: snap.sidebar_width,
             },
             &mut images,
         );
@@ -299,6 +352,7 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
                 tree: snap.tree_flat.as_deref(),
                 active_path: snap.source_path.as_deref(),
                 base_dir: base_dir.as_deref(),
+                sidebar_width: snap.sidebar_width,
             },
             &mut images,
         )
@@ -341,6 +395,9 @@ pub fn run(arg: Option<PathBuf>) -> ExitCode {
             viewport,
             tree,
             last_mouse: PhysicalPosition::new(0.0, 0.0),
+            sidebar_width: 260.0,
+            sidebar_width_restore: 260.0,
+            sidebar_dragging: false,
         }),
     });
 
