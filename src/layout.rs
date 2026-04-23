@@ -954,10 +954,26 @@ impl<'a> Ctx<'a> {
                 match &word.payload {
                     WordPayload::Text { glyphs, style } => {
                         let start_x = pen;
+                        // Emit a link hit-target for this word so clicks /
+                        // hovers inside table cells work just like in
+                        // paragraphs. Use the line's y_top (ascent/descent
+                        // aren't tracked here, approximate via base.size).
+                        let line_top = baseline - base.size * 0.85;
+                        let line_h = base.size * 1.1;
+                        if let Some(href) = &word.link_href {
+                            self.content_hits.push(HitTarget {
+                                x: start_x,
+                                y: line_top,
+                                w: word.width,
+                                h: line_h,
+                                action: HitAction::OpenUrl(href.as_ref().to_string()),
+                            });
+                        }
                         for g in glyphs {
+                            let fid = g.font.unwrap_or_else(|| style.font_id());
                             self.items.push(Placed::Glyph {
                                 ch: g.ch,
-                                font: style.font_id(),
+                                font: fid,
                                 size: style.size,
                                 x: pen,
                                 baseline,
