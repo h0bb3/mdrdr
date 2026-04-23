@@ -351,9 +351,13 @@ fn layout_sidebar(
         // Truncate name to fit.
         let max_name_x = width - 8.0;
         for ch in rel_name.chars() {
-            let m = font.metrics(ch, size);
+            let (glyph_font, fid) = if crate::font::is_emoji(ch) {
+                (&fonts.emoji, FontId::Emoji)
+            } else {
+                (font, font_id)
+            };
+            let m = glyph_font.metrics(ch, size);
             if x + m.advance_width > max_name_x {
-                // draw ellipsis and stop
                 let e = font.metrics('…', size);
                 items.push(Placed::Glyph {
                     ch: '…',
@@ -368,7 +372,7 @@ fn layout_sidebar(
             }
             items.push(Placed::Glyph {
                 ch,
-                font: font_id,
+                font: fid,
                 size,
                 x,
                 baseline,
@@ -424,13 +428,18 @@ fn layout_sidebar(
                 let oindent = base_indent + (o.level.saturating_sub(1) as f32) * step;
                 let baseline_o = row_y_o + row_h * 0.5 + size * 0.35;
                 let color_o = theme.muted;
-                let font_o = pick_font(fonts, FontId::Body);
+                let body = pick_font(fonts, FontId::Body);
                 let mut x_o = oindent;
                 let max_name_x = width - 8.0 - right_inset;
                 for ch in o.text.chars() {
-                    let m = font_o.metrics(ch, size);
+                    let (glyph_font, fid) = if crate::font::is_emoji(ch) {
+                        (&fonts.emoji, FontId::Emoji)
+                    } else {
+                        (body, FontId::Body)
+                    };
+                    let m = glyph_font.metrics(ch, size);
                     if x_o + m.advance_width > max_name_x {
-                        let e = font_o.metrics('…', size);
+                        let e = body.metrics('…', size);
                         items.push(Placed::Glyph {
                             ch: '…',
                             font: FontId::Body,
@@ -444,7 +453,7 @@ fn layout_sidebar(
                     }
                     items.push(Placed::Glyph {
                         ch,
-                        font: FontId::Body,
+                        font: fid,
                         size,
                         x: x_o,
                         baseline: baseline_o,
