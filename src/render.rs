@@ -68,6 +68,8 @@ pub struct RenderInput<'a> {
     pub active_path: Option<&'a Path>,
     pub base_dir: Option<&'a Path>,
     pub sidebar_width: f32,
+    /// (anchor, head) in document coordinates. None = no selection.
+    pub selection: Option<((f32, f32), (f32, f32))>,
 }
 
 pub fn render(input: &RenderInput, images: &mut ImageCache) -> Framebuffer {
@@ -86,7 +88,7 @@ pub fn render(input: &RenderInput, images: &mut ImageCache) -> Framebuffer {
         },
         images,
     );
-    draw(&lay, input.viewport, input.scroll, input.theme, input.fonts)
+    draw(&lay, input.viewport, input.scroll, input.theme, input.fonts, input.selection)
 }
 
 pub fn measure(
@@ -148,12 +150,189 @@ fn draw(
     scroll: f32,
     theme: &Theme,
     fonts: &Fonts,
+    selection: Option<((f32, f32), (f32, f32))>,
 ) -> Framebuffer {
     let mut fb = Framebuffer::new(viewport.width, viewport.height, theme.bg);
+
+    // Selection highlight goes *under* glyphs so text stays readable.
+    if let Some((a, h)) = selection {
+        let rects = selection_rects(&lay.content_items, a, h, fonts);
+        let hl: Rgba = [theme.accent[0], theme.accent[1], theme.accent[2], 55];
+        let vh = viewport.height as f32;
+        for (x, y, w, rh) in rects {
+            let sy = y - scroll;
+            if sy + rh < 0.0 || sy > vh {
+                continue;
+            }
+            fb.fill_rect(x as i32, sy as i32, w.ceil() as i32, rh.ceil() as i32, hl);
+        }
+    }
+
     draw_items(&mut fb, &lay.content_items, scroll, viewport, fonts);
     draw_items(&mut fb, &lay.pinned_items, 0.0, viewport, fonts);
     draw_scrollbar(&mut fb, viewport, scroll, lay.doc_height, theme);
     fb
+}
+
+/// Map a document point to the nearest glyph index in `items`.
+/// Returns 0 if the items list has no glyphs.
+fn glyph_index_at(items: &[Placed], doc_x: f32, doc_y: f32) -> usize {
+    // First: pick the line (baseline) closest to doc_y.
+    let mut best_bl: Option<f32> = None;
+    let mut best_bld = f32::MAX;
+    for item in items {
+        if let Placed::Glyph { baseline, .. } = item {
+            let d = (baseline - doc_y).abs();
+            if d < best_bld {
+                best_bld = d;
+                best_bl = Some(*baseline);
+            }
+        }
+    }
+    let Some(target) = best_bl else { return 0 };
+
+    // On that line, pick the glyph whose x is closest to doc_x (biased toward
+    // the glyph the click landed on or the one immediately before).
+    let mut best_idx = 0;
+    let mut best_dx = f32::MAX;
+    for (i, item) in items.iter().enumerate() {
+        if let Placed::Glyph { baseline, x, .. } = item {
+            if (baseline - target).abs() < 2.0 {
+                let d = (*x - doc_x).abs();
+                if d < best_dx {
+                    best_dx = d;
+                    best_idx = i;
+                }
+            }
+        }
+    }
+    best_idx
+}
+
+/// For each line in the selection range, produce a merged highlight rect.
+fn selection_rects(
+    items: &[Placed],
+    anchor: (f32, f32),
+    head: (f32, f32),
+    fonts: &Fonts,
+) -> Vec<(f32, f32, f32, f32)> {
+    if items.is_empty() {
+        return vec![];
+    }
+    let a_idx = glyph_index_at(items, anchor.0, anchor.1);
+    let h_idx = glyph_index_at(items, head.0, head.1);
+    let (start, end) = if a_idx <= h_idx { (a_idx, h_idx) } else { (h_idx, a_idx) };
+
+    let mut out: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let mut cur_baseline: Option<f32> = None;
+    let mut cur_x0: f32 = 0.0;
+    let mut cur_x1: f32 = 0.0;
+    let mut cur_size: f32 = 0.0;
+
+    for i in start..=end {
+        let Some(Placed::Glyph { ch, font, size, x, baseline, .. }) = items.get(i) else {
+            continue;
+        };
+        let f = pick_font(fonts, *font);
+        let advance = f.metrics(*ch, *size).advance_width;
+        let gx0 = *x;
+        let gx1 = *x + advance;
+
+        match cur_baseline {
+            Some(bl) if (bl - baseline).abs() < 2.0 => {
+                cur_x1 = cur_x1.max(gx1);
+                cur_size = cur_size.max(*size);
+            }
+            Some(bl) => {
+                out.push(line_rect(bl, cur_x0, cur_x1, cur_size));
+                cur_baseline = Some(*baseline);
+                cur_x0 = gx0;
+                cur_x1 = gx1;
+                cur_size = *size;
+                let _ = bl;
+            }
+            None => {
+                cur_baseline = Some(*baseline);
+                cur_x0 = gx0;
+                cur_x1 = gx1;
+                cur_size = *size;
+            }
+        }
+    }
+    if let Some(bl) = cur_baseline {
+        out.push(line_rect(bl, cur_x0, cur_x1, cur_size));
+    }
+    out
+}
+
+fn line_rect(baseline: f32, x0: f32, x1: f32, size: f32) -> (f32, f32, f32, f32) {
+    let top = baseline - size * 0.95;
+    let bot = baseline + size * 0.25;
+    (x0, top, (x1 - x0).max(1.0), bot - top)
+}
+
+/// Extract the selected text as plaintext. Used by /copy and Ctrl+C.
+pub fn extract_selection(
+    input: &RenderInput,
+    images: &mut ImageCache,
+) -> Option<String> {
+    let (anchor, head) = input.selection?;
+    let blocks = parse(input.source);
+    let lay = layout(
+        LayoutInput {
+            blocks: &blocks,
+            tree: input.tree,
+            active_path: input.active_path,
+            base_dir: input.base_dir,
+            viewport_w: input.viewport.width,
+            viewport_h: input.viewport.height,
+            theme: input.theme,
+            fonts: input.fonts,
+            sidebar_width: input.sidebar_width,
+        },
+        images,
+    );
+    Some(build_selection_text(&lay.content_items, anchor, head, input.fonts))
+}
+
+fn build_selection_text(
+    items: &[Placed],
+    anchor: (f32, f32),
+    head: (f32, f32),
+    fonts: &Fonts,
+) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let a_idx = glyph_index_at(items, anchor.0, anchor.1);
+    let h_idx = glyph_index_at(items, head.0, head.1);
+    let (start, end) = if a_idx <= h_idx { (a_idx, h_idx) } else { (h_idx, a_idx) };
+
+    let mut out = String::new();
+    let mut last_baseline: Option<f32> = None;
+    let mut last_xend: Option<f32> = None;
+
+    for i in start..=end {
+        let Some(Placed::Glyph { ch, font, size, x, baseline, .. }) = items.get(i) else {
+            continue;
+        };
+        if let Some(bl) = last_baseline {
+            if (baseline - bl).abs() > 2.0 {
+                out.push('\n');
+                last_xend = None;
+            } else if let Some(xe) = last_xend {
+                if x - xe > 1.0 {
+                    out.push(' ');
+                }
+            }
+        }
+        out.push(*ch);
+        let f = pick_font(fonts, *font);
+        let adv = f.metrics(*ch, *size).advance_width;
+        last_baseline = Some(*baseline);
+        last_xend = Some(*x + adv);
+    }
+    out
 }
 
 fn draw_scrollbar(

@@ -9,16 +9,17 @@ use std::sync::{Arc, Mutex};
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::api;
+use crate::clipboard;
 use crate::font::Fonts;
 use crate::images::ImageCache;
 use crate::layout::HitAction;
-use crate::render::{compute_hit_targets, hit_test, measure, render, RenderInput, Viewport};
+use crate::render::{compute_hit_targets, extract_selection, hit_test, measure, render, RenderInput, Viewport};
 use crate::theme::Theme;
 use crate::tree::FileTree;
 
@@ -41,6 +42,13 @@ pub struct AppState {
     pub sidebar_width_restore: f32,
     /// True while the user is dragging the sidebar's right edge.
     pub sidebar_dragging: bool,
+
+    /// Selection anchor and head in *document* coordinates (x from the left
+    /// of the window including sidebar, y in the unscrolled document).
+    /// `None` on both means no selection.
+    pub sel_anchor: Option<(f32, f32)>,
+    pub sel_head: Option<(f32, f32)>,
+    pub is_selecting: bool,
 }
 
 pub struct Shared {
@@ -52,6 +60,10 @@ pub struct Shared {
 impl Shared {
     pub fn snapshot(&self) -> Snapshot {
         let s = self.state.lock().unwrap();
+        let selection = match (s.sel_anchor, s.sel_head) {
+            (Some(a), Some(h)) if a != h => Some((a, h)),
+            _ => None,
+        };
         Snapshot {
             source: s.source.clone(),
             source_path: s.source_path.clone(),
@@ -60,6 +72,7 @@ impl Shared {
             tree_flat: s.tree.as_ref().map(|t| t.flatten()),
             theme: Theme::light(),
             sidebar_width: s.sidebar_width,
+            selection,
         }
     }
 }
@@ -72,6 +85,7 @@ pub struct Snapshot {
     pub tree_flat: Option<Vec<crate::tree::TreeEntry>>,
     pub theme: Theme,
     pub sidebar_width: f32,
+    pub selection: Option<((f32, f32), (f32, f32))>,
 }
 
 struct App {
@@ -79,6 +93,7 @@ struct App {
     window: Option<Arc<Window>>,
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
     proxy: EventLoopProxy<UserEvent>,
+    modifiers: Modifiers,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -129,13 +144,12 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                let (was_dragging, sidebar_w, tree_visible) = {
+                let (was_dragging_sidebar, was_selecting, scroll) = {
                     let mut s = self.shared.state.lock().unwrap();
                     s.last_mouse = position;
-                    (s.sidebar_dragging, s.sidebar_width, s.tree.is_some())
+                    (s.sidebar_dragging, s.is_selecting, s.scroll)
                 };
-                let _ = (sidebar_w, tree_visible);
-                if was_dragging {
+                if was_dragging_sidebar {
                     let new_w = (position.x as f32).clamp(120.0, 640.0);
                     {
                         let mut s = self.shared.state.lock().unwrap();
@@ -143,22 +157,43 @@ impl ApplicationHandler<UserEvent> for App {
                         s.sidebar_width_restore = new_w;
                     }
                     self.request_redraw();
+                } else if was_selecting {
+                    let doc = (position.x as f32, position.y as f32 + scroll);
+                    {
+                        let mut s = self.shared.state.lock().unwrap();
+                        s.sel_head = Some(doc);
+                    }
+                    self.request_redraw();
                 }
             }
 
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                let (pos, sidebar_w, tree_visible) = {
+                let (pos, sidebar_w, tree_visible, scroll) = {
                     let s = self.shared.state.lock().unwrap();
-                    (s.last_mouse, s.sidebar_width, s.tree.is_some())
+                    (s.last_mouse, s.sidebar_width, s.tree.is_some(), s.scroll)
                 };
-                // Edge drag strip: 6px on either side of the sidebar's right edge.
-                if tree_visible && sidebar_w > 0.0
-                    && (pos.x as f32 - sidebar_w).abs() <= 6.0
-                {
+                let x = pos.x as f32;
+                let y = pos.y as f32;
+
+                // Sidebar's right-edge drag strip.
+                if tree_visible && sidebar_w > 0.0 && (x - sidebar_w).abs() <= 6.0 {
                     let mut s = self.shared.state.lock().unwrap();
                     s.sidebar_dragging = true;
+                } else if x < sidebar_w {
+                    // Inside sidebar — treat as a tree click.
+                    {
+                        let mut s = self.shared.state.lock().unwrap();
+                        s.sel_anchor = None;
+                        s.sel_head = None;
+                    }
+                    click_at(&self.shared, x, y);
                 } else {
-                    click_at(&self.shared, pos.x as f32, pos.y as f32);
+                    // Content area — start a text selection.
+                    let doc = (x, y + scroll);
+                    let mut s = self.shared.state.lock().unwrap();
+                    s.sel_anchor = Some(doc);
+                    s.sel_head = Some(doc);
+                    s.is_selecting = true;
                 }
                 self.clamp_scroll();
                 self.request_redraw();
@@ -167,6 +202,11 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                 let mut s = self.shared.state.lock().unwrap();
                 s.sidebar_dragging = false;
+                s.is_selecting = false;
+            }
+
+            WindowEvent::ModifiersChanged(mods) => {
+                self.modifiers = mods;
             }
 
             WindowEvent::KeyboardInput {
@@ -216,7 +256,7 @@ impl ApplicationHandler<UserEvent> for App {
                         event_loop.exit();
                         return;
                     }
-                    Key::Character(c) if c == "b" => {
+                    Key::Character(c) if c == "b" && !self.modifiers.state().control_key() => {
                         let mut s = self.shared.state.lock().unwrap();
                         if s.sidebar_width > 0.0 {
                             s.sidebar_width_restore = s.sidebar_width;
@@ -228,6 +268,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 260.0
                             };
                         }
+                        None
+                    }
+                    Key::Character(c) if c == "c" && self.modifiers.state().control_key() => {
+                        self.copy_selection();
                         None
                     }
                     _ => None,
@@ -294,6 +338,37 @@ impl App {
         }
     }
 
+    fn copy_selection(&self) {
+        let snap = self.shared.snapshot();
+        if snap.selection.is_none() {
+            return;
+        }
+        let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+        let text = {
+            let mut images = self.shared.images.lock().unwrap();
+            extract_selection(
+                &RenderInput {
+                    source: &snap.source,
+                    viewport: snap.viewport,
+                    scroll: snap.scroll,
+                    theme: &snap.theme,
+                    fonts: &self.shared.fonts,
+                    tree: snap.tree_flat.as_deref(),
+                    active_path: snap.source_path.as_deref(),
+                    base_dir: base_dir.as_deref(),
+                    sidebar_width: snap.sidebar_width,
+                    selection: snap.selection,
+                },
+                &mut images,
+            )
+        };
+        if let Some(t) = text {
+            if !t.is_empty() {
+                clipboard::copy(&t);
+            }
+        }
+    }
+
     fn draw(&mut self) {
         let (Some(window), Some(surface)) = (&self.window, self.surface.as_mut()) else {
             return;
@@ -319,6 +394,7 @@ impl App {
                 active_path: snap.source_path.as_deref(),
                 base_dir: base_dir.as_deref(),
                 sidebar_width: snap.sidebar_width,
+                selection: snap.selection,
             },
             &mut images,
         );
@@ -353,6 +429,7 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
                 active_path: snap.source_path.as_deref(),
                 base_dir: base_dir.as_deref(),
                 sidebar_width: snap.sidebar_width,
+                selection: None,
             },
             &mut images,
         )
@@ -398,6 +475,9 @@ pub fn run(arg: Option<PathBuf>) -> ExitCode {
             sidebar_width: 260.0,
             sidebar_width_restore: 260.0,
             sidebar_dragging: false,
+            sel_anchor: None,
+            sel_head: None,
+            is_selecting: false,
         }),
     });
 
@@ -409,7 +489,7 @@ pub fn run(arg: Option<PathBuf>) -> ExitCode {
 
     crate::watch::spawn(shared.clone(), proxy.clone());
 
-    let mut app = App { shared, window: None, surface: None, proxy };
+    let mut app = App { shared, window: None, surface: None, proxy, modifiers: Modifiers::default() };
 
     match event_loop.run_app(&mut app) {
         Ok(()) => ExitCode::SUCCESS,

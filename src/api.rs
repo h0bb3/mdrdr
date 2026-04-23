@@ -71,6 +71,9 @@ fn handle(
         ("POST", "/open") => do_open(&mut stream, &shared, &proxy, &q),
         ("POST", "/click") => do_click(&mut stream, &shared, &proxy, &q),
         ("POST", "/sidebar") => do_sidebar(&mut stream, &shared, &proxy, &q),
+        ("POST", "/select") => do_select(&mut stream, &shared, &proxy, &q),
+        ("POST", "/select/clear") => do_select_clear(&mut stream, &shared, &proxy),
+        ("POST", "/copy") | ("GET", "/selection") => do_copy(&mut stream, &shared),
         ("POST", "/quit") => do_quit(&mut stream, &proxy),
         ("GET", "/") => ok_text(&mut stream, INDEX),
         _ => not_found(&mut stream),
@@ -150,6 +153,7 @@ fn screenshot(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<(
             active_path: snap.source_path.as_deref(),
             base_dir: base_dir.as_deref(),
             sidebar_width: snap.sidebar_width,
+            selection: snap.selection,
         },
         &mut images,
     );
@@ -287,6 +291,76 @@ fn do_sidebar(
     ok_json(stream, &state_json(shared))
 }
 
+fn do_select(
+    stream: &mut TcpStream,
+    shared: &Arc<Shared>,
+    proxy: &EventLoopProxy<UserEvent>,
+    q: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    let gf = |k: &str| q.get(k).and_then(|v| v.parse::<f32>().ok());
+    let (Some(x1), Some(y1), Some(x2), Some(y2)) = (gf("x1"), gf("y1"), gf("x2"), gf("y2")) else {
+        return bad_request(stream, "need ?x1=&y1=&x2=&y2= (screen coords)");
+    };
+    {
+        let mut s = shared.state.lock().unwrap();
+        let sc = s.scroll;
+        s.sel_anchor = Some((x1, y1 + sc));
+        s.sel_head = Some((x2, y2 + sc));
+        s.is_selecting = false;
+    }
+    let _ = proxy.send_event(UserEvent::Redraw);
+    ok_json(stream, "{\"ok\":true}")
+}
+
+fn do_select_clear(
+    stream: &mut TcpStream,
+    shared: &Arc<Shared>,
+    proxy: &EventLoopProxy<UserEvent>,
+) -> std::io::Result<()> {
+    {
+        let mut s = shared.state.lock().unwrap();
+        s.sel_anchor = None;
+        s.sel_head = None;
+        s.is_selecting = false;
+    }
+    let _ = proxy.send_event(UserEvent::Redraw);
+    ok_json(stream, "{\"ok\":true}")
+}
+
+fn do_copy(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> {
+    let snap = shared.snapshot();
+    if snap.selection.is_none() {
+        return ok_json(stream, "{\"selected\":false,\"text\":\"\"}");
+    }
+    let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+    let text = {
+        let mut images = shared.images.lock().unwrap();
+        crate::render::extract_selection(
+            &RenderInput {
+                source: &snap.source,
+                viewport: snap.viewport,
+                scroll: snap.scroll,
+                theme: &snap.theme,
+                fonts: &shared.fonts,
+                tree: snap.tree_flat.as_deref(),
+                active_path: snap.source_path.as_deref(),
+                base_dir: base_dir.as_deref(),
+                sidebar_width: snap.sidebar_width,
+                selection: snap.selection,
+            },
+            &mut images,
+        )
+        .unwrap_or_default()
+    };
+    let copied = !text.is_empty() && crate::clipboard::copy(&text);
+    let body = format!(
+        "{{\"selected\":true,\"copied\":{},\"text\":\"{}\"}}",
+        copied,
+        json_escape(&text)
+    );
+    ok_json(stream, &body)
+}
+
 fn do_quit(stream: &mut TcpStream, proxy: &EventLoopProxy<UserEvent>) -> std::io::Result<()> {
     let _ = proxy.send_event(UserEvent::Quit);
     ok_text(stream, "bye\n")
@@ -417,5 +491,8 @@ mdrdr api
   POST /click?x=X&y=Y    — simulate a left click at screen coords
   POST /sidebar?w=N      — set sidebar width (0 hides it)
   POST /sidebar?visible=0|1
+  POST /select?x1=&y1=&x2=&y2=  — select a range (screen coords)
+  POST /select/clear
+  POST /copy                    — copy selection to clipboard (also GET /selection)
   POST /quit             — exit
 ";

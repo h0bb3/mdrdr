@@ -5,6 +5,7 @@
 //!   mdrdr open   [FILE_OR_DIR]
 
 mod api;
+mod clipboard;
 mod font;
 mod headless;
 mod images;
