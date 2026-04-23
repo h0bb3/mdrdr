@@ -15,6 +15,7 @@ use fontdue::Font;
 
 use crate::font::Fonts;
 use crate::images::{CachedImage, ImageCache};
+use crate::math::{self, MathBox};
 use crate::md::{Block, Inline};
 use crate::theme::{Rgba, Theme};
 use crate::tree::{TreeEntry, TreeKind};
@@ -437,6 +438,35 @@ impl<'a> Ctx<'a> {
                     color: self.theme.muted,
                 });
             }
+            Block::DisplayMath(src) => {
+                let size = self.theme.body_size * 1.15;
+                let b = math::layout(src, size, self.fonts);
+                let avail = (self.content_right - self.content_left - indent).max(1.0);
+                let scale = if b.width > avail { avail / b.width } else { 1.0 };
+                let w = b.width * scale;
+                let x0 = self.content_left + indent + (avail - w) / 2.0;
+                let baseline = self.y + b.ascent * scale + self.theme.body_size * 0.4;
+                for g in &b.glyphs {
+                    self.items.push(Placed::Glyph {
+                        ch: g.ch,
+                        font: g.font,
+                        size: g.size * scale,
+                        x: x0 + g.x * scale,
+                        baseline: baseline + g.y * scale,
+                        color: self.theme.fg,
+                    });
+                }
+                for r in &b.rules {
+                    self.items.push(Placed::Rect {
+                        x: x0 + r.x * scale,
+                        y: baseline + r.y * scale,
+                        w: r.w * scale,
+                        h: r.h * scale,
+                        color: self.theme.fg,
+                    });
+                }
+                self.y = baseline + b.descent * scale + self.theme.body_size * 0.6;
+            }
             Block::ThematicBreak => {
                 let y = self.y + self.theme.body_size * 0.6;
                 self.items.push(Placed::Rect {
@@ -490,56 +520,104 @@ impl<'a> Ctx<'a> {
             return;
         }
 
-        let mut pen_x = left;
-        let mut line_width: f32 = 0.0;
-        let mut line_items: Vec<Placed> = Vec::new();
-        let mut line_max_size = base.size;
-        let mut baseline = self.y + base.size;
+        // One line at a time. Collect (word, x_offset) pairs, then at flush
+        // time compute line_ascent/line_descent (so math can be taller than
+        // body text) and emit Placed items with the right baseline.
+        let mut line: Vec<(usize, f32)> = Vec::new(); // (word index, x offset from left)
+        let mut pen = 0.0f32;
+        let mut y_top = self.y;
 
-        for word in &words {
-            let needs_space = !line_items.is_empty() && word.leading_space;
-            let sw = if needs_space {
-                space_advance(self.fonts, word.style)
-            } else {
-                0.0
+        let emit_line = |ctx: &mut Ctx,
+                         line: &mut Vec<(usize, f32)>,
+                         words: &[Word],
+                         left: f32,
+                         y_top: f32|
+         -> f32 {
+            if line.is_empty() {
+                return y_top;
+            }
+            let ascent = line
+                .iter()
+                .map(|(idx, _)| words[*idx].ascent)
+                .fold(0.0f32, f32::max);
+            let descent = line
+                .iter()
+                .map(|(idx, _)| words[*idx].descent)
+                .fold(0.0f32, f32::max);
+            let baseline = y_top + ascent;
+            for (idx, ox) in line.iter() {
+                let word = &words[*idx];
+                let wx = left + *ox;
+                match &word.payload {
+                    WordPayload::Text { glyphs, style } => {
+                        let mut gx = wx;
+                        for g in glyphs {
+                            ctx.items.push(Placed::Glyph {
+                                ch: g.ch,
+                                font: style.font_id(),
+                                size: style.size,
+                                x: gx,
+                                baseline,
+                                color: style.color,
+                            });
+                            gx += g.advance;
+                        }
+                        if style.underline {
+                            ctx.items.push(Placed::Underline {
+                                x: wx,
+                                y: baseline + 2.0,
+                                w: word.width,
+                                color: style.color,
+                            });
+                        }
+                    }
+                    WordPayload::Math(mb) => {
+                        for g in &mb.glyphs {
+                            ctx.items.push(Placed::Glyph {
+                                ch: g.ch,
+                                font: g.font,
+                                size: g.size,
+                                x: wx + g.x,
+                                baseline: baseline + g.y,
+                                color: ctx.theme.fg,
+                            });
+                        }
+                        for r in &mb.rules {
+                            ctx.items.push(Placed::Rect {
+                                x: wx + r.x,
+                                y: baseline + r.y,
+                                w: r.w,
+                                h: r.h,
+                                color: ctx.theme.fg,
+                            });
+                        }
+                    }
+                }
+            }
+            line.clear();
+            let line_gap = ctx.theme.body_size * (ctx.theme.line_height_mult - 1.0) * 0.6;
+            baseline + descent + line_gap
+        };
+
+        for (idx, word) in words.iter().enumerate() {
+            let sw = match &word.payload {
+                WordPayload::Text { style, .. } => space_advance(self.fonts, *style),
+                WordPayload::Math(_) => self.theme.body_size * 0.3,
             };
-            let projected = line_width + sw + word.width;
-            if !line_items.is_empty() && projected > avail {
-                self.items.extend(line_items.drain(..));
-                baseline += line_max_size * self.theme.line_height_mult;
-                pen_x = left;
-                line_width = 0.0;
-                line_max_size = word.style.size;
-                line_items.clear();
+            let needs_space = !line.is_empty() && word.leading_space;
+            let gap = if needs_space { sw } else { 0.0 };
+            let projected = pen + gap + word.width;
+            if !line.is_empty() && projected > avail {
+                y_top = emit_line(self, &mut line, &words, left, y_top);
+                pen = 0.0;
             } else if needs_space {
-                pen_x += sw;
-                line_width += sw;
+                pen += sw;
             }
-            line_max_size = line_max_size.max(word.style.size);
-            let word_start_x = pen_x;
-            for g in &word.glyphs {
-                line_items.push(Placed::Glyph {
-                    ch: g.ch,
-                    font: word.style.font_id(),
-                    size: word.style.size,
-                    x: pen_x,
-                    baseline,
-                    color: word.style.color,
-                });
-                pen_x += g.advance;
-            }
-            line_width += word.width;
-            if word.style.underline {
-                line_items.push(Placed::Underline {
-                    x: word_start_x,
-                    y: baseline + 2.0,
-                    w: word.width,
-                    color: word.style.color,
-                });
-            }
+            line.push((idx, pen));
+            pen += word.width;
         }
-        self.items.extend(line_items.drain(..));
-        self.y = baseline;
+        y_top = emit_line(self, &mut line, &words, left, y_top);
+        self.y = y_top;
     }
 }
 
@@ -591,10 +669,16 @@ struct Glyph {
     advance: f32,
 }
 
+pub enum WordPayload {
+    Text { glyphs: Vec<Glyph>, style: Style },
+    Math(MathBox),
+}
+
 struct Word {
-    glyphs: Vec<Glyph>,
+    payload: WordPayload,
     width: f32,
-    style: Style,
+    ascent: f32,
+    descent: f32,
     leading_space: bool,
 }
 
@@ -626,10 +710,15 @@ impl WordCollector {
 
     fn flush(&mut self) {
         if !self.cur.is_empty() {
+            let size = self.cur_style.size;
             self.out.push(Word {
-                glyphs: std::mem::take(&mut self.cur),
+                payload: WordPayload::Text {
+                    glyphs: std::mem::take(&mut self.cur),
+                    style: self.cur_style,
+                },
                 width: std::mem::take(&mut self.cur_width),
-                style: self.cur_style,
+                ascent: size * 0.85,
+                descent: size * 0.25,
                 leading_space: self.cur_leading_space,
             });
             self.cur_leading_space = false;
@@ -697,6 +786,23 @@ impl WordCollector {
                 let label = format!("[image: {}]", alt);
                 let s = Style { italic: true, color: theme.muted, underline: false, ..base };
                 self.emit_text(&label, s, fonts);
+            }
+            Inline::Math(src) => {
+                self.flush();
+                let size = base.size;
+                let mb = math::layout(src, size, fonts);
+                let width = mb.width;
+                let ascent = mb.ascent;
+                let descent = mb.descent;
+                let leading_space = self.pending_space;
+                self.pending_space = false;
+                self.out.push(Word {
+                    payload: WordPayload::Math(mb),
+                    width,
+                    ascent,
+                    descent,
+                    leading_space,
+                });
             }
         }
     }

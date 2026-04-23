@@ -9,6 +9,7 @@ mod font;
 mod headless;
 mod images;
 mod layout;
+mod math;
 mod md;
 mod render;
 mod theme;

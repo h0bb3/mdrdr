@@ -17,6 +17,7 @@ pub enum Inline {
     Code(String),
     Link { text: Vec<Inline>, href: String },
     Image { alt: String, src: String },
+    Math(String),
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +28,7 @@ pub enum Block {
     List { ordered: bool, items: Vec<Vec<Inline>> },
     BlockQuote(Vec<Block>),
     ThematicBreak,
+    DisplayMath(String),
 }
 
 pub fn parse(src: &str) -> Vec<Block> {
@@ -40,6 +42,35 @@ fn parse_lines(lines: &[&str]) -> Vec<Block> {
     while i < lines.len() {
         let line = lines[i];
         let trim = line.trim_start();
+
+        if trim.starts_with("$$") {
+            let mut body = String::new();
+            // Same-line close: $$ a + b $$
+            let first = &trim[2..];
+            if let Some(close) = first.find("$$") {
+                out.push(Block::DisplayMath(first[..close].trim().to_string()));
+                i += 1;
+                continue;
+            }
+            if !first.is_empty() {
+                body.push_str(first);
+                body.push('\n');
+            }
+            i += 1;
+            while i < lines.len() {
+                let l = lines[i];
+                if let Some(close) = l.find("$$") {
+                    body.push_str(&l[..close]);
+                    i += 1;
+                    break;
+                }
+                body.push_str(l);
+                body.push('\n');
+                i += 1;
+            }
+            out.push(Block::DisplayMath(body.trim().to_string()));
+            continue;
+        }
 
         if trim.starts_with("```") {
             let lang = trim.trim_start_matches('`').trim();
@@ -209,7 +240,7 @@ impl<'a> InlineParser<'a> {
 
             if b == b'\\' && self.i + 1 < self.src.len() {
                 let nxt = self.src[self.i + 1];
-                if matches!(nxt, b'*' | b'_' | b'`' | b'[' | b']' | b'(' | b')' | b'!' | b'\\') {
+                if matches!(nxt, b'*' | b'_' | b'`' | b'[' | b']' | b'(' | b')' | b'!' | b'\\' | b'$') {
                     buf.push(nxt as char);
                     self.i += 2;
                     continue;
@@ -280,6 +311,33 @@ impl<'a> InlineParser<'a> {
                         self.i = end;
                     } else {
                         buf.push('[');
+                        self.i += 1;
+                    }
+                }
+                b'$' => {
+                    // Inline math: $...$ — find next un-escaped $.
+                    let start = self.i + 1;
+                    let mut j = start;
+                    let mut found = None;
+                    while j < self.src.len() {
+                        if self.src[j] == b'\\' && j + 1 < self.src.len() {
+                            j += 2;
+                            continue;
+                        }
+                        if self.src[j] == b'$' {
+                            found = Some(j);
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if let Some(end) = found {
+                        let raw = &self.src[start..end];
+                        let s = std::str::from_utf8(raw).unwrap_or("").to_string();
+                        flush(&mut buf, &mut out);
+                        out.push(Inline::Math(s));
+                        self.i = end + 1;
+                    } else {
+                        buf.push('$');
                         self.i += 1;
                     }
                 }
