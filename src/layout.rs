@@ -27,6 +27,7 @@ pub enum FontId {
     Italic,
     BoldItalic,
     Mono,
+    Emoji,
 }
 
 #[derive(Debug)]
@@ -155,6 +156,7 @@ pub fn pick_font(fonts: &Fonts, id: FontId) -> &Font {
         FontId::Italic => &fonts.italic,
         FontId::BoldItalic => &fonts.bold_italic,
         FontId::Mono => &fonts.mono,
+        FontId::Emoji => &fonts.emoji,
     }
 }
 
@@ -1054,9 +1056,10 @@ impl<'a> Ctx<'a> {
                     WordPayload::Text { glyphs, style } => {
                         let mut gx = wx;
                         for g in glyphs {
+                            let fid = g.font.unwrap_or_else(|| style.font_id());
                             ctx.items.push(Placed::Glyph {
                                 ch: g.ch,
-                                font: style.font_id(),
+                                font: fid,
                                 size: style.size,
                                 x: gx,
                                 baseline,
@@ -1214,6 +1217,10 @@ fn body_style(theme: &Theme) -> Style {
 struct Glyph {
     ch: char,
     advance: f32,
+    /// Per-glyph font override. If None, falls back to the word's
+    /// style font. Emoji codepoints get routed here to FontId::Emoji
+    /// regardless of the surrounding style.
+    font: Option<FontId>,
 }
 
 pub enum WordPayload {
@@ -1293,7 +1300,6 @@ impl WordCollector {
 
     fn emit_text(&mut self, s: &str, style: Style, fonts: &Fonts) {
         self.ensure_style(style);
-        let font = pick_font(fonts, style.font_id());
         for ch in s.chars() {
             if ch == ' ' || ch == '\t' || ch == '\n' {
                 self.flush();
@@ -1305,8 +1311,17 @@ impl WordCollector {
                 self.pending_space = false;
                 self.cur_style = style;
             }
-            let m = font.metrics(ch, style.size);
-            self.cur.push(Glyph { ch, advance: m.advance_width });
+            let (g_font, fid) = if crate::font::is_emoji(ch) {
+                (&fonts.emoji, Some(FontId::Emoji))
+            } else {
+                (pick_font(fonts, style.font_id()), None)
+            };
+            let m = g_font.metrics(ch, style.size);
+            self.cur.push(Glyph {
+                ch,
+                advance: m.advance_width,
+                font: fid,
+            });
             self.cur_width += m.advance_width;
         }
     }
