@@ -1,13 +1,21 @@
-//! Layout engine — walks the parsed block tree and produces a flat list of
-//! positioned draw items in absolute document coordinates. The render pass
-//! applies scroll and clips; nothing in here cares about scroll or viewport
-//! height (only width).
+//! Layout engine — walks the parsed block tree and produces positioned draw
+//! items in absolute document coordinates. Also handles the sidebar.
+//!
+//! Two output buckets:
+//!   - content_items: scrollable (the main document).
+//!   - pinned_items:  drawn at fixed screen positions (sidebar, chrome).
+//!
+//! hit_targets are in screen coordinates (for pinned UI) — click handlers
+//! compare mouse position directly.
+
+use std::path::{Path, PathBuf};
 
 use fontdue::Font;
 
 use crate::font::Fonts;
 use crate::md::{Block, Inline};
 use crate::theme::{Rgba, Theme};
+use crate::tree::{TreeEntry, TreeKind};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FontId {
@@ -43,9 +51,27 @@ pub enum Placed {
     },
 }
 
+#[derive(Debug, Clone)]
+pub enum HitAction {
+    Open(PathBuf),
+    Toggle(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+pub struct HitTarget {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub action: HitAction,
+}
+
 pub struct Layout {
-    pub items: Vec<Placed>,
+    pub content_items: Vec<Placed>,
+    pub pinned_items: Vec<Placed>,
+    pub hit_targets: Vec<HitTarget>,
     pub doc_height: f32,
+    pub sidebar_width: f32,
 }
 
 #[derive(Copy, Clone)]
@@ -84,25 +110,200 @@ pub fn pick_font(fonts: &Fonts, id: FontId) -> &Font {
     }
 }
 
-pub fn layout(blocks: &[Block], viewport_w: u32, theme: &Theme, fonts: &Fonts) -> Layout {
-    let mut ctx = Ctx {
-        items: Vec::new(),
-        y: theme.margin_y,
-        viewport_w: viewport_w as f32,
-        theme,
-        fonts,
-    };
-    for b in blocks {
-        ctx.block(b, 0.0);
-    }
-    let doc_height = ctx.y + theme.margin_y;
-    Layout { items: ctx.items, doc_height }
+pub const SIDEBAR_WIDTH_DEFAULT: f32 = 260.0;
+
+pub struct LayoutInput<'a> {
+    pub blocks: &'a [Block],
+    pub tree: Option<&'a [TreeEntry]>,
+    pub active_path: Option<&'a Path>,
+    pub viewport_w: u32,
+    pub viewport_h: u32,
+    pub theme: &'a Theme,
+    pub fonts: &'a Fonts,
 }
 
+pub fn layout(input: LayoutInput) -> Layout {
+    let sidebar_width = if input.tree.is_some() {
+        SIDEBAR_WIDTH_DEFAULT
+    } else {
+        0.0
+    };
+
+    let content_left = sidebar_width + input.theme.margin_x;
+    let content_right = (input.viewport_w as f32) - input.theme.margin_x;
+
+    let mut content_items: Vec<Placed> = Vec::new();
+    let doc_height = {
+        let mut ctx = Ctx {
+            items: &mut content_items,
+            y: input.theme.margin_y,
+            content_left,
+            content_right,
+            theme: input.theme,
+            fonts: input.fonts,
+        };
+        for b in input.blocks {
+            ctx.block(b, 0.0);
+        }
+        ctx.y + input.theme.margin_y
+    };
+
+    let mut pinned_items = Vec::new();
+    let mut hit_targets = Vec::new();
+    if let Some(tree) = input.tree {
+        layout_sidebar(
+            tree,
+            input.active_path,
+            sidebar_width,
+            input.viewport_h as f32,
+            input.theme,
+            input.fonts,
+            &mut pinned_items,
+            &mut hit_targets,
+        );
+    }
+
+    Layout {
+        content_items,
+        pinned_items,
+        hit_targets,
+        doc_height,
+        sidebar_width,
+    }
+}
+
+// ───── sidebar layout ───────────────────────────────────────────────────────
+
+fn layout_sidebar(
+    tree: &[TreeEntry],
+    active: Option<&Path>,
+    width: f32,
+    height: f32,
+    theme: &Theme,
+    fonts: &Fonts,
+    items: &mut Vec<Placed>,
+    hits: &mut Vec<HitTarget>,
+) {
+    let sidebar_bg = [0xf3, 0xef, 0xe5, 0xff];
+    let border = theme.muted;
+
+    // Background panel.
+    items.push(Placed::Rect { x: 0.0, y: 0.0, w: width, h: height, color: sidebar_bg });
+    // Right border.
+    items.push(Placed::Rect { x: width - 1.0, y: 0.0, w: 1.0, h: height, color: border });
+
+    let size = theme.body_size * 0.82;
+    let row_h = size * 1.5;
+    let mut y = theme.margin_y * 0.5;
+
+    for entry in tree {
+        let rel_name = match entry.path.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => entry.path.display().to_string(),
+        };
+        let indent = 10.0 + (entry.depth as f32) * 14.0;
+        let is_active = active.map(|a| a == entry.path.as_path()).unwrap_or(false);
+
+        let row_y = y;
+        if is_active {
+            items.push(Placed::Rect {
+                x: 2.0,
+                y: row_y,
+                w: width - 4.0,
+                h: row_h,
+                color: [0xe3, 0xdc, 0xc9, 0xff],
+            });
+        }
+
+        let marker = match entry.kind {
+            TreeKind::Folder => if entry.expanded { "▾" } else { "▸" },
+            TreeKind::Markdown => " ",
+        };
+        let baseline = row_y + row_h * 0.5 + size * 0.35;
+        let muted = theme.muted;
+        let fg = theme.fg;
+
+        let mut x = indent;
+        for ch in marker.chars() {
+            let m = fonts.body.metrics(ch, size);
+            items.push(Placed::Glyph {
+                ch,
+                font: FontId::Body,
+                size,
+                x,
+                baseline,
+                color: muted,
+            });
+            x += m.advance_width;
+        }
+        x += size * 0.25;
+
+        let font_id = if entry.kind == TreeKind::Folder {
+            FontId::Bold
+        } else {
+            FontId::Body
+        };
+        let color = match entry.kind {
+            TreeKind::Folder => fg,
+            TreeKind::Markdown if is_active => theme.accent,
+            TreeKind::Markdown => fg,
+        };
+        let font = pick_font(fonts, font_id);
+        // Truncate name to fit.
+        let max_name_x = width - 8.0;
+        for ch in rel_name.chars() {
+            let m = font.metrics(ch, size);
+            if x + m.advance_width > max_name_x {
+                // draw ellipsis and stop
+                let e = font.metrics('…', size);
+                items.push(Placed::Glyph {
+                    ch: '…',
+                    font: font_id,
+                    size,
+                    x,
+                    baseline,
+                    color,
+                });
+                x += e.advance_width;
+                break;
+            }
+            items.push(Placed::Glyph {
+                ch,
+                font: font_id,
+                size,
+                x,
+                baseline,
+                color,
+            });
+            x += m.advance_width;
+        }
+
+        let action = match entry.kind {
+            TreeKind::Folder => HitAction::Toggle(entry.path.clone()),
+            TreeKind::Markdown => HitAction::Open(entry.path.clone()),
+        };
+        hits.push(HitTarget {
+            x: 0.0,
+            y: row_y,
+            w: width,
+            h: row_h,
+            action,
+        });
+
+        y += row_h;
+        if y > height {
+            break; // don't render rows below viewport for M3
+        }
+    }
+}
+
+// ───── main content layout ──────────────────────────────────────────────────
+
 struct Ctx<'a> {
-    items: Vec<Placed>,
+    items: &'a mut Vec<Placed>,
     y: f32,
-    viewport_w: f32,
+    content_left: f32,
+    content_right: f32,
     theme: &'a Theme,
     fonts: &'a Fonts,
 }
@@ -138,8 +339,8 @@ impl<'a> Ctx<'a> {
                     lines.push("");
                 }
                 let start_y = self.y;
-                let rect_x = self.theme.margin_x + indent;
-                let rect_w = (self.viewport_w - self.theme.margin_x * 2.0 - indent).max(1.0);
+                let rect_x = self.content_left + indent;
+                let rect_w = (self.content_right - rect_x).max(1.0);
                 let rect_h = lines.len() as f32 * lh + pad * 2.0;
                 self.items.push(Placed::Rect {
                     x: rect_x,
@@ -177,7 +378,7 @@ impl<'a> Ctx<'a> {
                     } else {
                         "•".to_string()
                     };
-                    let marker_x = self.theme.margin_x + indent;
+                    let marker_x = self.content_left + indent;
                     let baseline = self.y + size;
                     let mut mx = marker_x;
                     for ch in marker.chars() {
@@ -209,7 +410,7 @@ impl<'a> Ctx<'a> {
                 }
                 let end_y = self.y;
                 self.items.push(Placed::Rect {
-                    x: self.theme.margin_x + indent + 4.0,
+                    x: self.content_left + indent + 4.0,
                     y: start_y,
                     w: 3.0,
                     h: (end_y - start_y).max(1.0),
@@ -219,9 +420,9 @@ impl<'a> Ctx<'a> {
             Block::ThematicBreak => {
                 let y = self.y + self.theme.body_size * 0.6;
                 self.items.push(Placed::Rect {
-                    x: self.theme.margin_x,
+                    x: self.content_left,
                     y,
-                    w: (self.viewport_w - self.theme.margin_x * 2.0).max(1.0),
+                    w: (self.content_right - self.content_left).max(1.0),
                     h: 1.0,
                     color: self.theme.muted,
                 });
@@ -230,11 +431,9 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// Layout `inlines` as a flowing paragraph. Word-wrap, accumulate placed
-    /// glyphs, advance self.y by the lines consumed.
     fn paragraph(&mut self, inlines: &[Inline], base: Style, indent: f32) {
-        let left = self.theme.margin_x + indent;
-        let right = self.viewport_w - self.theme.margin_x;
+        let left = self.content_left + indent;
+        let right = self.content_right;
         let avail = (right - left).max(1.0);
 
         let mut collector = WordCollector::new(base);
@@ -266,10 +465,7 @@ impl<'a> Ctx<'a> {
                 pen_x = left;
                 line_width = 0.0;
                 line_max_size = word.style.size;
-                // On a fresh line, drop the leading space.
-                // Fall through to placing the word at pen_x.
                 line_items.clear();
-                // Force no-space for the first word on this line.
             } else if needs_space {
                 pen_x += sw;
                 line_width += sw;
@@ -335,8 +531,6 @@ struct Word {
     glyphs: Vec<Glyph>,
     width: f32,
     style: Style,
-    /// True if whitespace preceded this word in the source. Wrapping honors
-    /// this to avoid phantom spaces before punctuation like "`code`,".
     leading_space: bool,
 }
 
@@ -374,7 +568,6 @@ impl WordCollector {
                 style: self.cur_style,
                 leading_space: self.cur_leading_space,
             });
-            // Next word defaults to no leading space until we see one.
             self.cur_leading_space = false;
         }
     }

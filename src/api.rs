@@ -3,22 +3,24 @@
 //! Endpoints:
 //!   GET  /state
 //!   GET  /screenshot
+//!   GET  /tree
 //!   POST /scroll?y=N | ?dy=N
 //!   POST /resize?w=N&h=N
 //!   POST /open?path=URL_ENCODED
+//!   POST /click?x=X&y=Y
 //!   POST /quit
-//!
-//! Query-string bodies keep this file dependency-free. JSON bodies can land later.
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use winit::event_loop::EventLoopProxy;
 
-use crate::render::{render, Viewport};
-use crate::window::{Shared, UserEvent};
+use crate::render::{render, RenderInput, Viewport};
+use crate::tree::{TreeEntry, TreeKind};
+use crate::window::{click_at, Shared, UserEvent};
 
 pub fn spawn(shared: Arc<Shared>, proxy: EventLoopProxy<UserEvent>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind localhost");
@@ -63,9 +65,11 @@ fn handle(
     match (method, path) {
         ("GET", "/state") => ok_json(&mut stream, &state_json(&shared)),
         ("GET", "/screenshot") => screenshot(&mut stream, &shared),
+        ("GET", "/tree") => ok_json(&mut stream, &tree_json(&shared)),
         ("POST", "/scroll") => do_scroll(&mut stream, &shared, &proxy, &q),
         ("POST", "/resize") => do_resize(&mut stream, &shared, &proxy, &q),
         ("POST", "/open") => do_open(&mut stream, &shared, &proxy, &q),
+        ("POST", "/click") => do_click(&mut stream, &shared, &proxy, &q),
         ("POST", "/quit") => do_quit(&mut stream, &proxy),
         ("GET", "/") => ok_text(&mut stream, INDEX),
         _ => not_found(&mut stream),
@@ -81,8 +85,13 @@ fn state_json(shared: &Arc<Shared>) -> String {
         Some(p) => format!("\"{}\"", json_escape(&p)),
         None => "null".into(),
     };
+    let root_json = s
+        .tree
+        .as_ref()
+        .map(|t| format!("\"{}\"", json_escape(&t.root.display().to_string())))
+        .unwrap_or_else(|| "null".to_string());
     format!(
-        "{{\"source_path\":{path_json},\"scroll\":{:.3},\"viewport\":{{\"w\":{},\"h\":{}}},\"source_len\":{}}}",
+        "{{\"source_path\":{path_json},\"scroll\":{:.3},\"viewport\":{{\"w\":{},\"h\":{}}},\"source_len\":{},\"tree_root\":{root_json}}}",
         s.scroll,
         s.viewport.width,
         s.viewport.height,
@@ -90,12 +99,53 @@ fn state_json(shared: &Arc<Shared>) -> String {
     )
 }
 
+fn tree_json(shared: &Arc<Shared>) -> String {
+    let s = shared.state.lock().unwrap();
+    let Some(tree) = s.tree.as_ref() else {
+        return "null".into();
+    };
+    let flat = tree.flatten();
+    let active = s.source_path.clone();
+    let mut out = String::from("[");
+    for (i, e) in flat.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&entry_json(e, active.as_deref()));
+    }
+    out.push(']');
+    out
+}
+
+fn entry_json(e: &TreeEntry, active: Option<&std::path::Path>) -> String {
+    let kind = match e.kind {
+        TreeKind::Folder => "folder",
+        TreeKind::Markdown => "file",
+    };
+    let is_active = active.map(|a| a == e.path.as_path()).unwrap_or(false);
+    format!(
+        "{{\"path\":\"{}\",\"depth\":{},\"kind\":\"{}\",\"expanded\":{},\"active\":{}}}",
+        json_escape(&e.path.display().to_string()),
+        e.depth,
+        kind,
+        e.expanded,
+        is_active
+    )
+}
+
 fn screenshot(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> {
-    let (source, scroll, viewport, theme) = shared.snapshot();
-    let fb = render(&source, viewport, scroll, &theme, &shared.fonts);
+    let snap = shared.snapshot();
+    let fb = render(&RenderInput {
+        source: &snap.source,
+        viewport: snap.viewport,
+        scroll: snap.scroll,
+        theme: &snap.theme,
+        fonts: &shared.fonts,
+        tree: snap.tree_flat.as_deref(),
+        active_path: snap.source_path.as_deref(),
+    });
     let img: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> =
-        image::ImageBuffer::from_raw(fb.width, fb.height, fb.pixels)
-            .expect("fb size mismatch");
+        image::ImageBuffer::from_raw(fb.width, fb.height, fb.pixels).expect("fb size mismatch");
     let mut png = Vec::new();
     img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
         .expect("encode png");
@@ -156,11 +206,40 @@ fn do_open(
     {
         let mut s = shared.state.lock().unwrap();
         s.source = source;
-        s.source_path = Some(std::path::PathBuf::from(path));
+        s.source_path = Some(PathBuf::from(path));
         s.scroll = 0.0;
     }
     let _ = proxy.send_event(UserEvent::Redraw);
     ok_json(stream, &state_json(shared))
+}
+
+fn do_click(
+    stream: &mut TcpStream,
+    shared: &Arc<Shared>,
+    proxy: &EventLoopProxy<UserEvent>,
+    q: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    let Some(x) = q.get("x").and_then(|v| v.parse::<f32>().ok()) else {
+        return bad_request(stream, "missing ?x=");
+    };
+    let Some(y) = q.get("y").and_then(|v| v.parse::<f32>().ok()) else {
+        return bad_request(stream, "missing ?y=");
+    };
+    let action = click_at(shared, x, y);
+    let _ = proxy.send_event(UserEvent::Redraw);
+    let body = match action {
+        Some(a) => format!("{{\"hit\":true,\"action\":{}}}", action_json(&a)),
+        None => "{\"hit\":false}".to_string(),
+    };
+    ok_json(stream, &body)
+}
+
+fn action_json(a: &crate::layout::HitAction) -> String {
+    use crate::layout::HitAction::*;
+    match a {
+        Open(p) => format!("{{\"kind\":\"open\",\"path\":\"{}\"}}", json_escape(&p.display().to_string())),
+        Toggle(p) => format!("{{\"kind\":\"toggle\",\"path\":\"{}\"}}", json_escape(&p.display().to_string())),
+    }
 }
 
 fn do_quit(stream: &mut TcpStream, proxy: &EventLoopProxy<UserEvent>) -> std::io::Result<()> {
@@ -284,10 +363,12 @@ const INDEX: &str = "\
 mdrdr api
 
   GET  /state            — current state as JSON
+  GET  /tree             — current file tree as JSON
   GET  /screenshot       — PNG of the current viewport
   POST /scroll?y=N       — absolute scroll
   POST /scroll?dy=N      — relative scroll
   POST /resize?w=N&h=N   — resize viewport (state only; window follows on redraw)
   POST /open?path=P      — load a file
+  POST /click?x=X&y=Y    — simulate a left click at screen coords
   POST /quit             — exit
 ";

@@ -1,14 +1,17 @@
 //! `mdrdr render` — write a PNG of the current render core output, then exit.
-//! No window, no event loop. This is the primary iteration loop for development.
+//! No window, no event loop. Primary iteration loop for development.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::font::Fonts;
-use crate::render::{render, Viewport};
+use crate::render::{render, RenderInput, Viewport};
 use crate::theme::Theme;
+use crate::tree::FileTree;
 
 pub fn render_to_png(
     source: &str,
+    source_path: Option<&Path>,
+    root: Option<&Path>,
     width: u32,
     height: u32,
     scroll: f32,
@@ -16,7 +19,19 @@ pub fn render_to_png(
 ) -> std::io::Result<()> {
     let theme = Theme::light();
     let fonts = Fonts::load();
-    let fb = render(source, Viewport { width, height }, scroll, &theme, &fonts);
+
+    let tree_owner = root.map(|r| FileTree::new(PathBuf::from(r)));
+    let flat = tree_owner.as_ref().map(|t| t.flatten());
+
+    let fb = render(&RenderInput {
+        source,
+        viewport: Viewport { width, height },
+        scroll,
+        theme: &theme,
+        fonts: &fonts,
+        tree: flat.as_deref(),
+        active_path: source_path,
+    });
     let img: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> =
         image::ImageBuffer::from_raw(fb.width, fb.height, fb.pixels)
             .expect("framebuffer size mismatch");

@@ -1,13 +1,12 @@
 //! The pure render core.
-//!
-//! render() parses source → lays out blocks → draws Placed items into a
-//! Framebuffer with scroll applied. All three shells (headless PNG, window,
-//! HTTP /screenshot) go through this exact function.
+
+use std::path::Path;
 
 use crate::font::Fonts;
-use crate::layout::{layout, pick_font, Layout, Placed};
+use crate::layout::{layout, pick_font, HitTarget, Layout, LayoutInput, Placed};
 use crate::md::parse;
 use crate::theme::{Rgba, Theme};
+use crate::tree::TreeEntry;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Viewport {
@@ -58,22 +57,58 @@ impl Framebuffer {
     }
 }
 
-pub fn render(
-    source: &str,
-    viewport: Viewport,
-    scroll: f32,
-    theme: &Theme,
-    fonts: &Fonts,
-) -> Framebuffer {
-    let blocks = parse(source);
-    let lay = layout(&blocks, viewport.width, theme, fonts);
-    draw(&lay, viewport, scroll, theme, fonts)
+pub struct RenderInput<'a> {
+    pub source: &'a str,
+    pub viewport: Viewport,
+    pub scroll: f32,
+    pub theme: &'a Theme,
+    pub fonts: &'a Fonts,
+    pub tree: Option<&'a [TreeEntry]>,
+    pub active_path: Option<&'a Path>,
 }
 
-/// Expose layout-only rendering so the window can clamp scroll to doc height.
-pub fn measure(source: &str, viewport_w: u32, theme: &Theme, fonts: &Fonts) -> f32 {
+pub fn render(input: &RenderInput) -> Framebuffer {
+    let blocks = parse(input.source);
+    let lay = layout(LayoutInput {
+        blocks: &blocks,
+        tree: input.tree,
+        active_path: input.active_path,
+        viewport_w: input.viewport.width,
+        viewport_h: input.viewport.height,
+        theme: input.theme,
+        fonts: input.fonts,
+    });
+    draw(&lay, input.viewport, input.scroll, input.theme, input.fonts)
+}
+
+pub fn measure(
+    source: &str,
+    viewport_w: u32,
+    viewport_h: u32,
+    sidebar_x_offset: u32,
+    theme: &Theme,
+    fonts: &Fonts,
+) -> f32 {
+    let _ = sidebar_x_offset;
     let blocks = parse(source);
-    layout(&blocks, viewport_w, theme, fonts).doc_height
+    let lay = layout(LayoutInput {
+        blocks: &blocks,
+        tree: None,
+        active_path: None,
+        viewport_w,
+        viewport_h,
+        theme,
+        fonts,
+    });
+    lay.doc_height
+}
+
+/// Hit-test a point (in screen coords) against the sidebar. Returns the
+/// click action if any target contains (x,y).
+pub fn hit_test<'a>(targets: &'a [HitTarget], x: f32, y: f32) -> Option<&'a HitTarget> {
+    targets
+        .iter()
+        .find(|t| x >= t.x && x <= t.x + t.w && y >= t.y && y <= t.y + t.h)
 }
 
 fn draw(
@@ -84,13 +119,29 @@ fn draw(
     fonts: &Fonts,
 ) -> Framebuffer {
     let mut fb = Framebuffer::new(viewport.width, viewport.height, theme.bg);
-    let vh = viewport.height as f32;
 
-    for item in &lay.items {
+    // Content (scrolled).
+    draw_items(&mut fb, &lay.content_items, scroll, viewport, fonts);
+    // Pinned UI on top.
+    draw_items(&mut fb, &lay.pinned_items, 0.0, viewport, fonts);
+
+    // suppress unused warning
+    let _ = theme;
+    fb
+}
+
+fn draw_items(
+    fb: &mut Framebuffer,
+    items: &[Placed],
+    scroll: f32,
+    viewport: Viewport,
+    fonts: &Fonts,
+) {
+    let vh = viewport.height as f32;
+    for item in items {
         match item {
             Placed::Glyph { ch, font, size, x, baseline, color } => {
                 let screen_baseline = *baseline - scroll;
-                // Quick cull: baseline far off-screen.
                 if screen_baseline < -(*size) || screen_baseline - size > vh {
                     continue;
                 }
@@ -126,6 +177,19 @@ fn draw(
             }
         }
     }
+}
 
-    fb
+/// Compute hit targets for the current state without drawing.
+pub fn compute_hit_targets(input: &RenderInput) -> Vec<HitTarget> {
+    let blocks = parse(input.source);
+    let lay = layout(LayoutInput {
+        blocks: &blocks,
+        tree: input.tree,
+        active_path: input.active_path,
+        viewport_w: input.viewport.width,
+        viewport_h: input.viewport.height,
+        theme: input.theme,
+        fonts: input.fonts,
+    });
+    lay.hit_targets
 }

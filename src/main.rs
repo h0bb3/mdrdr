@@ -1,8 +1,8 @@
 //! mdrdr — a from-scratch markdown viewer.
 //!
 //! Subcommands:
-//!   mdrdr render [FILE] [--out PATH] [--width W] [--height H]
-//!   mdrdr open   [FILE]
+//!   mdrdr render [FILE] [--tree DIR] [--out PATH] [--width W] [--height H] [--scroll Y]
+//!   mdrdr open   [FILE_OR_DIR]
 
 mod api;
 mod font;
@@ -11,6 +11,7 @@ mod layout;
 mod md;
 mod render;
 mod theme;
+mod tree;
 mod window;
 
 use std::path::PathBuf;
@@ -19,8 +20,8 @@ use std::process::ExitCode;
 fn usage() -> ExitCode {
     eprintln!(
         "usage:\n  \
-         mdrdr render [FILE] [--out PATH] [--width W] [--height H] [--scroll Y]\n  \
-         mdrdr open   [FILE]"
+         mdrdr render [FILE] [--tree DIR] [--out PATH] [--width W] [--height H] [--scroll Y]\n  \
+         mdrdr open   [FILE_OR_DIR]"
     );
     ExitCode::from(2)
 }
@@ -46,6 +47,7 @@ fn cmd_render(args: &[String]) -> ExitCode {
     let mut width: u32 = 1200;
     let mut height: u32 = 900;
     let mut scroll: f32 = 0.0;
+    let mut tree_root: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -66,6 +68,10 @@ fn cmd_render(args: &[String]) -> ExitCode {
                 i += 1;
                 scroll = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0.0);
             }
+            "--tree" => {
+                i += 1;
+                tree_root = args.get(i).cloned().map(PathBuf::from);
+            }
             other if !other.starts_with("--") && file.is_none() => {
                 file = Some(PathBuf::from(other));
             }
@@ -77,15 +83,23 @@ fn cmd_render(args: &[String]) -> ExitCode {
         i += 1;
     }
 
-    let source = match file {
-        Some(p) => std::fs::read_to_string(&p).unwrap_or_else(|e| {
+    let source = match &file {
+        Some(p) => std::fs::read_to_string(p).unwrap_or_else(|e| {
             eprintln!("could not read {}: {}", p.display(), e);
             String::new()
         }),
         None => String::new(),
     };
 
-    match headless::render_to_png(&source, width, height, scroll, &out) {
+    match headless::render_to_png(
+        &source,
+        file.as_deref(),
+        tree_root.as_deref(),
+        width,
+        height,
+        scroll,
+        &out,
+    ) {
         Ok(()) => {
             println!("wrote {} ({}x{})", out.display(), width, height);
             ExitCode::SUCCESS
@@ -98,6 +112,6 @@ fn cmd_render(args: &[String]) -> ExitCode {
 }
 
 fn cmd_open(args: &[String]) -> ExitCode {
-    let file = args.iter().find(|a| !a.starts_with("--")).cloned().map(PathBuf::from);
-    window::run(file)
+    let arg = args.iter().find(|a| !a.starts_with("--")).cloned().map(PathBuf::from);
+    window::run(arg)
 }
