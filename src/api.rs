@@ -131,6 +131,7 @@ fn entry_json(e: &TreeEntry, active: Option<&std::path::Path>) -> String {
     let kind = match e.kind {
         TreeKind::Folder => "folder",
         TreeKind::Markdown => "file",
+        TreeKind::Parent => "parent",
     };
     let is_active = active.map(|a| a == e.path.as_path()).unwrap_or(false);
     format!(
@@ -303,6 +304,7 @@ fn action_json(a: &crate::layout::HitAction) -> String {
         OpenUrl(u) => format!("{{\"kind\":\"url\",\"url\":\"{}\"}}", json_escape(u)),
         CopyCode(_) => "{\"kind\":\"copy_code\"}".to_string(),
         ScrollTo(y) => format!("{{\"kind\":\"scroll_to\",\"y\":{:.3}}}", y),
+        SetRoot(p) => format!("{{\"kind\":\"set_root\",\"path\":\"{}\"}}", json_escape(&p.display().to_string())),
     }
 }
 

@@ -69,6 +69,11 @@ pub struct AppState {
     /// Ctrl + wheel over a panel bumps its zoom.
     pub content_zoom: f32,
     pub sidebar_zoom: f32,
+
+    /// (time, x, y, path) of the most recent tree-folder click. Used to
+    /// promote a second click on the same folder within the double-click
+    /// window to a SetRoot (enter directory) action.
+    pub last_folder_click: Option<(std::time::Instant, f32, f32, PathBuf)>,
 }
 
 pub struct Shared {
@@ -838,13 +843,39 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
         )
     };
     // Pinned targets (tree rows) first — they're in screen coords.
-    let action = if let Some(hit) = hit_test(&pinned, x, y) {
+    let raw_action = if let Some(hit) = hit_test(&pinned, x, y) {
         hit.action.clone()
     } else if let Some(hit) = hit_test(&content, x, y + snap.scroll) {
         // Content targets (links) are in document coords.
         hit.action.clone()
     } else {
         return None;
+    };
+
+    // Double-click detection: a second click on the same folder within
+    // 400 ms and a few pixels promotes Toggle → SetRoot (enter dir).
+    let action = match raw_action {
+        HitAction::Toggle(ref path) => {
+            let now = std::time::Instant::now();
+            let mut s = shared.state.lock().unwrap();
+            let is_double = match &s.last_folder_click {
+                Some((t0, px, py, last_path)) => {
+                    last_path == path
+                        && now.duration_since(*t0).as_millis() < 400
+                        && (px - x).abs() < 5.0
+                        && (py - y).abs() < 5.0
+                }
+                None => false,
+            };
+            if is_double {
+                s.last_folder_click = None;
+                HitAction::SetRoot(path.clone())
+            } else {
+                s.last_folder_click = Some((now, x, y, path.clone()));
+                raw_action
+            }
+        }
+        other => other,
     };
     match &action {
         HitAction::Open(path) => {
@@ -865,6 +896,14 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
         }
         HitAction::CopyCode(text) => {
             clipboard::copy(text);
+        }
+        HitAction::SetRoot(path) => {
+            let mut s = shared.state.lock().unwrap();
+            if let Some(t) = s.tree.as_mut() {
+                t.set_root(path.clone());
+            }
+            // Re-rooting invalidates any pending double-click anchor.
+            s.last_folder_click = None;
         }
         HitAction::ScrollTo(y) => {
             // Clamp against the actual doc height so clicking "Smallest
@@ -938,6 +977,7 @@ pub fn run(arg: Option<PathBuf>) -> ExitCode {
             sidebar_scrollbar_grip: 0.0,
             content_zoom: 1.0,
             sidebar_zoom: 1.0,
+            last_folder_click: None,
         }),
     });
 

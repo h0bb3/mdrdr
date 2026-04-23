@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 pub enum TreeKind {
     Folder,
     Markdown,
+    /// Synthetic ".." row shown above the root when the root has a parent.
+    /// Clicking it re-roots the tree one level up.
+    Parent,
 }
 
 #[derive(Debug, Clone)]
@@ -36,14 +39,31 @@ impl FileTree {
         }
     }
 
+    /// Replace the tree's root directory. Forgets previous expand state.
+    pub fn set_root(&mut self, path: PathBuf) {
+        self.expanded.clear();
+        self.expanded.insert(path.clone());
+        self.root = path;
+    }
+
     pub fn is_expanded(&self, path: &Path) -> bool {
         self.expanded.contains(path)
     }
 
     /// Return a flat, ordered display list. Folders first, then files,
     /// alphabetical. Hidden entries (starting with '.') are skipped.
+    /// If the root has a parent directory, a synthetic ".." entry is
+    /// prepended so the user can navigate up.
     pub fn flatten(&self) -> Vec<TreeEntry> {
         let mut out = Vec::new();
+        if let Some(parent) = self.root.parent() {
+            out.push(TreeEntry {
+                path: parent.to_path_buf(),
+                depth: 0,
+                kind: TreeKind::Parent,
+                expanded: false,
+            });
+        }
         let root = self.root.clone();
         if root.is_dir() {
             out.push(TreeEntry {

@@ -89,6 +89,9 @@ pub enum HitAction {
     /// Scroll the content panel to this document y-coord. Used by the
     /// sidebar outline entries.
     ScrollTo(f32),
+    /// Change the sidebar tree's root directory. Emitted by the ".."
+    /// row and by a double-click on any directory.
+    SetRoot(PathBuf),
 }
 
 /// A heading captured during content layout, used to build the sidebar
@@ -251,6 +254,26 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
         );
     }
 
+    // Resolve internal anchor links (href="#slug") against the outline so
+    // clicking one scrolls instead of trying to xdg-open "#slug". Slugs
+    // follow the common GitHub convention: lowercase, non-alphanumerics
+    // collapsed to single hyphens.
+    let mut slug_y: std::collections::HashMap<String, f32> =
+        std::collections::HashMap::with_capacity(outline.len());
+    for o in &outline {
+        slug_y.entry(slugify(&o.text)).or_insert(o.doc_y);
+    }
+    for hit in &mut content_hit_targets {
+        if let HitAction::OpenUrl(href) = &hit.action {
+            if let Some(slug) = href.strip_prefix('#') {
+                let s = slugify(slug);
+                if let Some(y) = slug_y.get(&s) {
+                    hit.action = HitAction::ScrollTo(*y);
+                }
+            }
+        }
+    }
+
     Layout {
         content_items,
         pinned_items,
@@ -261,6 +284,29 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
         sidebar_content_height,
         outline,
     }
+}
+
+/// GitHub-style slug: lowercase, drop non-alphanumerics (keeping hyphens/
+/// underscores), runs of separators collapse to one hyphen. Good enough
+/// to match most hand-written link fragments against heading text.
+fn slugify(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_sep = true;
+    for ch in s.chars() {
+        if ch.is_alphanumeric() {
+            for c in ch.to_lowercase() {
+                out.push(c);
+            }
+            prev_sep = false;
+        } else if !prev_sep {
+            out.push('-');
+            prev_sep = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
 }
 
 // ───── sidebar layout ───────────────────────────────────────────────────────
@@ -302,9 +348,12 @@ fn layout_sidebar(
         if row_y + row_h < 0.0 || row_y > height {
             continue;
         }
-        let rel_name = match entry.path.file_name() {
-            Some(n) => n.to_string_lossy().to_string(),
-            None => entry.path.display().to_string(),
+        let rel_name = match entry.kind {
+            TreeKind::Parent => "..".to_string(),
+            _ => match entry.path.file_name() {
+                Some(n) => n.to_string_lossy().to_string(),
+                None => entry.path.display().to_string(),
+            },
         };
         let indent = 10.0 + (entry.depth as f32) * 14.0;
         let is_active = active.map(|a| a == entry.path.as_path()).unwrap_or(false);
@@ -321,6 +370,7 @@ fn layout_sidebar(
         let marker = match entry.kind {
             TreeKind::Folder => if entry.expanded { "▾" } else { "▸" },
             TreeKind::Markdown => " ",
+            TreeKind::Parent => "↑",
         };
         let baseline = row_y + row_h * 0.5 + size * 0.35;
         let muted = theme.muted;
@@ -342,13 +392,13 @@ fn layout_sidebar(
         }
         x += size * 0.25;
 
-        let font_id = if entry.kind == TreeKind::Folder {
-            FontId::Bold
-        } else {
-            FontId::Body
+        let font_id = match entry.kind {
+            TreeKind::Folder => FontId::Bold,
+            _ => FontId::Body,
         };
         let color = match entry.kind {
             TreeKind::Folder => fg,
+            TreeKind::Parent => muted,
             TreeKind::Markdown if is_active => theme.accent,
             TreeKind::Markdown => fg,
         };
@@ -391,6 +441,7 @@ fn layout_sidebar(
         let action = match entry.kind {
             TreeKind::Folder => HitAction::Toggle(entry.path.clone()),
             TreeKind::Markdown => HitAction::Open(entry.path.clone()),
+            TreeKind::Parent => HitAction::SetRoot(entry.path.clone()),
         };
         // Clip hit-target to the visible strip so a partial row doesn't grab
         // clicks outside the sidebar. If there's a scrollbar, shrink the
