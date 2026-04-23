@@ -39,6 +39,7 @@ pub fn render_to_png(
             sidebar_width: if flat.is_some() { 260.0 } else { 0.0 },
             sidebar_scroll: 0.0,
             selection: None,
+            hover_pos: None,
         },
         &mut images,
     );

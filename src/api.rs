@@ -64,7 +64,8 @@ fn handle(
 
     match (method, path) {
         ("GET", "/state") => ok_json(&mut stream, &state_json(&shared)),
-        ("GET", "/screenshot") => screenshot(&mut stream, &shared),
+        ("GET", "/screenshot") => screenshot(&mut stream, &shared, &q),
+        ("GET", "/hits") => do_hits(&mut stream, &shared),
         ("GET", "/tree") => ok_json(&mut stream, &tree_json(&shared)),
         ("POST", "/scroll") => do_scroll(&mut stream, &shared, &proxy, &q),
         ("POST", "/resize") => do_resize(&mut stream, &shared, &proxy, &q),
@@ -139,9 +140,20 @@ fn entry_json(e: &TreeEntry, active: Option<&std::path::Path>) -> String {
     )
 }
 
-fn screenshot(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> {
+fn screenshot(
+    stream: &mut TcpStream,
+    shared: &Arc<Shared>,
+    q: &HashMap<String, String>,
+) -> std::io::Result<()> {
     let snap = shared.snapshot();
     let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+    let hover_pos = match (
+        q.get("hx").and_then(|v| v.parse::<f32>().ok()),
+        q.get("hy").and_then(|v| v.parse::<f32>().ok()),
+    ) {
+        (Some(hx), Some(hy)) => Some((hx, hy)),
+        _ => None,
+    };
     let mut images = shared.images.lock().unwrap();
     let fb = render(
         &RenderInput {
@@ -156,6 +168,7 @@ fn screenshot(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<(
             sidebar_width: snap.sidebar_width,
             sidebar_scroll: snap.sidebar_scroll,
             selection: snap.selection,
+            hover_pos,
         },
         &mut images,
     );
@@ -281,6 +294,7 @@ fn action_json(a: &crate::layout::HitAction) -> String {
     match a {
         Open(p) => format!("{{\"kind\":\"open\",\"path\":\"{}\"}}", json_escape(&p.display().to_string())),
         Toggle(p) => format!("{{\"kind\":\"toggle\",\"path\":\"{}\"}}", json_escape(&p.display().to_string())),
+        OpenUrl(u) => format!("{{\"kind\":\"url\",\"url\":\"{}\"}}", json_escape(u)),
     }
 }
 
@@ -323,6 +337,49 @@ fn do_sidebar(
     clamp_sidebar_scroll(shared);
     let _ = proxy.send_event(UserEvent::Redraw);
     ok_json(stream, &state_json(shared))
+}
+
+fn do_hits(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> {
+    let snap = shared.snapshot();
+    let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+    let (pinned, content) = {
+        let mut images = shared.images.lock().unwrap();
+        crate::render::compute_all_hit_targets(
+            &RenderInput {
+                source: &snap.source,
+                viewport: snap.viewport,
+                scroll: snap.scroll,
+                theme: &snap.theme,
+                fonts: &shared.fonts,
+                tree: snap.tree_flat.as_deref(),
+                active_path: snap.source_path.as_deref(),
+                base_dir: base_dir.as_deref(),
+                sidebar_width: snap.sidebar_width,
+                sidebar_scroll: snap.sidebar_scroll,
+                selection: None,
+                hover_pos: None,
+            },
+            &mut images,
+        )
+    };
+    let mut body = String::from("{\"pinned\":[");
+    for (i, t) in pinned.iter().enumerate() {
+        if i > 0 { body.push(','); }
+        body.push_str(&format!(
+            "{{\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1}}}",
+            t.x, t.y, t.w, t.h
+        ));
+    }
+    body.push_str("],\"content\":[");
+    for (i, t) in content.iter().enumerate() {
+        if i > 0 { body.push(','); }
+        body.push_str(&format!(
+            "{{\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1}}}",
+            t.x, t.y, t.w, t.h
+        ));
+    }
+    body.push_str("]}");
+    ok_json(stream, &body)
 }
 
 fn clamp_sidebar_scroll(shared: &Arc<Shared>) {
@@ -402,6 +459,7 @@ fn do_copy(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> 
                 sidebar_width: snap.sidebar_width,
                 sidebar_scroll: snap.sidebar_scroll,
                 selection: snap.selection,
+                hover_pos: None,
             },
             &mut images,
         )

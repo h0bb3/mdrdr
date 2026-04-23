@@ -71,6 +71,9 @@ pub struct RenderInput<'a> {
     pub sidebar_scroll: f32,
     /// (anchor, head) in document coordinates. None = no selection.
     pub selection: Option<((f32, f32), (f32, f32))>,
+    /// Mouse position in screen coords. Used to paint a hover highlight on
+    /// the hit-target under the cursor (tree row / link).
+    pub hover_pos: Option<(f32, f32)>,
 }
 
 pub fn render(input: &RenderInput, images: &mut ImageCache) -> Framebuffer {
@@ -90,7 +93,15 @@ pub fn render(input: &RenderInput, images: &mut ImageCache) -> Framebuffer {
         },
         images,
     );
-    draw(&lay, input.viewport, input.scroll, input.theme, input.fonts, input.selection)
+    draw(
+        &lay,
+        input.viewport,
+        input.scroll,
+        input.theme,
+        input.fonts,
+        input.selection,
+        input.hover_pos,
+    )
 }
 
 pub fn measure(
@@ -178,7 +189,64 @@ pub fn in_scrollbar_strip(g: &SbGeom, viewport: Viewport, x: f32, y: f32) -> boo
     x >= strip_left && x < strip_right && y >= g.track_y && y < g.track_y + g.track_h
 }
 
-pub fn compute_hit_targets(input: &RenderInput, images: &mut ImageCache) -> Vec<HitTarget> {
+/// Width of the sidebar scrollbar. Shared by layout (draw) and window
+/// (hit test).
+pub const SIDEBAR_SB_W: f32 = 6.0;
+pub const SIDEBAR_SB_RIGHT_PAD: f32 = 2.0;
+pub const SIDEBAR_SB_HIT_W: f32 = 14.0;
+pub const SIDEBAR_SB_MIN_THUMB: f32 = 32.0;
+
+/// Geometry for the sidebar's internal scrollbar. None when the tree fits.
+pub fn sidebar_scrollbar_geom(
+    sidebar_width: f32,
+    viewport_h: f32,
+    sidebar_scroll: f32,
+    content_h: f32,
+) -> Option<SbGeom> {
+    if content_h <= viewport_h + 1.0 {
+        return None;
+    }
+    let max_scroll = (content_h - viewport_h).max(1.0);
+    let thumb_h = ((viewport_h / content_h) * viewport_h)
+        .max(SIDEBAR_SB_MIN_THUMB)
+        .min(viewport_h);
+    let frac = (sidebar_scroll / max_scroll).clamp(0.0, 1.0);
+    let thumb_y = frac * (viewport_h - thumb_h);
+    Some(SbGeom {
+        track_x: sidebar_width - SIDEBAR_SB_W - SIDEBAR_SB_RIGHT_PAD,
+        track_y: 0.0,
+        track_w: SIDEBAR_SB_W,
+        track_h: viewport_h,
+        thumb_y,
+        thumb_h,
+        max_scroll,
+    })
+}
+
+/// Is (x, y) inside the sidebar scrollbar hit strip?
+pub fn in_sidebar_scrollbar_strip(g: &SbGeom, sidebar_width: f32, x: f32, y: f32) -> bool {
+    let strip_right = sidebar_width;
+    let strip_left = sidebar_width - SIDEBAR_SB_HIT_W - SIDEBAR_SB_RIGHT_PAD;
+    x >= strip_left && x < strip_right && y >= g.track_y && y < g.track_y + g.track_h
+}
+
+/// Total content height of the sidebar tree. Pure formula — no layout pass
+/// needed. Used by callers that need to clamp sidebar_scroll without
+/// re-laying out the whole document.
+pub fn sidebar_content_height(theme: &Theme, tree_len: usize) -> f32 {
+    let size = theme.body_size * 0.82;
+    let row_h = size * 1.5;
+    let top_pad = theme.margin_y * 0.5;
+    top_pad * 2.0 + row_h * tree_len as f32
+}
+
+/// Returns (pinned_hits, content_hits). Pinned hits (sidebar tree rows) are
+/// in screen coordinates. Content hits (links) are in document coordinates
+/// and need `- scroll` applied before hit-testing.
+pub fn compute_all_hit_targets(
+    input: &RenderInput,
+    images: &mut ImageCache,
+) -> (Vec<HitTarget>, Vec<HitTarget>) {
     let blocks = parse(input.source);
     let lay = layout(
         LayoutInput {
@@ -195,7 +263,7 @@ pub fn compute_hit_targets(input: &RenderInput, images: &mut ImageCache) -> Vec<
         },
         images,
     );
-    lay.hit_targets
+    (lay.hit_targets, lay.content_hit_targets)
 }
 
 fn draw(
@@ -205,6 +273,7 @@ fn draw(
     theme: &Theme,
     fonts: &Fonts,
     selection: Option<((f32, f32), (f32, f32))>,
+    hover_pos: Option<(f32, f32)>,
 ) -> Framebuffer {
     let mut fb = Framebuffer::new(viewport.width, viewport.height, theme.bg);
 
@@ -224,6 +293,21 @@ fn draw(
 
     draw_items(&mut fb, &lay.content_items, scroll, viewport, fonts);
     draw_items(&mut fb, &lay.pinned_items, 0.0, viewport, fonts);
+
+    // Hover highlight goes *after* pinned_items so the sidebar's opaque
+    // background doesn't bury it. alpha is low enough to leave glyphs
+    // readable through the tint.
+    if let Some((hx, hy)) = hover_pos {
+        if let Some(t) = hit_test(&lay.hit_targets, hx, hy) {
+            let hl: Rgba = [theme.muted[0], theme.muted[1], theme.muted[2], 45];
+            fb.fill_rect(t.x as i32, t.y as i32, t.w.ceil() as i32, t.h.ceil() as i32, hl);
+        } else if let Some(t) = hit_test(&lay.content_hit_targets, hx, hy + scroll) {
+            let sy = t.y - scroll;
+            let hl: Rgba = [theme.accent[0], theme.accent[1], theme.accent[2], 45];
+            fb.fill_rect(t.x as i32, sy as i32, t.w.ceil() as i32, t.h.ceil() as i32, hl);
+        }
+    }
+
     draw_scrollbar(&mut fb, viewport, scroll, lay.doc_height, theme);
     fb
 }

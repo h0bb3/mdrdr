@@ -20,8 +20,9 @@ use crate::font::Fonts;
 use crate::images::ImageCache;
 use crate::layout::HitAction;
 use crate::render::{
-    compute_hit_targets, extract_selection, hit_test, in_scrollbar_strip, measure, render,
-    scrollbar_geom, RenderInput, SbGeom, Viewport,
+    compute_all_hit_targets, extract_selection, hit_test, in_scrollbar_strip,
+    in_sidebar_scrollbar_strip, measure, render, scrollbar_geom, sidebar_content_height,
+    sidebar_scrollbar_geom, RenderInput, SbGeom, Viewport,
 };
 use crate::theme::Theme;
 use crate::tree::FileTree;
@@ -59,6 +60,10 @@ pub struct AppState {
     /// using `scrollbar_grip` (offset between mouse_y and thumb top at press).
     pub scrollbar_dragging: bool,
     pub scrollbar_grip: f32,
+
+    /// Same as above but for the sidebar's internal scrollbar.
+    pub sidebar_scrollbar_dragging: bool,
+    pub sidebar_scrollbar_grip: f32,
 }
 
 pub struct Shared {
@@ -74,6 +79,15 @@ impl Shared {
             (Some(a), Some(h)) if a != h => Some((a, h)),
             _ => None,
         };
+        let quiet = !s.is_selecting
+            && !s.sidebar_dragging
+            && !s.scrollbar_dragging
+            && !s.sidebar_scrollbar_dragging;
+        let hover_pos = if quiet {
+            Some((s.last_mouse.x as f32, s.last_mouse.y as f32))
+        } else {
+            None
+        };
         Snapshot {
             source: s.source.clone(),
             source_path: s.source_path.clone(),
@@ -84,6 +98,7 @@ impl Shared {
             sidebar_width: s.sidebar_width,
             sidebar_scroll: s.sidebar_scroll,
             selection,
+            hover_pos,
         }
     }
 }
@@ -98,6 +113,10 @@ pub struct Snapshot {
     pub sidebar_width: f32,
     pub sidebar_scroll: f32,
     pub selection: Option<((f32, f32), (f32, f32))>,
+    /// Mouse position in screen coords, but only when the window is in a
+    /// "quiet" state — not dragging, not selecting. Drawn hover highlights
+    /// flicker if left on during active interaction.
+    pub hover_pos: Option<(f32, f32)>,
 }
 
 struct App {
@@ -108,6 +127,10 @@ struct App {
     modifiers: Modifiers,
     /// Cached last-set cursor so we don't spam `set_cursor` every mouse move.
     cursor: CursorIcon,
+    /// Last hit-target rect under the pointer (screen coords for pinned,
+    /// doc coords for content). Used to detect the need to repaint the
+    /// hover highlight when crossing between adjacent clickable rects.
+    last_hover_rect: Option<(f32, f32, f32, f32)>,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -170,30 +193,42 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                let (dragging_sidebar, dragging_scrollbar, selecting, scroll, grip, sidebar_w, tree_visible, viewport) = {
+                let (dragging_sidebar, dragging_scrollbar, dragging_sb_sidebar, selecting, scroll, grip, sb_sidebar_grip, sidebar_w, tree_visible, viewport) = {
                     let mut s = self.shared.state.lock().unwrap();
                     s.last_mouse = position;
                     (
                         s.sidebar_dragging,
                         s.scrollbar_dragging,
+                        s.sidebar_scrollbar_dragging,
                         s.is_selecting,
                         s.scroll,
                         s.scrollbar_grip,
+                        s.sidebar_scrollbar_grip,
                         s.sidebar_width,
                         s.tree.is_some(),
                         s.viewport,
                     )
                 };
-                self.update_cursor(
+                let cursor_changed = self.update_cursor(
                     position.x as f32,
                     position.y as f32,
                     dragging_sidebar,
-                    dragging_scrollbar,
+                    dragging_scrollbar || dragging_sb_sidebar,
                     selecting,
                     sidebar_w,
                     tree_visible,
                     viewport,
                 );
+                if cursor_changed
+                    && !dragging_scrollbar
+                    && !dragging_sb_sidebar
+                    && !dragging_sidebar
+                    && !selecting
+                {
+                    // Hover highlight follows the cursor icon; repaint when
+                    // the clickable/non-clickable boundary crosses.
+                    self.request_redraw();
+                }
                 if dragging_scrollbar {
                     if let Some(g) = self.current_scrollbar_geom() {
                         let vh = g.track_h;
@@ -207,6 +242,21 @@ impl ApplicationHandler<UserEvent> for App {
                             s.scroll = new_scroll;
                         }
                         self.clamp_scroll();
+                        self.request_redraw();
+                    }
+                } else if dragging_sb_sidebar {
+                    if let Some(g) = self.current_sidebar_scrollbar_geom() {
+                        let vh = g.track_h;
+                        let track_avail = (vh - g.thumb_h).max(1.0);
+                        let new_thumb_top =
+                            (position.y as f32 - sb_sidebar_grip).clamp(0.0, vh - g.thumb_h);
+                        let frac = new_thumb_top / track_avail;
+                        let new_scroll = frac * g.max_scroll;
+                        {
+                            let mut s = self.shared.state.lock().unwrap();
+                            s.sidebar_scroll = new_scroll;
+                        }
+                        self.clamp_sidebar_scroll();
                         self.request_redraw();
                     }
                 } else if dragging_sidebar {
@@ -259,7 +309,33 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                // 2. Sidebar's right-edge drag strip.
+                // 2. Sidebar's internal scrollbar strip (intercept before
+                //    anything in the sidebar so it doesn't click-through
+                //    to a tree row underneath).
+                if tree_visible {
+                    if let Some(g) = self.current_sidebar_scrollbar_geom() {
+                        if in_sidebar_scrollbar_strip(&g, sidebar_w, x, y) {
+                            if y >= g.thumb_y && y < g.thumb_y + g.thumb_h {
+                                let mut s = self.shared.state.lock().unwrap();
+                                s.sidebar_scrollbar_dragging = true;
+                                s.sidebar_scrollbar_grip = y - g.thumb_y;
+                            } else {
+                                let page = g.track_h * 0.9;
+                                let mut s = self.shared.state.lock().unwrap();
+                                if y < g.thumb_y {
+                                    s.sidebar_scroll = (s.sidebar_scroll - page).max(0.0);
+                                } else {
+                                    s.sidebar_scroll = (s.sidebar_scroll + page).min(g.max_scroll);
+                                }
+                            }
+                            self.clamp_sidebar_scroll();
+                            self.request_redraw();
+                            return;
+                        }
+                    }
+                }
+
+                // 3. Sidebar's right-edge drag strip (resize sidebar width).
                 if tree_visible && sidebar_w > 0.0 && (x - sidebar_w).abs() <= 6.0 {
                     let mut s = self.shared.state.lock().unwrap();
                     s.sidebar_dragging = true;
@@ -272,7 +348,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     click_at(&self.shared, x, y);
                 } else {
-                    // 4. Content area — start a text selection.
+                    // 4. Content area — start a text selection. A click (no
+                    // drag) will be caught on release and dispatched to
+                    // click_at so links still fire.
                     let doc = (x, y + scroll);
                     let mut s = self.shared.state.lock().unwrap();
                     s.sel_anchor = Some(doc);
@@ -284,10 +362,38 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
-                let mut s = self.shared.state.lock().unwrap();
-                s.sidebar_dragging = false;
-                s.is_selecting = false;
-                s.scrollbar_dragging = false;
+                // Decide whether the press→release pair was a click (no drag)
+                // that should dispatch to click_at (for link handling).
+                let (click_candidate, last_mouse) = {
+                    let mut s = self.shared.state.lock().unwrap();
+                    let was_selecting = s.is_selecting;
+                    let anchor = s.sel_anchor;
+                    let head = s.sel_head;
+                    s.sidebar_dragging = false;
+                    s.is_selecting = false;
+                    s.scrollbar_dragging = false;
+                    s.sidebar_scrollbar_dragging = false;
+                    let click = match (was_selecting, anchor, head) {
+                        (true, Some(a), Some(h)) => {
+                            let dx = (a.0 - h.0).abs();
+                            let dy = (a.1 - h.1).abs();
+                            if dx < 3.0 && dy < 3.0 {
+                                // Degenerate selection → treat as a click.
+                                s.sel_anchor = None;
+                                s.sel_head = None;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    (click, s.last_mouse)
+                };
+                if click_candidate {
+                    click_at(&self.shared, last_mouse.x as f32, last_mouse.y as f32);
+                    self.request_redraw();
+                }
             }
 
             WindowEvent::ModifiersChanged(mods) => {
@@ -425,6 +531,10 @@ impl App {
 
     /// Decide which cursor icon to show based on what the pointer is over,
     /// and push it to the window (only when it changes).
+    ///
+    /// Pointer is reserved for things the user can actually click:
+    /// tree rows in the sidebar and markdown links in the content. The
+    /// scrollbar keeps the default cursor (no hand), matching the request.
     #[allow(clippy::too_many_arguments)]
     fn update_cursor(
         &mut self,
@@ -435,35 +545,84 @@ impl App {
         selecting: bool,
         sidebar_w: f32,
         tree_visible: bool,
-        viewport: Viewport,
-    ) {
+        _viewport: Viewport,
+    ) -> bool {
+        // Compute hover rect once so we can both pick the cursor and
+        // notice when the hovered target changes between equal-cursor rects
+        // (e.g., two adjacent tree rows both want CursorIcon::Pointer).
+        let hover_rect = if dragging_scrollbar || dragging_sidebar || selecting {
+            None
+        } else {
+            self.hovered_rect(x, y)
+        };
+
         let icon = if dragging_scrollbar {
-            CursorIcon::Grabbing
+            // Keep default while scroll-dragging — no grab cursor per user ask.
+            CursorIcon::Default
         } else if dragging_sidebar {
             CursorIcon::EwResize
         } else if selecting {
             CursorIcon::Text
-        } else if let Some(g) = self.current_scrollbar_geom().filter(|g| {
-            in_scrollbar_strip(g, viewport, x, y)
-        }) {
-            if y >= g.thumb_y && y < g.thumb_y + g.thumb_h {
-                CursorIcon::Grab
-            } else {
-                CursorIcon::Pointer
-            }
         } else if tree_visible && sidebar_w > 0.0 && (x - sidebar_w).abs() <= 6.0 {
             CursorIcon::EwResize
-        } else if x < sidebar_w {
+        } else if hover_rect.is_some() {
             CursorIcon::Pointer
+        } else if x < sidebar_w {
+            CursorIcon::Default
         } else {
             CursorIcon::Text
         };
-        if icon != self.cursor {
+
+        let icon_changed = icon != self.cursor;
+        if icon_changed {
             if let Some(w) = &self.window {
                 w.set_cursor(icon);
             }
             self.cursor = icon;
         }
+        let hover_changed = hover_rect != self.last_hover_rect;
+        self.last_hover_rect = hover_rect;
+        icon_changed || hover_changed
+    }
+
+    /// True if (x, y) is over a clickable hit-target (tree row or link).
+    fn over_clickable(&self, x: f32, y: f32) -> bool {
+        self.hovered_rect(x, y).is_some()
+    }
+
+    /// Return the hit-target rect under (x, y), or None. Pinned rects are in
+    /// screen coords; content rects in doc coords — we return them as-is so
+    /// the caller can just compare the tuple.
+    fn hovered_rect(&self, x: f32, y: f32) -> Option<(f32, f32, f32, f32)> {
+        let (pinned, content) = self.current_hit_targets();
+        if let Some(t) = crate::render::hit_test(&pinned, x, y) {
+            return Some((t.x, t.y, t.w, t.h));
+        }
+        let scroll = self.shared.state.lock().unwrap().scroll;
+        crate::render::hit_test(&content, x, y + scroll).map(|t| (t.x, t.y, t.w, t.h))
+    }
+
+    fn current_hit_targets(&self) -> (Vec<crate::layout::HitTarget>, Vec<crate::layout::HitTarget>) {
+        let snap = self.shared.snapshot();
+        let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+        let mut images = self.shared.images.lock().unwrap();
+        compute_all_hit_targets(
+            &RenderInput {
+                source: &snap.source,
+                viewport: snap.viewport,
+                scroll: snap.scroll,
+                theme: &snap.theme,
+                fonts: &self.shared.fonts,
+                tree: snap.tree_flat.as_deref(),
+                active_path: snap.source_path.as_deref(),
+                base_dir: base_dir.as_deref(),
+                sidebar_width: snap.sidebar_width,
+                sidebar_scroll: snap.sidebar_scroll,
+                selection: None,
+                hover_pos: None,
+            },
+            &mut images,
+        )
     }
 
     /// Measure the sidebar's total content height and clamp
@@ -488,6 +647,21 @@ impl App {
         if s.sidebar_scroll < 0.0 {
             s.sidebar_scroll = 0.0;
         }
+    }
+
+    fn current_sidebar_scrollbar_geom(&self) -> Option<SbGeom> {
+        let snap = self.shared.snapshot();
+        let tree = snap.tree_flat.as_ref()?;
+        if snap.sidebar_width <= 0.0 {
+            return None;
+        }
+        let content_h = sidebar_content_height(&snap.theme, tree.len());
+        sidebar_scrollbar_geom(
+            snap.sidebar_width,
+            snap.viewport.height as f32,
+            snap.sidebar_scroll,
+            content_h,
+        )
     }
 
     fn current_scrollbar_geom(&self) -> Option<SbGeom> {
@@ -537,6 +711,7 @@ impl App {
                     sidebar_width: snap.sidebar_width,
                     sidebar_scroll: snap.sidebar_scroll,
                     selection: snap.selection,
+                    hover_pos: None,
                 },
                 &mut images,
             )
@@ -575,6 +750,7 @@ impl App {
                 sidebar_width: snap.sidebar_width,
                 sidebar_scroll: snap.sidebar_scroll,
                 selection: snap.selection,
+                hover_pos: snap.hover_pos,
             },
             &mut images,
         );
@@ -596,9 +772,9 @@ impl App {
 pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
     let snap = shared.snapshot();
     let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
-    let targets = {
+    let (pinned, content) = {
         let mut images = shared.images.lock().unwrap();
-        compute_hit_targets(
+        compute_all_hit_targets(
             &RenderInput {
                 source: &snap.source,
                 viewport: snap.viewport,
@@ -611,14 +787,20 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
                 sidebar_width: snap.sidebar_width,
                 sidebar_scroll: snap.sidebar_scroll,
                 selection: None,
+                hover_pos: None,
             },
             &mut images,
         )
     };
-    let Some(hit) = hit_test(&targets, x, y) else {
+    // Pinned targets (tree rows) first — they're in screen coords.
+    let action = if let Some(hit) = hit_test(&pinned, x, y) {
+        hit.action.clone()
+    } else if let Some(hit) = hit_test(&content, x, y + snap.scroll) {
+        // Content targets (links) are in document coords.
+        hit.action.clone()
+    } else {
         return None;
     };
-    let action = hit.action.clone();
     match &action {
         HitAction::Open(path) => {
             let source = std::fs::read_to_string(path).unwrap_or_default();
@@ -633,8 +815,18 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
                 t.toggle(path);
             }
         }
+        HitAction::OpenUrl(url) => {
+            open_url(url);
+        }
     }
     Some(action)
+}
+
+/// Shell out to `xdg-open` (Linux). Errors silently — the worst case is a
+/// click that does nothing, which matches the prior "links aren't clickable"
+/// state anyway.
+fn open_url(url: &str) {
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
 pub fn run(arg: Option<PathBuf>) -> ExitCode {
@@ -662,6 +854,8 @@ pub fn run(arg: Option<PathBuf>) -> ExitCode {
             is_selecting: false,
             scrollbar_dragging: false,
             scrollbar_grip: 0.0,
+            sidebar_scrollbar_dragging: false,
+            sidebar_scrollbar_grip: 0.0,
         }),
     });
 
@@ -680,6 +874,7 @@ pub fn run(arg: Option<PathBuf>) -> ExitCode {
         proxy,
         modifiers: Modifiers::default(),
         cursor: CursorIcon::Default,
+        last_hover_rect: None,
     };
 
     match event_loop.run_app(&mut app) {

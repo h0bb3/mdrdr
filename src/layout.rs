@@ -79,6 +79,7 @@ pub enum Placed {
 pub enum HitAction {
     Open(PathBuf),
     Toggle(PathBuf),
+    OpenUrl(String),
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +94,11 @@ pub struct HitTarget {
 pub struct Layout {
     pub content_items: Vec<Placed>,
     pub pinned_items: Vec<Placed>,
+    /// Hit targets pinned to screen coords (sidebar rows). y is screen y.
     pub hit_targets: Vec<HitTarget>,
+    /// Hit targets in document coords (links inside content). y needs
+    /// `- scroll` to translate to screen coords at hit-test time.
+    pub content_hit_targets: Vec<HitTarget>,
     pub doc_height: f32,
     pub sidebar_width: f32,
     /// Total pixel height needed to render every tree row. Used to clamp
@@ -165,9 +170,11 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
     let content_right = (input.viewport_w as f32) - input.theme.margin_x;
 
     let mut content_items: Vec<Placed> = Vec::new();
+    let mut content_hit_targets: Vec<HitTarget> = Vec::new();
     let doc_height = {
         let mut ctx = Ctx {
             items: &mut content_items,
+            content_hits: &mut content_hit_targets,
             y: input.theme.margin_y,
             content_left,
             content_right,
@@ -203,6 +210,7 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
         content_items,
         pinned_items,
         hit_targets,
+        content_hit_targets,
         doc_height,
         sidebar_width,
         sidebar_content_height,
@@ -328,32 +336,42 @@ fn layout_sidebar(
             TreeKind::Markdown => HitAction::Open(entry.path.clone()),
         };
         // Clip hit-target to the visible strip so a partial row doesn't grab
-        // clicks outside the sidebar.
+        // clicks outside the sidebar. If there's a scrollbar, shrink the
+        // row's right edge so clicks on the scrollbar don't fall through
+        // to the tree row underneath.
         let clipped_top = row_y.max(0.0);
         let clipped_bot = (row_y + row_h).min(height);
+        let right_inset = if content_h > height + 1.0 {
+            crate::render::SIDEBAR_SB_HIT_W + crate::render::SIDEBAR_SB_RIGHT_PAD
+        } else {
+            0.0
+        };
+        let row_w = (width - right_inset).max(1.0);
         if clipped_bot > clipped_top {
             hits.push(HitTarget {
                 x: 0.0,
                 y: clipped_top,
-                w: width,
+                w: row_w,
                 h: clipped_bot - clipped_top,
                 action,
             });
         }
     }
 
-    // Thin scrollbar stripe on the sidebar's right edge (inside the border).
-    if content_h > height + 1.0 {
-        let max_scroll = (content_h - height).max(1.0);
-        let thumb_h = ((height / content_h) * height).max(32.0).min(height);
-        let frac = (sidebar_scroll / max_scroll).clamp(0.0, 1.0);
-        let thumb_y = frac * (height - thumb_h);
-        let sb_w = 6.0;
-        let sb_x = width - sb_w - 2.0;
+    // Thin scrollbar stripe on the sidebar's right edge. Geometry comes
+    // from `render::sidebar_scrollbar_geom` so hit-testing and drawing
+    // stay in sync.
+    if let Some(g) = crate::render::sidebar_scrollbar_geom(width, height, sidebar_scroll, content_h) {
         let track_color = [theme.muted[0], theme.muted[1], theme.muted[2], 30];
         let thumb_color = [theme.muted[0], theme.muted[1], theme.muted[2], 170];
-        items.push(Placed::Rect { x: sb_x, y: 0.0, w: sb_w, h: height, color: track_color });
-        items.push(Placed::Rect { x: sb_x, y: thumb_y, w: sb_w, h: thumb_h, color: thumb_color });
+        items.push(Placed::Rect {
+            x: g.track_x, y: g.track_y, w: g.track_w, h: g.track_h,
+            color: track_color,
+        });
+        items.push(Placed::Rect {
+            x: g.track_x, y: g.thumb_y, w: g.track_w, h: g.thumb_h,
+            color: thumb_color,
+        });
     }
 
     content_h
@@ -363,6 +381,7 @@ fn layout_sidebar(
 
 struct Ctx<'a> {
     items: &'a mut Vec<Placed>,
+    content_hits: &'a mut Vec<HitTarget>,
     y: f32,
     content_left: f32,
     content_right: f32,
@@ -869,6 +888,15 @@ impl<'a> Ctx<'a> {
             for (idx, ox) in line.iter() {
                 let word = &words[*idx];
                 let wx = left + *ox;
+                if let Some(href) = &word.link_href {
+                    ctx.content_hits.push(HitTarget {
+                        x: wx,
+                        y: y_top,
+                        w: word.width,
+                        h: ascent + descent,
+                        action: HitAction::OpenUrl(href.as_ref().to_string()),
+                    });
+                }
                 match &word.payload {
                     WordPayload::Text { glyphs, style } => {
                         let mut gx = wx;
@@ -1026,6 +1054,9 @@ struct Word {
     ascent: f32,
     descent: f32,
     leading_space: bool,
+    /// If set, every glyph in this word is part of a markdown link and
+    /// clicking anywhere on the word should open this URL.
+    link_href: Option<std::rc::Rc<str>>,
 }
 
 struct WordCollector {
@@ -1035,6 +1066,8 @@ struct WordCollector {
     cur_style: Style,
     cur_leading_space: bool,
     pending_space: bool,
+    /// Active link URL while walking inside an `Inline::Link`.
+    cur_link: Option<std::rc::Rc<str>>,
 }
 
 impl WordCollector {
@@ -1046,6 +1079,7 @@ impl WordCollector {
             cur_style: base,
             cur_leading_space: false,
             pending_space: false,
+            cur_link: None,
         }
     }
 
@@ -1066,6 +1100,7 @@ impl WordCollector {
                 ascent: size * 0.85,
                 descent: size * 0.25,
                 leading_space: self.cur_leading_space,
+                link_href: self.cur_link.clone(),
             });
             self.cur_leading_space = false;
         }
@@ -1124,9 +1159,16 @@ impl WordCollector {
                 };
                 self.emit_text(s, st, fonts);
             }
-            Inline::Link { text, href: _ } => {
+            Inline::Link { text, href } => {
+                // Flush anything pending so the word preceding the link
+                // doesn't accidentally inherit link_href.
+                self.flush();
+                let prev_link = self.cur_link.take();
+                self.cur_link = Some(std::rc::Rc::from(href.as_str()));
                 let s = Style { color: theme.accent, underline: true, ..base };
                 for ii in text { self.walk(ii, s, fonts, theme); }
+                self.flush();
+                self.cur_link = prev_link;
             }
             Inline::Image { alt, .. } => {
                 let label = format!("[image: {}]", alt);
@@ -1148,6 +1190,7 @@ impl WordCollector {
                     ascent,
                     descent,
                     leading_space,
+                    link_href: self.cur_link.clone(),
                 });
             }
         }
