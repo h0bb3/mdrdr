@@ -74,6 +74,9 @@ pub struct AppState {
     /// promote a second click on the same folder within the double-click
     /// window to a SetRoot (enter directory) action.
     pub last_folder_click: Option<(std::time::Instant, f32, f32, PathBuf)>,
+
+    /// When true, Theme::dark() is used for rendering instead of light.
+    pub dark: bool,
 }
 
 pub struct Shared {
@@ -104,7 +107,7 @@ impl Shared {
             scroll: s.scroll,
             viewport: s.viewport,
             tree_flat: s.tree.as_ref().map(|t| t.flatten()),
-            theme: Theme::light(),
+            theme: if s.dark { Theme::dark() } else { Theme::light() },
             sidebar_width: s.sidebar_width,
             sidebar_scroll: s.sidebar_scroll,
             content_zoom: s.content_zoom,
@@ -501,6 +504,11 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     Key::Character(c) if c == "c" && self.modifiers.state().control_key() => {
                         self.copy_selection();
+                        None
+                    }
+                    Key::Character(c) if c == "t" && !self.modifiers.state().control_key() => {
+                        let mut s = self.shared.state.lock().unwrap();
+                        s.dark = !s.dark;
                         None
                     }
                     _ => None,
@@ -978,6 +986,7 @@ pub fn run(arg: Option<PathBuf>) -> ExitCode {
             content_zoom: 1.0,
             sidebar_zoom: 1.0,
             last_folder_click: None,
+            dark: false,
         }),
     });
 

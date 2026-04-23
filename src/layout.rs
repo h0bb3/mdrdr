@@ -325,7 +325,7 @@ fn layout_sidebar(
     items: &mut Vec<Placed>,
     hits: &mut Vec<HitTarget>,
 ) -> f32 {
-    let sidebar_bg = [0xf3, 0xef, 0xe5, 0xff];
+    let sidebar_bg = theme.sidebar_bg;
     let border = theme.muted;
 
     // Background panel.
@@ -363,7 +363,7 @@ fn layout_sidebar(
                 y: row_y,
                 w: width - 4.0,
                 h: row_h,
-                color: [0xe3, 0xdc, 0xc9, 0xff],
+                color: theme.sidebar_active_bg,
             });
         }
 
