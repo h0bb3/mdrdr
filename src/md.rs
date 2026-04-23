@@ -20,6 +20,13 @@ pub enum Inline {
     Math(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    Left,
+    Center,
+    Right,
+}
+
 #[derive(Debug, Clone)]
 pub enum Block {
     Heading { level: u8, inlines: Vec<Inline> },
@@ -30,6 +37,11 @@ pub enum Block {
     ThematicBreak,
     DisplayMath(String),
     Mermaid(String),
+    Table {
+        header: Vec<Vec<Inline>>,
+        align: Vec<Align>,
+        rows: Vec<Vec<Vec<Inline>>>,
+    },
 }
 
 pub fn parse(src: &str) -> Vec<Block> {
@@ -154,6 +166,33 @@ fn parse_lines(lines: &[&str]) -> Vec<Block> {
             continue;
         }
 
+        // Table detection: current line looks like a pipe row, and the next
+        // line is a separator of dashes-with-optional-colons.
+        if looks_like_table_row(line) && i + 1 < lines.len() {
+            if let Some(align) = parse_table_separator(lines[i + 1]) {
+                let header = split_pipe_row(line);
+                if header.len() == align.len() {
+                    let header_inlines: Vec<Vec<Inline>> =
+                        header.iter().map(|c| parse_inlines(c)).collect();
+                    i += 2;
+                    let mut rows: Vec<Vec<Vec<Inline>>> = Vec::new();
+                    while i < lines.len() && looks_like_table_row(lines[i]) {
+                        let cells = split_pipe_row(lines[i]);
+                        let mut row: Vec<Vec<Inline>> =
+                            cells.iter().map(|c| parse_inlines(c)).collect();
+                        while row.len() < align.len() {
+                            row.push(Vec::new());
+                        }
+                        row.truncate(align.len());
+                        rows.push(row);
+                        i += 1;
+                    }
+                    out.push(Block::Table { header: header_inlines, align, rows });
+                    continue;
+                }
+            }
+        }
+
         // Paragraph — soak up contiguous lines.
         let mut buf = String::new();
         while i < lines.len() {
@@ -175,6 +214,88 @@ fn parse_lines(lines: &[&str]) -> Vec<Block> {
         if !buf.is_empty() {
             out.push(Block::Paragraph(parse_inlines(&buf)));
         }
+    }
+    out
+}
+
+fn looks_like_table_row(line: &str) -> bool {
+    let t = line.trim();
+    t.contains('|') && t.chars().any(|c| c == '|')
+        && t.trim_start().starts_with('|')
+        && t.trim_end().ends_with('|')
+}
+
+fn parse_table_separator(line: &str) -> Option<Vec<Align>> {
+    let t = line.trim();
+    if !t.starts_with('|') || !t.ends_with('|') {
+        return None;
+    }
+    let inner = &t[1..t.len() - 1];
+    let cells: Vec<&str> = inner.split('|').map(str::trim).collect();
+    let mut aligns = Vec::with_capacity(cells.len());
+    for c in cells {
+        if c.is_empty() {
+            return None;
+        }
+        let starts = c.starts_with(':');
+        let ends = c.ends_with(':');
+        let body = c.trim_matches(':');
+        if body.is_empty() || !body.chars().all(|ch| ch == '-') {
+            return None;
+        }
+        aligns.push(match (starts, ends) {
+            (true, true) => Align::Center,
+            (false, true) => Align::Right,
+            _ => Align::Left,
+        });
+    }
+    if aligns.is_empty() {
+        None
+    } else {
+        Some(aligns)
+    }
+}
+
+fn split_pipe_row(line: &str) -> Vec<String> {
+    // Split on unescaped '|', then trim. Leading/trailing empties (from the
+    // outer pipes) are dropped.
+    let bytes = line.trim().as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'|' {
+            cur.push('|');
+            i += 2;
+            continue;
+        }
+        if b == b'|' {
+            out.push(cur.trim().to_string());
+            cur = String::new();
+            i += 1;
+            continue;
+        }
+        let ch_len = match b {
+            0x00..=0x7F => 1,
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        let end = (i + ch_len).min(bytes.len());
+        if let Ok(s) = std::str::from_utf8(&bytes[i..end]) {
+            cur.push_str(s);
+        }
+        i = end;
+    }
+    out.push(cur.trim().to_string());
+    // drop empty leading/trailing from surrounding pipes
+    if out.first().map(|s| s.is_empty()).unwrap_or(false) {
+        out.remove(0);
+    }
+    if out.last().map(|s| s.is_empty()).unwrap_or(false) {
+        out.pop();
     }
     out
 }

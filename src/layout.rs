@@ -16,7 +16,7 @@ use fontdue::Font;
 use crate::font::Fonts;
 use crate::images::{CachedImage, ImageCache};
 use crate::math::{self, MathBox};
-use crate::md::{Block, Inline};
+use crate::md::{Align, Block, Inline};
 use crate::theme::{Rgba, Theme};
 use crate::tree::{TreeEntry, TreeKind};
 
@@ -454,6 +454,9 @@ impl<'a> Ctx<'a> {
                     color: self.theme.muted,
                 });
             }
+            Block::Table { header, align, rows } => {
+                self.table(header, align, rows, indent);
+            }
             Block::Mermaid(src) => {
                 let avail = (self.content_right - self.content_left - indent).max(1.0);
                 let Some(mut r) = crate::mermaid::render(src, avail, self.theme, self.fonts) else {
@@ -521,6 +524,248 @@ impl<'a> Ctx<'a> {
                 });
                 self.y = y + 1.0 + self.theme.body_size * 0.8;
             }
+        }
+    }
+
+    fn table(
+        &mut self,
+        header: &[Vec<Inline>],
+        align: &[Align],
+        rows: &[Vec<Vec<Inline>>],
+        indent: f32,
+    ) {
+        if header.is_empty() {
+            return;
+        }
+        let cols = header.len();
+        let pad_x = 12.0;
+        let pad_y = 8.0;
+        let line_color = self.theme.muted;
+        let header_bg: Rgba = [0xef, 0xec, 0xe3, 0xff];
+        let stroke: Rgba = [line_color[0], line_color[1], line_color[2], 180];
+
+        // Natural width for each column = max of (header, body) single-line widths.
+        let base = body_style(self.theme);
+        let mut natural: Vec<f32> = vec![0.0; cols];
+        for c in 0..cols {
+            let h_style = Style { bold: true, ..base };
+            natural[c] = natural[c].max(measure_inline_run(&header[c], h_style, self.fonts, self.theme));
+            for row in rows {
+                if let Some(cell) = row.get(c) {
+                    natural[c] = natural[c].max(
+                        measure_inline_run(cell, base, self.fonts, self.theme),
+                    );
+                }
+            }
+            natural[c] += pad_x * 2.0;
+        }
+
+        // Fit into available width. Cap any single column so super-wide cells
+        // don't starve the rest.
+        let avail = (self.content_right - self.content_left - indent).max(1.0);
+        let cap = avail * 0.6;
+        for w in natural.iter_mut() {
+            *w = w.min(cap.max(80.0));
+        }
+        let total: f32 = natural.iter().sum();
+        let col_w: Vec<f32> = if total > avail {
+            let scale = avail / total;
+            natural.iter().map(|w| w * scale).collect()
+        } else if total > 0.0 && total < avail {
+            // Distribute extra width proportionally, up to the available.
+            let scale = avail / total;
+            let scale = scale.min(1.4); // don't balloon tiny tables
+            natural.iter().map(|w| w * scale).collect()
+        } else {
+            natural.clone()
+        };
+
+        let table_w: f32 = col_w.iter().sum();
+        let x0 = self.content_left + indent;
+
+        let header_style = Style { bold: true, ..base };
+        let y_start = self.y + self.theme.body_size * 0.2;
+        let mut y = y_start;
+
+        // ── header row ──
+        let header_h = self.row_height(header, align, &col_w, header_style, pad_y);
+        self.items.push(Placed::Rect {
+            x: x0, y, w: table_w, h: header_h, color: header_bg,
+        });
+        self.draw_row(header, align, &col_w, header_style, x0, y, header_h, pad_x, pad_y);
+        y += header_h;
+        // border under header
+        self.items.push(Placed::Rect { x: x0, y, w: table_w, h: 1.5, color: stroke });
+        y += 1.5;
+
+        // ── body rows ──
+        for row in rows {
+            let row_h = self.row_height(row, align, &col_w, base, pad_y);
+            self.draw_row(row, align, &col_w, base, x0, y, row_h, pad_x, pad_y);
+            y += row_h;
+            self.items.push(Placed::Rect { x: x0, y, w: table_w, h: 1.0, color: [stroke[0], stroke[1], stroke[2], 90] });
+            y += 1.0;
+        }
+
+        // ── vertical dividers + outer border ──
+        let col_thin: Rgba = [stroke[0], stroke[1], stroke[2], 70];
+        let mut cx = x0;
+        self.items.push(Placed::Rect { x: cx, y: y_start, w: 1.0, h: y - y_start, color: col_thin });
+        for w in &col_w {
+            cx += *w;
+            self.items.push(Placed::Rect { x: cx - 0.5, y: y_start, w: 1.0, h: y - y_start, color: col_thin });
+        }
+
+        self.y = y + self.theme.body_size * 0.4;
+    }
+
+    fn row_height(
+        &self,
+        row: &[Vec<Inline>],
+        _align: &[Align],
+        col_w: &[f32],
+        style: Style,
+        pad_y: f32,
+    ) -> f32 {
+        let mut max_h: f32 = style.size * self.theme.line_height_mult;
+        for (c, cell) in row.iter().enumerate() {
+            let w = col_w.get(c).copied().unwrap_or(0.0);
+            let inner_w = (w - 24.0).max(40.0);
+            let lines = count_wrapped_lines(cell, style, inner_w, self.fonts, self.theme);
+            let h = (lines as f32) * style.size * self.theme.line_height_mult;
+            if h > max_h {
+                max_h = h;
+            }
+        }
+        max_h + pad_y * 2.0
+    }
+
+    fn draw_row(
+        &mut self,
+        row: &[Vec<Inline>],
+        align: &[Align],
+        col_w: &[f32],
+        style: Style,
+        x0: f32,
+        y: f32,
+        row_h: f32,
+        pad_x: f32,
+        pad_y: f32,
+    ) {
+        let mut cell_x = x0;
+        for (c, cell) in row.iter().enumerate() {
+            let Some(&w) = col_w.get(c) else { break };
+            let cell_w_inner = (w - pad_x * 2.0).max(1.0);
+            let a = align.get(c).copied().unwrap_or(Align::Left);
+            let cell_top = y + pad_y;
+            self.draw_cell_inlines(cell, style, cell_x + pad_x, cell_w_inner, cell_top, a);
+            cell_x += w;
+            let _ = row_h;
+        }
+    }
+
+    fn draw_cell_inlines(
+        &mut self,
+        inlines: &[Inline],
+        base: Style,
+        left: f32,
+        width: f32,
+        y_top: f32,
+        align: Align,
+    ) {
+        let mut collector = WordCollector::new(base);
+        for i in inlines {
+            collector.walk(i, base, self.fonts, self.theme);
+        }
+        let words = collector.finish();
+        if words.is_empty() {
+            return;
+        }
+
+        // Wrap into lines greedily.
+        let mut lines: Vec<Vec<usize>> = Vec::new();
+        let mut cur: Vec<usize> = Vec::new();
+        let mut cur_w = 0.0;
+        for (i, w) in words.iter().enumerate() {
+            let sw = match &w.payload {
+                WordPayload::Text { style, .. } => space_advance(self.fonts, *style),
+                WordPayload::Math(_) => self.theme.body_size * 0.3,
+            };
+            let lead = !cur.is_empty() && w.leading_space;
+            let gap = if lead { sw } else { 0.0 };
+            if !cur.is_empty() && cur_w + gap + w.width > width {
+                lines.push(std::mem::take(&mut cur));
+                cur_w = 0.0;
+            }
+            if !cur.is_empty() && w.leading_space {
+                cur_w += sw;
+            }
+            cur.push(i);
+            cur_w += w.width;
+        }
+        if !cur.is_empty() {
+            lines.push(cur);
+        }
+
+        // Place each line with alignment.
+        let lh = base.size * self.theme.line_height_mult;
+        let mut baseline = y_top + base.size;
+        for line in &lines {
+            let line_w = line_width(&words, line, self.fonts);
+            let x_start = match align {
+                Align::Left => left,
+                Align::Center => left + (width - line_w) / 2.0,
+                Align::Right => left + width - line_w,
+            };
+            let mut pen = x_start;
+            for (pos, &idx) in line.iter().enumerate() {
+                let word = &words[idx];
+                if pos > 0 && word.leading_space {
+                    let sw = match &word.payload {
+                        WordPayload::Text { style, .. } => space_advance(self.fonts, *style),
+                        WordPayload::Math(_) => self.theme.body_size * 0.3,
+                    };
+                    pen += sw;
+                }
+                match &word.payload {
+                    WordPayload::Text { glyphs, style } => {
+                        let start_x = pen;
+                        for g in glyphs {
+                            self.items.push(Placed::Glyph {
+                                ch: g.ch,
+                                font: style.font_id(),
+                                size: style.size,
+                                x: pen,
+                                baseline,
+                                color: style.color,
+                            });
+                            pen += g.advance;
+                        }
+                        if style.underline {
+                            self.items.push(Placed::Underline {
+                                x: start_x, y: baseline + 2.0, w: word.width, color: style.color,
+                            });
+                        }
+                    }
+                    WordPayload::Math(mb) => {
+                        for g in &mb.glyphs {
+                            self.items.push(Placed::Glyph {
+                                ch: g.ch, font: g.font, size: g.size,
+                                x: pen + g.x, baseline: baseline + g.y,
+                                color: self.theme.fg,
+                            });
+                        }
+                        for r in &mb.rules {
+                            self.items.push(Placed::Rect {
+                                x: pen + r.x, y: baseline + r.y,
+                                w: r.w, h: r.h, color: self.theme.fg,
+                            });
+                        }
+                        pen += mb.width;
+                    }
+                }
+            }
+            baseline += lh;
         }
     }
 
@@ -878,4 +1123,81 @@ impl WordCollector {
 
 fn space_advance(fonts: &Fonts, style: Style) -> f32 {
     pick_font(fonts, style.font_id()).metrics(' ', style.size).advance_width
+}
+
+/// Measure the single-line natural width of an inline sequence in the given
+/// base style. Used for table column sizing.
+fn measure_inline_run(inlines: &[Inline], base: Style, fonts: &Fonts, theme: &Theme) -> f32 {
+    let mut collector = WordCollector::new(base);
+    for i in inlines {
+        collector.walk(i, base, fonts, theme);
+    }
+    let words = collector.finish();
+    let mut total = 0.0;
+    for (i, w) in words.iter().enumerate() {
+        if i > 0 && w.leading_space {
+            let sw = match &w.payload {
+                WordPayload::Text { style, .. } => space_advance(fonts, *style),
+                WordPayload::Math(_) => theme.body_size * 0.3,
+            };
+            total += sw;
+        }
+        total += w.width;
+    }
+    total
+}
+
+/// Count how many lines a cell's inlines wrap to at the given width.
+fn count_wrapped_lines(
+    inlines: &[Inline],
+    base: Style,
+    width: f32,
+    fonts: &Fonts,
+    theme: &Theme,
+) -> usize {
+    let mut collector = WordCollector::new(base);
+    for i in inlines {
+        collector.walk(i, base, fonts, theme);
+    }
+    let words = collector.finish();
+    if words.is_empty() {
+        return 1;
+    }
+    let mut lines = 1;
+    let mut cur_w: f32 = 0.0;
+    let mut first_on_line = true;
+    for w in &words {
+        let sw = match &w.payload {
+            WordPayload::Text { style, .. } => space_advance(fonts, *style),
+            WordPayload::Math(_) => theme.body_size * 0.3,
+        };
+        let gap = if !first_on_line && w.leading_space { sw } else { 0.0 };
+        if !first_on_line && cur_w + gap + w.width > width {
+            lines += 1;
+            cur_w = 0.0;
+            first_on_line = true;
+        }
+        if !first_on_line && w.leading_space {
+            cur_w += sw;
+        }
+        cur_w += w.width;
+        first_on_line = false;
+    }
+    lines
+}
+
+fn line_width(words: &[Word], indices: &[usize], fonts: &Fonts) -> f32 {
+    let mut w: f32 = 0.0;
+    for (pos, &idx) in indices.iter().enumerate() {
+        let word = &words[idx];
+        if pos > 0 && word.leading_space {
+            let sw = match &word.payload {
+                WordPayload::Text { style, .. } => space_advance(fonts, *style),
+                WordPayload::Math(_) => 6.0,
+            };
+            w += sw;
+        }
+        w += word.width;
+    }
+    w
 }
