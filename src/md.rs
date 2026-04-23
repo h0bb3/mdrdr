@@ -29,6 +29,7 @@ pub enum Block {
     BlockQuote(Vec<Block>),
     ThematicBreak,
     DisplayMath(String),
+    Mermaid(String),
 }
 
 pub fn parse(src: &str) -> Vec<Block> {
@@ -74,7 +75,7 @@ fn parse_lines(lines: &[&str]) -> Vec<Block> {
 
         if trim.starts_with("```") {
             let lang = trim.trim_start_matches('`').trim();
-            let lang = if lang.is_empty() { None } else { Some(lang.to_string()) };
+            let lang_opt = if lang.is_empty() { None } else { Some(lang.to_string()) };
             let mut code = String::new();
             i += 1;
             while i < lines.len() && !lines[i].trim_start().starts_with("```") {
@@ -82,8 +83,12 @@ fn parse_lines(lines: &[&str]) -> Vec<Block> {
                 code.push('\n');
                 i += 1;
             }
-            if i < lines.len() { i += 1; } // consume closing fence
-            out.push(Block::CodeBlock { lang, text: code });
+            if i < lines.len() { i += 1; }
+            if lang.eq_ignore_ascii_case("mermaid") {
+                out.push(Block::Mermaid(code));
+            } else {
+                out.push(Block::CodeBlock { lang: lang_opt, text: code });
+            }
             continue;
         }
 

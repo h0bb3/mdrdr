@@ -202,6 +202,81 @@ fn draw_items(
                 }
                 blit_image_scaled(fb, *x, screen_y, *w, *h, data.width, data.height, &data.rgba);
             }
+            Placed::Line { x1, y1, x2, y2, thickness, color } => {
+                let s_y1 = *y1 - scroll;
+                let s_y2 = *y2 - scroll;
+                if s_y1.max(s_y2) < 0.0 || s_y1.min(s_y2) > vh {
+                    continue;
+                }
+                draw_line(fb, *x1, s_y1, *x2, s_y2, *thickness, *color);
+            }
+            Placed::Triangle { p1, p2, p3, color } => {
+                let min_y = p1.1.min(p2.1).min(p3.1) - scroll;
+                let max_y = p1.1.max(p2.1).max(p3.1) - scroll;
+                if max_y < 0.0 || min_y > vh {
+                    continue;
+                }
+                let p1s = (p1.0, p1.1 - scroll);
+                let p2s = (p2.0, p2.1 - scroll);
+                let p3s = (p3.0, p3.1 - scroll);
+                fill_triangle(fb, p1s, p2s, p3s, *color);
+            }
+        }
+    }
+}
+
+fn draw_line(fb: &mut Framebuffer, x1: f32, y1: f32, x2: f32, y2: f32, thickness: f32, color: Rgba) {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 0.5 {
+        return;
+    }
+    let steps = len.ceil() as i32;
+    let r = (thickness * 0.5).max(0.5);
+    let r_int = r.ceil() as i32;
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let cx = x1 + dx * t;
+        let cy = y1 + dy * t;
+        let cxi = cx.round() as i32;
+        let cyi = cy.round() as i32;
+        for oy in -r_int..=r_int {
+            for ox in -r_int..=r_int {
+                let d = ((ox as f32).powi(2) + (oy as f32).powi(2)).sqrt();
+                if d <= r + 0.5 {
+                    let alpha = if d <= r - 0.5 {
+                        255u8
+                    } else {
+                        // soft edge over half a pixel
+                        ((1.0 - (d - (r - 0.5))).clamp(0.0, 1.0) * 255.0) as u8
+                    };
+                    fb.blend(cxi + ox, cyi + oy, color, alpha);
+                }
+            }
+        }
+    }
+}
+
+fn fill_triangle(fb: &mut Framebuffer, a: (f32, f32), b: (f32, f32), c: (f32, f32), color: Rgba) {
+    let min_x = a.0.min(b.0).min(c.0).floor() as i32;
+    let max_x = a.0.max(b.0).max(c.0).ceil() as i32;
+    let min_y = a.1.min(b.1).min(c.1).floor() as i32;
+    let max_y = a.1.max(b.1).max(c.1).ceil() as i32;
+    let edge = |p: (f32, f32), q: (f32, f32), r: (f32, f32)| -> f32 {
+        (r.0 - p.0) * (q.1 - p.1) - (r.1 - p.1) * (q.0 - p.0)
+    };
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let p = (x as f32 + 0.5, y as f32 + 0.5);
+            let w0 = edge(b, c, p);
+            let w1 = edge(c, a, p);
+            let w2 = edge(a, b, p);
+            let inside = (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0)
+                || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
+            if inside {
+                fb.blend(x, y, color, 255);
+            }
         }
     }
 }

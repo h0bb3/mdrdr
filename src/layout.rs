@@ -59,6 +59,20 @@ pub enum Placed {
         h: f32,
         data: Arc<CachedImage>,
     },
+    Line {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        thickness: f32,
+        color: Rgba,
+    },
+    Triangle {
+        p1: (f32, f32),
+        p2: (f32, f32),
+        p3: (f32, f32),
+        color: Rgba,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -438,6 +452,33 @@ impl<'a> Ctx<'a> {
                     color: self.theme.muted,
                 });
             }
+            Block::Mermaid(src) => {
+                let avail = (self.content_right - self.content_left - indent).max(1.0);
+                let Some(mut r) = crate::mermaid::render(src, avail, self.theme, self.fonts) else {
+                    // parse failed — fall back to a plain code block.
+                    self.block(
+                        &Block::CodeBlock { lang: Some("mermaid".into()), text: src.clone() },
+                        indent,
+                    );
+                    return;
+                };
+                // Padding around the diagram and horizontal centering.
+                let pad = 16.0;
+                let outer_w = r.width + pad * 2.0;
+                let x0 = self.content_left + indent + ((avail - outer_w) / 2.0).max(0.0);
+                let y0 = self.y + pad;
+                self.items.push(Placed::Rect {
+                    x: x0,
+                    y: self.y,
+                    w: outer_w.min(avail),
+                    h: r.height + pad * 2.0,
+                    color: [0xf6, 0xf2, 0xe9, 0xff],
+                });
+                for item in r.items.drain(..) {
+                    self.items.push(shift_placed(item, x0 + pad, y0));
+                }
+                self.y = y0 + r.height + pad + self.theme.body_size * 0.5;
+            }
             Block::DisplayMath(src) => {
                 let size = self.theme.body_size * 1.15;
                 let b = math::layout(src, size, self.fonts);
@@ -638,6 +679,31 @@ fn single_image(inlines: &[Inline]) -> Option<(&str, &str)> {
         }
     }
     found
+}
+
+fn shift_placed(p: Placed, dx: f32, dy: f32) -> Placed {
+    match p {
+        Placed::Glyph { ch, font, size, x, baseline, color } => Placed::Glyph {
+            ch, font, size,
+            x: x + dx,
+            baseline: baseline + dy,
+            color,
+        },
+        Placed::Rect { x, y, w, h, color } => Placed::Rect { x: x + dx, y: y + dy, w, h, color },
+        Placed::Underline { x, y, w, color } => Placed::Underline { x: x + dx, y: y + dy, w, color },
+        Placed::Image { x, y, w, h, data } => Placed::Image { x: x + dx, y: y + dy, w, h, data },
+        Placed::Line { x1, y1, x2, y2, thickness, color } => Placed::Line {
+            x1: x1 + dx, y1: y1 + dy,
+            x2: x2 + dx, y2: y2 + dy,
+            thickness, color,
+        },
+        Placed::Triangle { p1, p2, p3, color } => Placed::Triangle {
+            p1: (p1.0 + dx, p1.1 + dy),
+            p2: (p2.0 + dx, p2.1 + dy),
+            p3: (p3.0 + dx, p3.1 + dy),
+            color,
+        },
+    }
 }
 
 fn heading_size(base: f32, level: u8) -> f32 {

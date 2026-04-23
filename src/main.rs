@@ -11,6 +11,7 @@ mod images;
 mod layout;
 mod math;
 mod md;
+mod mermaid;
 mod render;
 mod theme;
 mod tree;
