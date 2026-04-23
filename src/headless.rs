@@ -7,10 +7,16 @@ use crate::font::Fonts;
 use crate::render::{render, Viewport};
 use crate::theme::Theme;
 
-pub fn render_to_png(source: &str, width: u32, height: u32, out: &Path) -> std::io::Result<()> {
+pub fn render_to_png(
+    source: &str,
+    width: u32,
+    height: u32,
+    scroll: f32,
+    out: &Path,
+) -> std::io::Result<()> {
     let theme = Theme::light();
     let fonts = Fonts::load();
-    let fb = render(source, Viewport { width, height }, 0.0, &theme, &fonts);
+    let fb = render(source, Viewport { width, height }, scroll, &theme, &fonts);
     let img: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> =
         image::ImageBuffer::from_raw(fb.width, fb.height, fb.pixels)
             .expect("framebuffer size mismatch");

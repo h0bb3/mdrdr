@@ -9,13 +9,14 @@ use std::sync::{Arc, Mutex};
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::api;
 use crate::font::Fonts;
-use crate::render::{render, Viewport};
+use crate::render::{measure, render, Viewport};
 use crate::theme::Theme;
 
 /// Messages API thread pushes back into the winit event loop.
@@ -81,9 +82,65 @@ impl ApplicationHandler<UserEvent> for App {
                     let mut s = self.shared.state.lock().unwrap();
                     s.viewport = Viewport { width: sz.width.max(1), height: sz.height.max(1) };
                 }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+                self.clamp_scroll();
+                self.request_redraw();
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, lines) => -lines * 40.0,
+                    MouseScrollDelta::PixelDelta(pos) => -pos.y as f32,
+                };
+                {
+                    let mut s = self.shared.state.lock().unwrap();
+                    s.scroll = (s.scroll + dy).max(0.0);
                 }
+                self.clamp_scroll();
+                self.request_redraw();
+            }
+
+            WindowEvent::KeyboardInput {
+                event: KeyEvent { logical_key, state: ElementState::Pressed, .. },
+                ..
+            } => {
+                let (vh, source) = {
+                    let s = self.shared.state.lock().unwrap();
+                    (s.viewport.height as f32, s.source.clone())
+                };
+                let page = (vh * 0.85).max(60.0);
+                let dy: Option<f32> = match logical_key.as_ref() {
+                    Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => Some(page),
+                    Key::Named(NamedKey::PageUp) => Some(-page),
+                    Key::Named(NamedKey::ArrowDown) => Some(60.0),
+                    Key::Named(NamedKey::ArrowUp) => Some(-60.0),
+                    Key::Named(NamedKey::Home) => {
+                        let mut s = self.shared.state.lock().unwrap();
+                        s.scroll = 0.0;
+                        None
+                    }
+                    Key::Named(NamedKey::End) => {
+                        let theme = Theme::light();
+                        let vw = {
+                            let s = self.shared.state.lock().unwrap();
+                            s.viewport.width
+                        };
+                        let doc_h = measure(&source, vw, &theme, &self.shared.fonts);
+                        let mut s = self.shared.state.lock().unwrap();
+                        s.scroll = (doc_h - s.viewport.height as f32).max(0.0);
+                        None
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        event_loop.exit();
+                        return;
+                    }
+                    _ => None,
+                };
+                if let Some(d) = dy {
+                    let mut s = self.shared.state.lock().unwrap();
+                    s.scroll = (s.scroll + d).max(0.0);
+                }
+                self.clamp_scroll();
+                self.request_redraw();
             }
 
             WindowEvent::RedrawRequested => {
@@ -107,6 +164,26 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 impl App {
+    fn request_redraw(&self) {
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    fn clamp_scroll(&self) {
+        let theme = Theme::light();
+        let (source, vw, vh) = {
+            let s = self.shared.state.lock().unwrap();
+            (s.source.clone(), s.viewport.width, s.viewport.height as f32)
+        };
+        let doc_h = measure(&source, vw, &theme, &self.shared.fonts);
+        let max_scroll = (doc_h - vh).max(0.0);
+        let mut s = self.shared.state.lock().unwrap();
+        if s.scroll > max_scroll {
+            s.scroll = max_scroll;
+        }
+    }
+
     fn draw(&mut self) {
         let (Some(window), Some(surface)) = (&self.window, self.surface.as_mut()) else {
             return;
