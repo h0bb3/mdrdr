@@ -13,6 +13,7 @@ mod md;
 mod render;
 mod theme;
 mod tree;
+mod watch;
 mod window;
 
 use std::path::PathBuf;

@@ -350,6 +350,8 @@ pub fn run(arg: Option<PathBuf>) -> ExitCode {
     let port = api::spawn(shared.clone(), proxy.clone());
     println!("mdrdr api listening on http://127.0.0.1:{port}");
 
+    crate::watch::spawn(shared.clone(), proxy.clone());
+
     let mut app = App { shared, window: None, surface: None, proxy };
 
     match event_loop.run_app(&mut app) {
