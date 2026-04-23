@@ -767,7 +767,7 @@ impl<'a> Ctx<'a> {
                     y: self.y,
                     w: outer_w.min(avail),
                     h: r.height + pad * 2.0,
-                    color: [0xf6, 0xf2, 0xe9, 0xff],
+                    color: self.theme.code_bg,
                 });
                 for item in r.items.drain(..) {
                     self.items.push(shift_placed(item, x0 + pad, y0));

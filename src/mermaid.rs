@@ -365,6 +365,28 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
                 .collect();
             let max_h = col_heights.iter().fold(0.0f32, |a, &b| a.max(b));
             total_h = max_h.max(1.0);
+
+            // Each inter-column gap gets widened to fit the max label width
+            // of any labelled edge that starts in that column, so the arrow
+            // line is long enough to host the label without clipping the
+            // next node. Unlabelled edges keep the default gap.
+            let gap_n = per_layer.len().saturating_sub(1);
+            let mut gap_w: Vec<f32> = vec![h_gap; gap_n];
+            let lbl_size = label_size * 0.85;
+            let pad = 4.0;
+            for e in &graph.edges {
+                let Some(lab) = e.label.as_deref() else { continue };
+                let (lw, _lh) = measure_label(lab, lbl_size, font);
+                let from_layer = *layers.get(&e.from).unwrap_or(&0);
+                let to_layer = *layers.get(&e.to).unwrap_or(&0);
+                if to_layer > from_layer && from_layer < gap_w.len() {
+                    let need = lw + pad * 2.0 + 20.0;
+                    if need > gap_w[from_layer] {
+                        gap_w[from_layer] = need;
+                    }
+                }
+            }
+
             let mut x = 0.0;
             for (i, col) in per_layer.iter().enumerate() {
                 let col_h = col_heights[i];
@@ -379,7 +401,7 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
                 }
                 x += col_w;
                 if i + 1 < per_layer.len() {
-                    x += h_gap;
+                    x += gap_w[i];
                 }
             }
             total_w = x;
@@ -404,7 +426,7 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
 
     // 5. Emit primitives.
     let stroke: Rgba = theme.fg;
-    let fill: Rgba = [0xef, 0xec, 0xe3, 0xff];
+    let fill: Rgba = theme.code_bg;
     let mut items: Vec<Placed> = Vec::new();
 
     // Rects / circles for nodes.
