@@ -2,6 +2,7 @@
 
 pub type Rgba = [u8; 4];
 
+#[derive(Clone)]
 pub struct Theme {
     pub bg: Rgba,
     pub fg: Rgba,

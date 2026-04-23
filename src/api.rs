@@ -66,6 +66,7 @@ fn handle(
         ("GET", "/state") => ok_json(&mut stream, &state_json(&shared)),
         ("GET", "/screenshot") => screenshot(&mut stream, &shared, &q),
         ("GET", "/hits") => do_hits(&mut stream, &shared),
+        ("POST", "/zoom") => do_zoom(&mut stream, &shared, &proxy, &q),
         ("GET", "/tree") => ok_json(&mut stream, &tree_json(&shared)),
         ("POST", "/scroll") => do_scroll(&mut stream, &shared, &proxy, &q),
         ("POST", "/resize") => do_resize(&mut stream, &shared, &proxy, &q),
@@ -96,13 +97,15 @@ fn state_json(shared: &Arc<Shared>) -> String {
         .map(|t| format!("\"{}\"", json_escape(&t.root.display().to_string())))
         .unwrap_or_else(|| "null".to_string());
     format!(
-        "{{\"source_path\":{path_json},\"scroll\":{:.3},\"viewport\":{{\"w\":{},\"h\":{}}},\"source_len\":{},\"tree_root\":{root_json},\"sidebar_width\":{:.1},\"sidebar_scroll\":{:.3}}}",
+        "{{\"source_path\":{path_json},\"scroll\":{:.3},\"viewport\":{{\"w\":{},\"h\":{}}},\"source_len\":{},\"tree_root\":{root_json},\"sidebar_width\":{:.1},\"sidebar_scroll\":{:.3},\"content_zoom\":{:.3},\"sidebar_zoom\":{:.3}}}",
         s.scroll,
         s.viewport.width,
         s.viewport.height,
         s.source.len(),
         s.sidebar_width,
         s.sidebar_scroll,
+        s.content_zoom,
+        s.sidebar_zoom,
     )
 }
 
@@ -167,6 +170,8 @@ fn screenshot(
             base_dir: base_dir.as_deref(),
             sidebar_width: snap.sidebar_width,
             sidebar_scroll: snap.sidebar_scroll,
+            content_zoom: snap.content_zoom,
+            sidebar_zoom: snap.sidebar_zoom,
             selection: snap.selection,
             hover_pos,
         },
@@ -216,6 +221,7 @@ fn compute_max_scroll(shared: &Arc<Shared>) -> f32 {
         snap.viewport.height,
         base_dir.as_deref(),
         snap.sidebar_width,
+        snap.content_zoom,
         &snap.theme,
         &shared.fonts,
         &mut images,
@@ -339,6 +345,25 @@ fn do_sidebar(
     ok_json(stream, &state_json(shared))
 }
 
+fn do_zoom(
+    stream: &mut TcpStream,
+    shared: &Arc<Shared>,
+    proxy: &EventLoopProxy<UserEvent>,
+    q: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    {
+        let mut s = shared.state.lock().unwrap();
+        if let Some(v) = q.get("content").and_then(|v| v.parse::<f32>().ok()) {
+            s.content_zoom = v.clamp(0.5, 3.0);
+        }
+        if let Some(v) = q.get("sidebar").and_then(|v| v.parse::<f32>().ok()) {
+            s.sidebar_zoom = v.clamp(0.5, 3.0);
+        }
+    }
+    let _ = proxy.send_event(UserEvent::Redraw);
+    ok_json(stream, &state_json(shared))
+}
+
 fn do_hits(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> {
     let snap = shared.snapshot();
     let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
@@ -356,6 +381,8 @@ fn do_hits(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> 
                 base_dir: base_dir.as_deref(),
                 sidebar_width: snap.sidebar_width,
                 sidebar_scroll: snap.sidebar_scroll,
+                content_zoom: snap.content_zoom,
+                sidebar_zoom: snap.sidebar_zoom,
                 selection: None,
                 hover_pos: None,
             },
@@ -388,10 +415,8 @@ fn clamp_sidebar_scroll(shared: &Arc<Shared>) {
     if snap.sidebar_width <= 0.0 {
         return;
     }
-    let size = snap.theme.body_size * 0.82;
-    let row_h = size * 1.5;
-    let top_pad = snap.theme.margin_y * 0.5;
-    let content_h = top_pad * 2.0 + row_h * tree.len() as f32;
+    let content_h =
+        crate::render::sidebar_content_height(&snap.theme, tree.len(), snap.sidebar_zoom);
     let max_scroll = (content_h - snap.viewport.height as f32).max(0.0);
     let mut s = shared.state.lock().unwrap();
     if s.sidebar_scroll > max_scroll {
@@ -458,6 +483,8 @@ fn do_copy(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> 
                 base_dir: base_dir.as_deref(),
                 sidebar_width: snap.sidebar_width,
                 sidebar_scroll: snap.sidebar_scroll,
+                content_zoom: snap.content_zoom,
+                sidebar_zoom: snap.sidebar_zoom,
                 selection: snap.selection,
                 hover_pos: None,
             },

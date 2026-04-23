@@ -64,6 +64,11 @@ pub struct AppState {
     /// Same as above but for the sidebar's internal scrollbar.
     pub sidebar_scrollbar_dragging: bool,
     pub sidebar_scrollbar_grip: f32,
+
+    /// Font-size multipliers for the two panels. 1.0 = default theme size.
+    /// Ctrl + wheel over a panel bumps its zoom.
+    pub content_zoom: f32,
+    pub sidebar_zoom: f32,
 }
 
 pub struct Shared {
@@ -97,6 +102,8 @@ impl Shared {
             theme: Theme::light(),
             sidebar_width: s.sidebar_width,
             sidebar_scroll: s.sidebar_scroll,
+            content_zoom: s.content_zoom,
+            sidebar_zoom: s.sidebar_zoom,
             selection,
             hover_pos,
         }
@@ -112,6 +119,8 @@ pub struct Snapshot {
     pub theme: Theme,
     pub sidebar_width: f32,
     pub sidebar_scroll: f32,
+    pub content_zoom: f32,
+    pub sidebar_zoom: f32,
     pub selection: Option<((f32, f32), (f32, f32))>,
     /// Mouse position in screen coords, but only when the window is in a
     /// "quiet" state — not dragging, not selecting. Drawn hover highlights
@@ -168,15 +177,35 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, lines) => -lines * 40.0,
-                    MouseScrollDelta::PixelDelta(pos) => -pos.y as f32,
+                // Note: lines-based deltas differ from pixel deltas in unit;
+                // we normalize to a scroll-pixel dy and a zoom-step count.
+                let (dy, zoom_step) = match delta {
+                    MouseScrollDelta::LineDelta(_, lines) => (-lines * 40.0, lines),
+                    MouseScrollDelta::PixelDelta(pos) => {
+                        let dy = -pos.y as f32;
+                        (dy, (pos.y as f32) / 40.0)
+                    }
                 };
+                let ctrl = self.modifiers.state().control_key();
                 let over_sidebar = {
                     let s = self.shared.state.lock().unwrap();
-                    s.tree.is_some() && s.sidebar_width > 0.0 && (s.last_mouse.x as f32) < s.sidebar_width
+                    s.tree.is_some()
+                        && s.sidebar_width > 0.0
+                        && (s.last_mouse.x as f32) < s.sidebar_width
                 };
-                if over_sidebar {
+                if ctrl {
+                    // Ctrl+wheel: zoom the panel under the cursor.
+                    let factor = (1.0 + zoom_step * 0.1).clamp(0.5, 2.0);
+                    let mut s = self.shared.state.lock().unwrap();
+                    if over_sidebar {
+                        s.sidebar_zoom = (s.sidebar_zoom * factor).clamp(0.5, 3.0);
+                    } else {
+                        s.content_zoom = (s.content_zoom * factor).clamp(0.5, 3.0);
+                    }
+                    drop(s);
+                    self.clamp_scroll();
+                    self.clamp_sidebar_scroll();
+                } else if over_sidebar {
                     {
                         let mut s = self.shared.state.lock().unwrap();
                         s.sidebar_scroll = (s.sidebar_scroll + dy).max(0.0);
@@ -426,7 +455,10 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     Key::Named(NamedKey::End) => {
                         let theme = Theme::light();
-                        let sidebar_w = self.shared.state.lock().unwrap().sidebar_width;
+                        let (sidebar_w, content_zoom) = {
+                            let s = self.shared.state.lock().unwrap();
+                            (s.sidebar_width, s.content_zoom)
+                        };
                         let mut images = self.shared.images.lock().unwrap();
                         let doc_h = measure(
                             &source,
@@ -434,6 +466,7 @@ impl ApplicationHandler<UserEvent> for App {
                             vh as u32,
                             base_dir.as_deref(),
                             sidebar_w,
+                            content_zoom,
                             &theme,
                             &self.shared.fonts,
                             &mut images,
@@ -500,7 +533,7 @@ impl App {
 
     fn clamp_scroll(&self) {
         let theme = Theme::light();
-        let (source, vw, vh, base_dir, sidebar_w) = {
+        let (source, vw, vh, base_dir, sidebar_w, content_zoom) = {
             let s = self.shared.state.lock().unwrap();
             (
                 s.source.clone(),
@@ -508,6 +541,7 @@ impl App {
                 s.viewport.height as f32,
                 s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
                 s.sidebar_width,
+                s.content_zoom,
             )
         };
         let mut images = self.shared.images.lock().unwrap();
@@ -517,6 +551,7 @@ impl App {
             vh as u32,
             base_dir.as_deref(),
             sidebar_w,
+            content_zoom,
             &theme,
             &self.shared.fonts,
             &mut images,
@@ -585,11 +620,6 @@ impl App {
         icon_changed || hover_changed
     }
 
-    /// True if (x, y) is over a clickable hit-target (tree row or link).
-    fn over_clickable(&self, x: f32, y: f32) -> bool {
-        self.hovered_rect(x, y).is_some()
-    }
-
     /// Return the hit-target rect under (x, y), or None. Pinned rects are in
     /// screen coords; content rects in doc coords — we return them as-is so
     /// the caller can just compare the tuple.
@@ -618,6 +648,8 @@ impl App {
                 base_dir: base_dir.as_deref(),
                 sidebar_width: snap.sidebar_width,
                 sidebar_scroll: snap.sidebar_scroll,
+                content_zoom: snap.content_zoom,
+                sidebar_zoom: snap.sidebar_zoom,
                 selection: None,
                 hover_pos: None,
             },
@@ -633,12 +665,7 @@ impl App {
         if snap.sidebar_width <= 0.0 {
             return;
         }
-        // Mirror layout_sidebar's formula; cheap enough to inline here so we
-        // don't have to run the full layout just to count rows.
-        let size = snap.theme.body_size * 0.82;
-        let row_h = size * 1.5;
-        let top_pad = snap.theme.margin_y * 0.5;
-        let content_h = top_pad * 2.0 + row_h * tree.len() as f32;
+        let content_h = sidebar_content_height(&snap.theme, tree.len(), snap.sidebar_zoom);
         let max_scroll = (content_h - snap.viewport.height as f32).max(0.0);
         let mut s = self.shared.state.lock().unwrap();
         if s.sidebar_scroll > max_scroll {
@@ -655,7 +682,7 @@ impl App {
         if snap.sidebar_width <= 0.0 {
             return None;
         }
-        let content_h = sidebar_content_height(&snap.theme, tree.len());
+        let content_h = sidebar_content_height(&snap.theme, tree.len(), snap.sidebar_zoom);
         sidebar_scrollbar_geom(
             snap.sidebar_width,
             snap.viewport.height as f32,
@@ -666,7 +693,7 @@ impl App {
 
     fn current_scrollbar_geom(&self) -> Option<SbGeom> {
         let theme = Theme::light();
-        let (source, viewport, base_dir, sidebar_w, scroll) = {
+        let (source, viewport, base_dir, sidebar_w, scroll, content_zoom) = {
             let s = self.shared.state.lock().unwrap();
             (
                 s.source.clone(),
@@ -674,6 +701,7 @@ impl App {
                 s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
                 s.sidebar_width,
                 s.scroll,
+                s.content_zoom,
             )
         };
         let mut images = self.shared.images.lock().unwrap();
@@ -683,6 +711,7 @@ impl App {
             viewport.height,
             base_dir.as_deref(),
             sidebar_w,
+            content_zoom,
             &theme,
             &self.shared.fonts,
             &mut images,
@@ -710,6 +739,8 @@ impl App {
                     base_dir: base_dir.as_deref(),
                     sidebar_width: snap.sidebar_width,
                     sidebar_scroll: snap.sidebar_scroll,
+                    content_zoom: snap.content_zoom,
+                    sidebar_zoom: snap.sidebar_zoom,
                     selection: snap.selection,
                     hover_pos: None,
                 },
@@ -749,6 +780,8 @@ impl App {
                 base_dir: base_dir.as_deref(),
                 sidebar_width: snap.sidebar_width,
                 sidebar_scroll: snap.sidebar_scroll,
+                content_zoom: snap.content_zoom,
+                sidebar_zoom: snap.sidebar_zoom,
                 selection: snap.selection,
                 hover_pos: snap.hover_pos,
             },
@@ -786,6 +819,8 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
                 base_dir: base_dir.as_deref(),
                 sidebar_width: snap.sidebar_width,
                 sidebar_scroll: snap.sidebar_scroll,
+                content_zoom: snap.content_zoom,
+                sidebar_zoom: snap.sidebar_zoom,
                 selection: None,
                 hover_pos: None,
             },
@@ -856,6 +891,8 @@ pub fn run(arg: Option<PathBuf>) -> ExitCode {
             scrollbar_grip: 0.0,
             sidebar_scrollbar_dragging: false,
             sidebar_scrollbar_grip: 0.0,
+            content_zoom: 1.0,
+            sidebar_zoom: 1.0,
         }),
     });
 

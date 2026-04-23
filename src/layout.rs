@@ -157,6 +157,10 @@ pub struct LayoutInput<'a> {
     pub sidebar_width: f32,
     /// Scroll offset inside the sidebar. 0 → top.
     pub sidebar_scroll: f32,
+    /// Font zoom for the main content panel (multiplier; 1.0 = default).
+    pub content_zoom: f32,
+    /// Font zoom for the sidebar tree panel (multiplier; 1.0 = default).
+    pub sidebar_zoom: f32,
 }
 
 pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
@@ -169,16 +173,26 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
     let content_left = sidebar_width + input.theme.margin_x;
     let content_right = (input.viewport_w as f32) - input.theme.margin_x;
 
+    // Content panel uses a zoomed copy of the theme. Margins, colors, and
+    // line-height multiplier stay fixed so the page geometry doesn't jump
+    // when the user zooms.
+    let content_theme = Theme {
+        body_size: input.theme.body_size * input.content_zoom,
+        heading_size: input.theme.heading_size * input.content_zoom,
+        mono_size: input.theme.mono_size * input.content_zoom,
+        ..input.theme.clone()
+    };
+
     let mut content_items: Vec<Placed> = Vec::new();
     let mut content_hit_targets: Vec<HitTarget> = Vec::new();
     let doc_height = {
         let mut ctx = Ctx {
             items: &mut content_items,
             content_hits: &mut content_hit_targets,
-            y: input.theme.margin_y,
+            y: content_theme.margin_y,
             content_left,
             content_right,
-            theme: input.theme,
+            theme: &content_theme,
             fonts: input.fonts,
             base_dir: input.base_dir,
             images,
@@ -186,7 +200,7 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
         for b in input.blocks {
             ctx.block(b, 0.0);
         }
-        ctx.y + input.theme.margin_y
+        ctx.y + content_theme.margin_y
     };
 
     let mut pinned_items = Vec::new();
@@ -199,6 +213,7 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
             sidebar_width,
             input.viewport_h as f32,
             input.sidebar_scroll,
+            input.sidebar_zoom,
             input.theme,
             input.fonts,
             &mut pinned_items,
@@ -226,6 +241,7 @@ fn layout_sidebar(
     width: f32,
     height: f32,
     sidebar_scroll: f32,
+    sidebar_zoom: f32,
     theme: &Theme,
     fonts: &Fonts,
     items: &mut Vec<Placed>,
@@ -239,7 +255,7 @@ fn layout_sidebar(
     // Right border.
     items.push(Placed::Rect { x: width - 1.0, y: 0.0, w: 1.0, h: height, color: border });
 
-    let size = theme.body_size * 0.82;
+    let size = theme.body_size * 0.82 * sidebar_zoom;
     let row_h = size * 1.5;
     let top_pad = theme.margin_y * 0.5;
     let content_h = top_pad * 2.0 + row_h * tree.len() as f32;

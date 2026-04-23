@@ -69,6 +69,8 @@ pub struct RenderInput<'a> {
     pub base_dir: Option<&'a Path>,
     pub sidebar_width: f32,
     pub sidebar_scroll: f32,
+    pub content_zoom: f32,
+    pub sidebar_zoom: f32,
     /// (anchor, head) in document coordinates. None = no selection.
     pub selection: Option<((f32, f32), (f32, f32))>,
     /// Mouse position in screen coords. Used to paint a hover highlight on
@@ -90,6 +92,8 @@ pub fn render(input: &RenderInput, images: &mut ImageCache) -> Framebuffer {
             fonts: input.fonts,
             sidebar_width: input.sidebar_width,
             sidebar_scroll: input.sidebar_scroll,
+            content_zoom: input.content_zoom,
+            sidebar_zoom: input.sidebar_zoom,
         },
         images,
     );
@@ -104,12 +108,14 @@ pub fn render(input: &RenderInput, images: &mut ImageCache) -> Framebuffer {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn measure(
     source: &str,
     viewport_w: u32,
     viewport_h: u32,
     base_dir: Option<&Path>,
     sidebar_width: f32,
+    content_zoom: f32,
     theme: &Theme,
     fonts: &Fonts,
     images: &mut ImageCache,
@@ -127,6 +133,8 @@ pub fn measure(
             fonts,
             sidebar_width,
             sidebar_scroll: 0.0,
+            content_zoom,
+            sidebar_zoom: 1.0,
         },
         images,
     );
@@ -233,8 +241,8 @@ pub fn in_sidebar_scrollbar_strip(g: &SbGeom, sidebar_width: f32, x: f32, y: f32
 /// Total content height of the sidebar tree. Pure formula — no layout pass
 /// needed. Used by callers that need to clamp sidebar_scroll without
 /// re-laying out the whole document.
-pub fn sidebar_content_height(theme: &Theme, tree_len: usize) -> f32 {
-    let size = theme.body_size * 0.82;
+pub fn sidebar_content_height(theme: &Theme, tree_len: usize, sidebar_zoom: f32) -> f32 {
+    let size = theme.body_size * 0.82 * sidebar_zoom;
     let row_h = size * 1.5;
     let top_pad = theme.margin_y * 0.5;
     top_pad * 2.0 + row_h * tree_len as f32
@@ -260,6 +268,8 @@ pub fn compute_all_hit_targets(
             fonts: input.fonts,
             sidebar_width: input.sidebar_width,
             sidebar_scroll: input.sidebar_scroll,
+            content_zoom: input.content_zoom,
+            sidebar_zoom: input.sidebar_zoom,
         },
         images,
     );
@@ -428,6 +438,8 @@ pub fn extract_selection(
             fonts: input.fonts,
             sidebar_width: input.sidebar_width,
             sidebar_scroll: input.sidebar_scroll,
+            content_zoom: input.content_zoom,
+            sidebar_zoom: input.sidebar_zoom,
         },
         images,
     );
