@@ -333,11 +333,13 @@ fn draw(
 /// Map a document point to the nearest glyph index in `items`.
 /// Returns 0 if the items list has no glyphs.
 fn glyph_index_at(items: &[Placed], doc_x: f32, doc_y: f32) -> usize {
-    // First: pick the line (baseline) closest to doc_y.
+    // First: pick the line (baseline) closest to doc_y. Skip chrome
+    // glyphs (selectable: false) so, e.g., the code block's "copy"
+    // button doesn't get picked when the user aims at the first line.
     let mut best_bl: Option<f32> = None;
     let mut best_bld = f32::MAX;
     for item in items {
-        if let Placed::Glyph { baseline, .. } = item {
+        if let Placed::Glyph { baseline, selectable: true, .. } = item {
             let d = (baseline - doc_y).abs();
             if d < best_bld {
                 best_bld = d;
@@ -347,12 +349,11 @@ fn glyph_index_at(items: &[Placed], doc_x: f32, doc_y: f32) -> usize {
     }
     let Some(target) = best_bl else { return 0 };
 
-    // On that line, pick the glyph whose x is closest to doc_x (biased toward
-    // the glyph the click landed on or the one immediately before).
+    // On that line, pick the glyph whose x is closest to doc_x.
     let mut best_idx = 0;
     let mut best_dx = f32::MAX;
     for (i, item) in items.iter().enumerate() {
-        if let Placed::Glyph { baseline, x, .. } = item {
+        if let Placed::Glyph { baseline, x, selectable: true, .. } = item {
             if (baseline - target).abs() < 2.0 {
                 let d = (*x - doc_x).abs();
                 if d < best_dx {
@@ -386,7 +387,7 @@ fn selection_rects(
     let mut cur_size: f32 = 0.0;
 
     for i in start..=end {
-        let Some(Placed::Glyph { ch, font, size, x, baseline, .. }) = items.get(i) else {
+        let Some(Placed::Glyph { ch, font, size, x, baseline, selectable: true, .. }) = items.get(i) else {
             continue;
         };
         let f = pick_font(fonts, *font);
@@ -472,7 +473,7 @@ fn build_selection_text(
     let mut last_xend: Option<f32> = None;
 
     for i in start..=end {
-        let Some(Placed::Glyph { ch, font, size, x, baseline, .. }) = items.get(i) else {
+        let Some(Placed::Glyph { ch, font, size, x, baseline, selectable: true, .. }) = items.get(i) else {
             continue;
         };
         if let Some(bl) = last_baseline {
@@ -530,7 +531,7 @@ fn draw_items(
     let vh = viewport.height as f32;
     for item in items {
         match item {
-            Placed::Glyph { ch, font, size, x, baseline, color } => {
+            Placed::Glyph { ch, font, size, x, baseline, color, .. } => {
                 let screen_baseline = *baseline - scroll;
                 if screen_baseline < -(*size) || screen_baseline - size > vh {
                     continue;

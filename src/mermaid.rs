@@ -459,6 +459,7 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
                     x: lx,
                     baseline: ly,
                     color: stroke,
+                    selectable: true,
                 });
                 lx += m.advance_width;
             }
@@ -518,6 +519,7 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
                     x: lx,
                     baseline: ly,
                     color: theme.muted,
+                    selectable: true,
                 });
                 lx += m.advance_width;
             }

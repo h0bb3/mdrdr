@@ -39,6 +39,10 @@ pub enum Placed {
         x: f32,
         baseline: f32,
         color: Rgba,
+        /// False for "chrome" glyphs like the code block's copy button.
+        /// The selection hit-test skips these so dragging across the
+        /// top of a code block doesn't snap to the button's letters.
+        selectable: bool,
     },
     Rect {
         x: f32,
@@ -332,6 +336,7 @@ fn layout_sidebar(
                 x,
                 baseline,
                 color: muted,
+                selectable: true,
             });
             x += m.advance_width;
         }
@@ -366,6 +371,7 @@ fn layout_sidebar(
                     x,
                     baseline,
                     color,
+                    selectable: true,
                 });
                 x += e.advance_width;
                 break;
@@ -377,6 +383,7 @@ fn layout_sidebar(
                 x,
                 baseline,
                 color,
+                selectable: true,
             });
             x += m.advance_width;
         }
@@ -447,6 +454,7 @@ fn layout_sidebar(
                             x: x_o,
                             baseline: baseline_o,
                             color: color_o,
+                            selectable: true,
                         });
                         x_o += e.advance_width;
                         break;
@@ -458,6 +466,7 @@ fn layout_sidebar(
                         x: x_o,
                         baseline: baseline_o,
                         color: color_o,
+                        selectable: true,
                     });
                     x_o += m.advance_width;
                 }
@@ -575,6 +584,7 @@ impl<'a> Ctx<'a> {
                             x,
                             baseline,
                             color: self.theme.accent,
+                            selectable: true,
                         });
                         x += m.advance_width;
                     }
@@ -616,6 +626,10 @@ impl<'a> Ctx<'a> {
                         x: lx,
                         baseline: lbaseline,
                         color: self.theme.muted,
+                        // Chrome glyph — selection hit-test must skip it,
+                        // otherwise selecting the first code line snaps to
+                        // the "c/o/p/y" baseline above it.
+                        selectable: false,
                     });
                     lx += m.advance_width;
                 }
@@ -651,6 +665,7 @@ impl<'a> Ctx<'a> {
                             x: mx,
                             baseline,
                             color: self.theme.muted,
+                            selectable: true,
                         });
                         mx += m.advance_width;
                     }
@@ -724,6 +739,7 @@ impl<'a> Ctx<'a> {
                         x: x0 + g.x * scale,
                         baseline: baseline + g.y * scale,
                         color: self.theme.fg,
+                        selectable: true,
                     });
                 }
                 for r in &b.rules {
@@ -978,6 +994,7 @@ impl<'a> Ctx<'a> {
                                 x: pen,
                                 baseline,
                                 color: style.color,
+                                selectable: true,
                             });
                             pen += g.advance;
                         }
@@ -993,6 +1010,7 @@ impl<'a> Ctx<'a> {
                                 ch: g.ch, font: g.font, size: g.size,
                                 x: pen + g.x, baseline: baseline + g.y,
                                 color: self.theme.fg,
+                                selectable: true,
                             });
                         }
                         for r in &mb.rules {
@@ -1097,6 +1115,7 @@ impl<'a> Ctx<'a> {
                                 x: gx,
                                 baseline,
                                 color: style.color,
+                                selectable: true,
                             });
                             gx += g.advance;
                         }
@@ -1118,6 +1137,7 @@ impl<'a> Ctx<'a> {
                                 x: wx + g.x,
                                 baseline: baseline + g.y,
                                 color: ctx.theme.fg,
+                                selectable: true,
                             });
                         }
                         for r in &mb.rules {
@@ -1200,11 +1220,12 @@ fn single_image(inlines: &[Inline]) -> Option<(&str, &str)> {
 
 fn shift_placed(p: Placed, dx: f32, dy: f32) -> Placed {
     match p {
-        Placed::Glyph { ch, font, size, x, baseline, color } => Placed::Glyph {
+        Placed::Glyph { ch, font, size, x, baseline, color, selectable } => Placed::Glyph {
             ch, font, size,
             x: x + dx,
             baseline: baseline + dy,
             color,
+            selectable,
         },
         Placed::Rect { x, y, w, h, color } => Placed::Rect { x: x + dx, y: y + dy, w, h, color },
         Placed::Underline { x, y, w, color } => Placed::Underline { x: x + dx, y: y + dy, w, color },
