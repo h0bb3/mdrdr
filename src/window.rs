@@ -853,6 +853,9 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
         HitAction::OpenUrl(url) => {
             open_url(url);
         }
+        HitAction::CopyCode(text) => {
+            clipboard::copy(text);
+        }
     }
     Some(action)
 }

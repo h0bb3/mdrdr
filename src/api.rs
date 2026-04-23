@@ -301,6 +301,7 @@ fn action_json(a: &crate::layout::HitAction) -> String {
         Open(p) => format!("{{\"kind\":\"open\",\"path\":\"{}\"}}", json_escape(&p.display().to_string())),
         Toggle(p) => format!("{{\"kind\":\"toggle\",\"path\":\"{}\"}}", json_escape(&p.display().to_string())),
         OpenUrl(u) => format!("{{\"kind\":\"url\",\"url\":\"{}\"}}", json_escape(u)),
+        CopyCode(_) => "{\"kind\":\"copy_code\"}".to_string(),
     }
 }
 

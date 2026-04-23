@@ -80,6 +80,7 @@ pub enum HitAction {
     Open(PathBuf),
     Toggle(PathBuf),
     OpenUrl(String),
+    CopyCode(String),
 }
 
 #[derive(Debug, Clone)]
@@ -471,6 +472,53 @@ impl<'a> Ctx<'a> {
                     }
                     baseline += lh;
                 }
+
+                // Copy-to-clipboard button in the top-right corner.
+                let btn_label = "copy";
+                let btn_size = size * 0.8;
+                let btn_font = &self.fonts.body;
+                let btn_text_w: f32 = btn_label
+                    .chars()
+                    .map(|c| btn_font.metrics(c, btn_size).advance_width)
+                    .sum();
+                let btn_pad_x = 8.0;
+                let btn_pad_y = 4.0;
+                let btn_w = btn_text_w + btn_pad_x * 2.0;
+                let btn_h = btn_size + btn_pad_y * 2.0;
+                let btn_x = rect_x + rect_w - btn_w - 6.0;
+                let btn_y = start_y + 6.0;
+                // Slightly darker than code_bg for visibility.
+                let btn_bg = [
+                    self.theme.code_bg[0].saturating_sub(14),
+                    self.theme.code_bg[1].saturating_sub(14),
+                    self.theme.code_bg[2].saturating_sub(14),
+                    0xff,
+                ];
+                self.items.push(Placed::Rect {
+                    x: btn_x, y: btn_y, w: btn_w, h: btn_h, color: btn_bg,
+                });
+                let mut lx = btn_x + btn_pad_x;
+                let lbaseline = btn_y + btn_pad_y + btn_size * 0.85;
+                for ch in btn_label.chars() {
+                    let m = btn_font.metrics(ch, btn_size);
+                    self.items.push(Placed::Glyph {
+                        ch,
+                        font: FontId::Body,
+                        size: btn_size,
+                        x: lx,
+                        baseline: lbaseline,
+                        color: self.theme.muted,
+                    });
+                    lx += m.advance_width;
+                }
+                self.content_hits.push(HitTarget {
+                    x: btn_x,
+                    y: btn_y,
+                    w: btn_w,
+                    h: btn_h,
+                    action: HitAction::CopyCode(text.clone()),
+                });
+
                 self.y = start_y + rect_h + self.theme.body_size * 0.5;
             }
             Block::List { ordered, items } => {

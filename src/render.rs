@@ -287,10 +287,14 @@ fn draw(
 ) -> Framebuffer {
     let mut fb = Framebuffer::new(viewport.width, viewport.height, theme.bg);
 
-    // Selection highlight goes *under* glyphs so text stays readable.
+    draw_items(&mut fb, &lay.content_items, scroll, viewport, fonts);
+
+    // Selection highlight goes *after* content items so opaque block
+    // backgrounds (code blocks, etc.) don't bury it. alpha keeps glyphs
+    // readable through the tint.
     if let Some((a, h)) = selection {
         let rects = selection_rects(&lay.content_items, a, h, fonts);
-        let hl: Rgba = [theme.accent[0], theme.accent[1], theme.accent[2], 55];
+        let hl: Rgba = [theme.accent[0], theme.accent[1], theme.accent[2], 80];
         let vh = viewport.height as f32;
         for (x, y, w, rh) in rects {
             let sy = y - scroll;
@@ -301,7 +305,6 @@ fn draw(
         }
     }
 
-    draw_items(&mut fb, &lay.content_items, scroll, viewport, fonts);
     draw_items(&mut fb, &lay.pinned_items, 0.0, viewport, fonts);
 
     // Hover highlight goes *after* pinned_items so the sidebar's opaque
