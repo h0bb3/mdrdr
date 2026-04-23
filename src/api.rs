@@ -135,15 +135,22 @@ fn entry_json(e: &TreeEntry, active: Option<&std::path::Path>) -> String {
 
 fn screenshot(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> {
     let snap = shared.snapshot();
-    let fb = render(&RenderInput {
-        source: &snap.source,
-        viewport: snap.viewport,
-        scroll: snap.scroll,
-        theme: &snap.theme,
-        fonts: &shared.fonts,
-        tree: snap.tree_flat.as_deref(),
-        active_path: snap.source_path.as_deref(),
-    });
+    let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+    let mut images = shared.images.lock().unwrap();
+    let fb = render(
+        &RenderInput {
+            source: &snap.source,
+            viewport: snap.viewport,
+            scroll: snap.scroll,
+            theme: &snap.theme,
+            fonts: &shared.fonts,
+            tree: snap.tree_flat.as_deref(),
+            active_path: snap.source_path.as_deref(),
+            base_dir: base_dir.as_deref(),
+        },
+        &mut images,
+    );
+    drop(images);
     let img: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> =
         image::ImageBuffer::from_raw(fb.width, fb.height, fb.pixels).expect("fb size mismatch");
     let mut png = Vec::new();

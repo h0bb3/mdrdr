@@ -7,6 +7,7 @@
 mod api;
 mod font;
 mod headless;
+mod images;
 mod layout;
 mod md;
 mod render;

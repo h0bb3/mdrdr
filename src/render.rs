@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use crate::font::Fonts;
+use crate::images::ImageCache;
 use crate::layout::{layout, pick_font, HitTarget, Layout, LayoutInput, Placed};
 use crate::md::parse;
 use crate::theme::{Rgba, Theme};
@@ -17,7 +18,7 @@ pub struct Viewport {
 pub struct Framebuffer {
     pub width: u32,
     pub height: u32,
-    pub pixels: Vec<u8>, // RGBA8 row-major
+    pub pixels: Vec<u8>,
 }
 
 impl Framebuffer {
@@ -65,19 +66,24 @@ pub struct RenderInput<'a> {
     pub fonts: &'a Fonts,
     pub tree: Option<&'a [TreeEntry]>,
     pub active_path: Option<&'a Path>,
+    pub base_dir: Option<&'a Path>,
 }
 
-pub fn render(input: &RenderInput) -> Framebuffer {
+pub fn render(input: &RenderInput, images: &mut ImageCache) -> Framebuffer {
     let blocks = parse(input.source);
-    let lay = layout(LayoutInput {
-        blocks: &blocks,
-        tree: input.tree,
-        active_path: input.active_path,
-        viewport_w: input.viewport.width,
-        viewport_h: input.viewport.height,
-        theme: input.theme,
-        fonts: input.fonts,
-    });
+    let lay = layout(
+        LayoutInput {
+            blocks: &blocks,
+            tree: input.tree,
+            active_path: input.active_path,
+            base_dir: input.base_dir,
+            viewport_w: input.viewport.width,
+            viewport_h: input.viewport.height,
+            theme: input.theme,
+            fonts: input.fonts,
+        },
+        images,
+    );
     draw(&lay, input.viewport, input.scroll, input.theme, input.fonts)
 }
 
@@ -85,30 +91,50 @@ pub fn measure(
     source: &str,
     viewport_w: u32,
     viewport_h: u32,
-    sidebar_x_offset: u32,
+    base_dir: Option<&Path>,
     theme: &Theme,
     fonts: &Fonts,
+    images: &mut ImageCache,
 ) -> f32 {
-    let _ = sidebar_x_offset;
     let blocks = parse(source);
-    let lay = layout(LayoutInput {
-        blocks: &blocks,
-        tree: None,
-        active_path: None,
-        viewport_w,
-        viewport_h,
-        theme,
-        fonts,
-    });
+    let lay = layout(
+        LayoutInput {
+            blocks: &blocks,
+            tree: None,
+            active_path: None,
+            base_dir,
+            viewport_w,
+            viewport_h,
+            theme,
+            fonts,
+        },
+        images,
+    );
     lay.doc_height
 }
 
-/// Hit-test a point (in screen coords) against the sidebar. Returns the
-/// click action if any target contains (x,y).
 pub fn hit_test<'a>(targets: &'a [HitTarget], x: f32, y: f32) -> Option<&'a HitTarget> {
     targets
         .iter()
         .find(|t| x >= t.x && x <= t.x + t.w && y >= t.y && y <= t.y + t.h)
+}
+
+pub fn compute_hit_targets(input: &RenderInput, images: &mut ImageCache) -> Vec<HitTarget> {
+    let blocks = parse(input.source);
+    let lay = layout(
+        LayoutInput {
+            blocks: &blocks,
+            tree: input.tree,
+            active_path: input.active_path,
+            base_dir: input.base_dir,
+            viewport_w: input.viewport.width,
+            viewport_h: input.viewport.height,
+            theme: input.theme,
+            fonts: input.fonts,
+        },
+        images,
+    );
+    lay.hit_targets
 }
 
 fn draw(
@@ -119,14 +145,8 @@ fn draw(
     fonts: &Fonts,
 ) -> Framebuffer {
     let mut fb = Framebuffer::new(viewport.width, viewport.height, theme.bg);
-
-    // Content (scrolled).
     draw_items(&mut fb, &lay.content_items, scroll, viewport, fonts);
-    // Pinned UI on top.
     draw_items(&mut fb, &lay.pinned_items, 0.0, viewport, fonts);
-
-    // suppress unused warning
-    let _ = theme;
     fb
 }
 
@@ -175,21 +195,46 @@ fn draw_items(
                 }
                 fb.fill_rect(*x as i32, screen_y as i32, *w as i32, 1, *color);
             }
+            Placed::Image { x, y, w, h, data } => {
+                let screen_y = *y - scroll;
+                if screen_y + *h < 0.0 || screen_y > vh {
+                    continue;
+                }
+                blit_image_scaled(fb, *x, screen_y, *w, *h, data.width, data.height, &data.rgba);
+            }
         }
     }
 }
 
-/// Compute hit targets for the current state without drawing.
-pub fn compute_hit_targets(input: &RenderInput) -> Vec<HitTarget> {
-    let blocks = parse(input.source);
-    let lay = layout(LayoutInput {
-        blocks: &blocks,
-        tree: input.tree,
-        active_path: input.active_path,
-        viewport_w: input.viewport.width,
-        viewport_h: input.viewport.height,
-        theme: input.theme,
-        fonts: input.fonts,
-    });
-    lay.hit_targets
+/// Nearest-neighbor scaled blit. Source is RGBA8, `sw` × `sh`.
+fn blit_image_scaled(
+    fb: &mut Framebuffer,
+    dst_x: f32,
+    dst_y: f32,
+    dst_w: f32,
+    dst_h: f32,
+    sw: u32,
+    sh: u32,
+    src: &[u8],
+) {
+    let dw = dst_w.round() as i32;
+    let dh = dst_h.round() as i32;
+    let dx = dst_x.round() as i32;
+    let dy = dst_y.round() as i32;
+    if dw <= 0 || dh <= 0 || sw == 0 || sh == 0 {
+        return;
+    }
+    for py in 0..dh {
+        let sy = (py as u64 * sh as u64 / dh as u64).min(sh as u64 - 1) as u32;
+        let row = (sy as usize) * (sw as usize) * 4;
+        for px in 0..dw {
+            let sx = (px as u64 * sw as u64 / dw as u64).min(sw as u64 - 1) as u32;
+            let idx = row + (sx as usize) * 4;
+            let r = src[idx];
+            let g = src[idx + 1];
+            let b = src[idx + 2];
+            let a = src[idx + 3];
+            fb.blend(dx + px, dy + py, [r, g, b, 255], a);
+        }
+    }
 }

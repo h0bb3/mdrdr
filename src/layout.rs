@@ -9,10 +9,12 @@
 //! compare mouse position directly.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use fontdue::Font;
 
 use crate::font::Fonts;
+use crate::images::{CachedImage, ImageCache};
 use crate::md::{Block, Inline};
 use crate::theme::{Rgba, Theme};
 use crate::tree::{TreeEntry, TreeKind};
@@ -48,6 +50,13 @@ pub enum Placed {
         y: f32,
         w: f32,
         color: Rgba,
+    },
+    Image {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        data: Arc<CachedImage>,
     },
 }
 
@@ -116,13 +125,14 @@ pub struct LayoutInput<'a> {
     pub blocks: &'a [Block],
     pub tree: Option<&'a [TreeEntry]>,
     pub active_path: Option<&'a Path>,
+    pub base_dir: Option<&'a Path>,
     pub viewport_w: u32,
     pub viewport_h: u32,
     pub theme: &'a Theme,
     pub fonts: &'a Fonts,
 }
 
-pub fn layout(input: LayoutInput) -> Layout {
+pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
     let sidebar_width = if input.tree.is_some() {
         SIDEBAR_WIDTH_DEFAULT
     } else {
@@ -141,6 +151,8 @@ pub fn layout(input: LayoutInput) -> Layout {
             content_right,
             theme: input.theme,
             fonts: input.fonts,
+            base_dir: input.base_dir,
+            images,
         };
         for b in input.blocks {
             ctx.block(b, 0.0);
@@ -306,6 +318,8 @@ struct Ctx<'a> {
     content_right: f32,
     theme: &'a Theme,
     fonts: &'a Fonts,
+    base_dir: Option<&'a Path>,
+    images: &'a mut ImageCache,
 }
 
 impl<'a> Ctx<'a> {
@@ -326,6 +340,12 @@ impl<'a> Ctx<'a> {
                 self.y += size * 0.15;
             }
             Block::Paragraph(inlines) => {
+                if let Some((alt, src)) = single_image(inlines) {
+                    if self.emit_block_image(alt, src, indent) {
+                        self.y += self.theme.body_size * 0.55;
+                        return;
+                    }
+                }
                 let style = body_style(self.theme);
                 self.paragraph(inlines, style, indent);
                 self.y += self.theme.body_size * 0.55;
@@ -431,6 +451,31 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Try to place an image as a block element. Returns true if placed;
+    /// false if the image could not be loaded (caller falls back to alt text).
+    fn emit_block_image(&mut self, alt: &str, src: &str, indent: f32) -> bool {
+        let Some(resolved) = ImageCache::resolve(src, self.base_dir) else {
+            return false;
+        };
+        let Some(data) = self.images.get_or_load(&resolved) else {
+            return false;
+        };
+        let avail_w = (self.content_right - self.content_left - indent).max(1.0);
+        let (nat_w, nat_h) = (data.width as f32, data.height as f32);
+        let (w, h) = if nat_w > avail_w {
+            let scale = avail_w / nat_w;
+            (avail_w, nat_h * scale)
+        } else {
+            (nat_w, nat_h)
+        };
+        let x = self.content_left + indent;
+        let y = self.y;
+        self.items.push(Placed::Image { x, y, w, h, data });
+        self.y = y + h;
+        let _ = alt; // alt is used for accessibility / fallback only.
+        true
+    }
+
     fn paragraph(&mut self, inlines: &[Inline], base: Style, indent: f32) {
         let left = self.content_left + indent;
         let right = self.content_right;
@@ -496,6 +541,25 @@ impl<'a> Ctx<'a> {
         self.items.extend(line_items.drain(..));
         self.y = baseline;
     }
+}
+
+/// If `inlines` reduces to a single Image (optionally surrounded by
+/// whitespace-only Text runs), return (alt, src). Otherwise None.
+fn single_image(inlines: &[Inline]) -> Option<(&str, &str)> {
+    let mut found: Option<(&str, &str)> = None;
+    for i in inlines {
+        match i {
+            Inline::Image { alt, src } => {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((alt.as_str(), src.as_str()));
+            }
+            Inline::Text(t) if t.trim().is_empty() => {}
+            _ => return None,
+        }
+    }
+    found
 }
 
 fn heading_size(base: f32, level: u8) -> f32 {

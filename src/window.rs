@@ -16,6 +16,7 @@ use winit::window::{Window, WindowId};
 
 use crate::api;
 use crate::font::Fonts;
+use crate::images::ImageCache;
 use crate::layout::HitAction;
 use crate::render::{compute_hit_targets, hit_test, measure, render, RenderInput, Viewport};
 use crate::theme::Theme;
@@ -39,6 +40,7 @@ pub struct AppState {
 pub struct Shared {
     pub fonts: Fonts,
     pub state: Mutex<AppState>,
+    pub images: Mutex<ImageCache>,
 }
 
 impl Shared {
@@ -137,9 +139,14 @@ impl ApplicationHandler<UserEvent> for App {
                 event: KeyEvent { logical_key, state: ElementState::Pressed, .. },
                 ..
             } => {
-                let (vh, source, vw) = {
+                let (vh, source, vw, base_dir) = {
                     let s = self.shared.state.lock().unwrap();
-                    (s.viewport.height as f32, s.source.clone(), s.viewport.width)
+                    (
+                        s.viewport.height as f32,
+                        s.source.clone(),
+                        s.viewport.width,
+                        s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
+                    )
                 };
                 let page = (vh * 0.85).max(60.0);
                 let dy: Option<f32> = match logical_key.as_ref() {
@@ -154,7 +161,17 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     Key::Named(NamedKey::End) => {
                         let theme = Theme::light();
-                        let doc_h = measure(&source, vw, vh as u32, 0, &theme, &self.shared.fonts);
+                        let mut images = self.shared.images.lock().unwrap();
+                        let doc_h = measure(
+                            &source,
+                            vw,
+                            vh as u32,
+                            base_dir.as_deref(),
+                            &theme,
+                            &self.shared.fonts,
+                            &mut images,
+                        );
+                        drop(images);
                         let mut s = self.shared.state.lock().unwrap();
                         s.scroll = (doc_h - s.viewport.height as f32).max(0.0);
                         None
@@ -198,11 +215,26 @@ impl App {
 
     fn clamp_scroll(&self) {
         let theme = Theme::light();
-        let (source, vw, vh) = {
+        let (source, vw, vh, base_dir) = {
             let s = self.shared.state.lock().unwrap();
-            (s.source.clone(), s.viewport.width, s.viewport.height as f32)
+            (
+                s.source.clone(),
+                s.viewport.width,
+                s.viewport.height as f32,
+                s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
+            )
         };
-        let doc_h = measure(&source, vw, vh as u32, 0, &theme, &self.shared.fonts);
+        let mut images = self.shared.images.lock().unwrap();
+        let doc_h = measure(
+            &source,
+            vw,
+            vh as u32,
+            base_dir.as_deref(),
+            &theme,
+            &self.shared.fonts,
+            &mut images,
+        );
+        drop(images);
         let max_scroll = (doc_h - vh).max(0.0);
         let mut s = self.shared.state.lock().unwrap();
         if s.scroll > max_scroll {
@@ -222,15 +254,22 @@ impl App {
             .unwrap();
 
         let snap = self.shared.snapshot();
-        let fb = render(&RenderInput {
-            source: &snap.source,
-            viewport: Viewport { width: w, height: h },
-            scroll: snap.scroll,
-            theme: &snap.theme,
-            fonts: &self.shared.fonts,
-            tree: snap.tree_flat.as_deref(),
-            active_path: snap.source_path.as_deref(),
-        });
+        let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+        let mut images = self.shared.images.lock().unwrap();
+        let fb = render(
+            &RenderInput {
+                source: &snap.source,
+                viewport: Viewport { width: w, height: h },
+                scroll: snap.scroll,
+                theme: &snap.theme,
+                fonts: &self.shared.fonts,
+                tree: snap.tree_flat.as_deref(),
+                active_path: snap.source_path.as_deref(),
+                base_dir: base_dir.as_deref(),
+            },
+            &mut images,
+        );
+        drop(images);
 
         let mut buffer = surface.buffer_mut().unwrap();
         for (i, px) in fb.pixels.chunks_exact(4).enumerate() {
@@ -247,15 +286,23 @@ impl App {
 
 pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
     let snap = shared.snapshot();
-    let targets = compute_hit_targets(&RenderInput {
-        source: &snap.source,
-        viewport: snap.viewport,
-        scroll: snap.scroll,
-        theme: &snap.theme,
-        fonts: &shared.fonts,
-        tree: snap.tree_flat.as_deref(),
-        active_path: snap.source_path.as_deref(),
-    });
+    let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+    let targets = {
+        let mut images = shared.images.lock().unwrap();
+        compute_hit_targets(
+            &RenderInput {
+                source: &snap.source,
+                viewport: snap.viewport,
+                scroll: snap.scroll,
+                theme: &snap.theme,
+                fonts: &shared.fonts,
+                tree: snap.tree_flat.as_deref(),
+                active_path: snap.source_path.as_deref(),
+                base_dir: base_dir.as_deref(),
+            },
+            &mut images,
+        )
+    };
     let Some(hit) = hit_test(&targets, x, y) else {
         return None;
     };
@@ -286,6 +333,7 @@ pub fn run(arg: Option<PathBuf>) -> ExitCode {
 
     let shared = Arc::new(Shared {
         fonts,
+        images: Mutex::new(ImageCache::new()),
         state: Mutex::new(AppState {
             source,
             source_path,
