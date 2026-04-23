@@ -68,6 +68,7 @@ pub struct RenderInput<'a> {
     pub active_path: Option<&'a Path>,
     pub base_dir: Option<&'a Path>,
     pub sidebar_width: f32,
+    pub sidebar_scroll: f32,
     /// (anchor, head) in document coordinates. None = no selection.
     pub selection: Option<((f32, f32), (f32, f32))>,
 }
@@ -85,6 +86,7 @@ pub fn render(input: &RenderInput, images: &mut ImageCache) -> Framebuffer {
             theme: input.theme,
             fonts: input.fonts,
             sidebar_width: input.sidebar_width,
+            sidebar_scroll: input.sidebar_scroll,
         },
         images,
     );
@@ -113,6 +115,7 @@ pub fn measure(
             theme,
             fonts,
             sidebar_width,
+            sidebar_scroll: 0.0,
         },
         images,
     );
@@ -123,6 +126,56 @@ pub fn hit_test<'a>(targets: &'a [HitTarget], x: f32, y: f32) -> Option<&'a HitT
     targets
         .iter()
         .find(|t| x >= t.x && x <= t.x + t.w && y >= t.y && y <= t.y + t.h)
+}
+
+/// Scrollbar geometry. Shared between the draw pass and mouse hit-testing so
+/// "what the thumb shows" and "what the user grabs" are the same values.
+///
+/// Coords are in screen space. `max_scroll` is the maximum valid scroll
+/// position (doc_height - viewport_height). Returns None when the doc fits.
+#[derive(Debug, Clone, Copy)]
+pub struct SbGeom {
+    pub track_x: f32,
+    pub track_y: f32,
+    pub track_w: f32,
+    pub track_h: f32,
+    pub thumb_y: f32,
+    pub thumb_h: f32,
+    pub max_scroll: f32,
+}
+
+pub const SB_VISIBLE_W: f32 = 8.0;
+pub const SB_HIT_W: f32 = 14.0;
+pub const SB_RIGHT_PAD: f32 = 2.0;
+pub const SB_MIN_THUMB: f32 = 40.0;
+
+pub fn scrollbar_geom(viewport: Viewport, scroll: f32, doc_height: f32) -> Option<SbGeom> {
+    let vh = viewport.height as f32;
+    let vw = viewport.width as f32;
+    if doc_height <= vh + 1.0 {
+        return None;
+    }
+    let max_scroll = (doc_height - vh).max(1.0);
+    let thumb_h = ((vh / doc_height) * vh).max(SB_MIN_THUMB).min(vh);
+    let frac = (scroll / max_scroll).clamp(0.0, 1.0);
+    let thumb_y = frac * (vh - thumb_h);
+    Some(SbGeom {
+        track_x: vw - SB_VISIBLE_W - SB_RIGHT_PAD,
+        track_y: 0.0,
+        track_w: SB_VISIBLE_W,
+        track_h: vh,
+        thumb_y,
+        thumb_h,
+        max_scroll,
+    })
+}
+
+/// Is (x, y) inside the scrollbar hit strip (slightly wider than the visible
+/// track so users can grab it)?
+pub fn in_scrollbar_strip(g: &SbGeom, viewport: Viewport, x: f32, y: f32) -> bool {
+    let strip_left = viewport.width as f32 - SB_HIT_W - SB_RIGHT_PAD;
+    let strip_right = viewport.width as f32;
+    x >= strip_left && x < strip_right && y >= g.track_y && y < g.track_y + g.track_h
 }
 
 pub fn compute_hit_targets(input: &RenderInput, images: &mut ImageCache) -> Vec<HitTarget> {
@@ -138,6 +191,7 @@ pub fn compute_hit_targets(input: &RenderInput, images: &mut ImageCache) -> Vec<
             theme: input.theme,
             fonts: input.fonts,
             sidebar_width: input.sidebar_width,
+            sidebar_scroll: input.sidebar_scroll,
         },
         images,
     );
@@ -289,6 +343,7 @@ pub fn extract_selection(
             theme: input.theme,
             fonts: input.fonts,
             sidebar_width: input.sidebar_width,
+            sidebar_scroll: input.sidebar_scroll,
         },
         images,
     );
@@ -342,22 +397,23 @@ fn draw_scrollbar(
     doc_height: f32,
     theme: &Theme,
 ) {
-    let vh = viewport.height as f32;
-    let vw = viewport.width as i32;
-    if doc_height <= vh + 1.0 {
-        return;
-    }
-    let track_w: i32 = 8;
-    let track_x = vw - track_w - 2;
+    let Some(g) = scrollbar_geom(viewport, scroll, doc_height) else { return };
     let track_color: [u8; 4] = [theme.muted[0], theme.muted[1], theme.muted[2], 40];
-    fb.fill_rect(track_x, 0, track_w, viewport.height as i32, track_color);
-
-    let thumb_h = ((vh / doc_height) * vh).max(40.0);
-    let max_scroll = (doc_height - vh).max(1.0);
-    let frac = (scroll / max_scroll).clamp(0.0, 1.0);
-    let thumb_y = frac * (vh - thumb_h);
+    fb.fill_rect(
+        g.track_x as i32,
+        g.track_y as i32,
+        g.track_w as i32,
+        g.track_h as i32,
+        track_color,
+    );
     let thumb_color: [u8; 4] = [theme.muted[0], theme.muted[1], theme.muted[2], 180];
-    fb.fill_rect(track_x, thumb_y as i32, track_w, thumb_h as i32, thumb_color);
+    fb.fill_rect(
+        g.track_x as i32,
+        g.thumb_y as i32,
+        g.track_w as i32,
+        g.thumb_h.ceil() as i32,
+        thumb_color,
+    );
 }
 
 fn draw_items(

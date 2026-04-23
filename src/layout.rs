@@ -96,6 +96,9 @@ pub struct Layout {
     pub hit_targets: Vec<HitTarget>,
     pub doc_height: f32,
     pub sidebar_width: f32,
+    /// Total pixel height needed to render every tree row. Used to clamp
+    /// sidebar scroll and decide whether to draw the sidebar scrollbar.
+    pub sidebar_content_height: f32,
 }
 
 #[derive(Copy, Clone)]
@@ -147,6 +150,8 @@ pub struct LayoutInput<'a> {
     pub fonts: &'a Fonts,
     /// Width of the file-tree sidebar. 0 → hidden.
     pub sidebar_width: f32,
+    /// Scroll offset inside the sidebar. 0 → top.
+    pub sidebar_scroll: f32,
 }
 
 pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
@@ -179,12 +184,14 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
 
     let mut pinned_items = Vec::new();
     let mut hit_targets = Vec::new();
+    let mut sidebar_content_height = 0.0;
     if let (Some(tree), true) = (input.tree, sidebar_width > 0.0) {
-        layout_sidebar(
+        sidebar_content_height = layout_sidebar(
             tree,
             input.active_path,
             sidebar_width,
             input.viewport_h as f32,
+            input.sidebar_scroll,
             input.theme,
             input.fonts,
             &mut pinned_items,
@@ -198,21 +205,24 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
         hit_targets,
         doc_height,
         sidebar_width,
+        sidebar_content_height,
     }
 }
 
 // ───── sidebar layout ───────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn layout_sidebar(
     tree: &[TreeEntry],
     active: Option<&Path>,
     width: f32,
     height: f32,
+    sidebar_scroll: f32,
     theme: &Theme,
     fonts: &Fonts,
     items: &mut Vec<Placed>,
     hits: &mut Vec<HitTarget>,
-) {
+) -> f32 {
     let sidebar_bg = [0xf3, 0xef, 0xe5, 0xff];
     let border = theme.muted;
 
@@ -223,17 +233,23 @@ fn layout_sidebar(
 
     let size = theme.body_size * 0.82;
     let row_h = size * 1.5;
-    let mut y = theme.margin_y * 0.5;
+    let top_pad = theme.margin_y * 0.5;
+    let content_h = top_pad * 2.0 + row_h * tree.len() as f32;
+    let mut y = top_pad - sidebar_scroll;
 
     for entry in tree {
+        let row_y = y;
+        y += row_h;
+        // Cull rows fully outside the sidebar viewport; still advance `y`.
+        if row_y + row_h < 0.0 || row_y > height {
+            continue;
+        }
         let rel_name = match entry.path.file_name() {
             Some(n) => n.to_string_lossy().to_string(),
             None => entry.path.display().to_string(),
         };
         let indent = 10.0 + (entry.depth as f32) * 14.0;
         let is_active = active.map(|a| a == entry.path.as_path()).unwrap_or(false);
-
-        let row_y = y;
         if is_active {
             items.push(Placed::Rect {
                 x: 2.0,
@@ -311,19 +327,36 @@ fn layout_sidebar(
             TreeKind::Folder => HitAction::Toggle(entry.path.clone()),
             TreeKind::Markdown => HitAction::Open(entry.path.clone()),
         };
-        hits.push(HitTarget {
-            x: 0.0,
-            y: row_y,
-            w: width,
-            h: row_h,
-            action,
-        });
-
-        y += row_h;
-        if y > height {
-            break; // don't render rows below viewport for M3
+        // Clip hit-target to the visible strip so a partial row doesn't grab
+        // clicks outside the sidebar.
+        let clipped_top = row_y.max(0.0);
+        let clipped_bot = (row_y + row_h).min(height);
+        if clipped_bot > clipped_top {
+            hits.push(HitTarget {
+                x: 0.0,
+                y: clipped_top,
+                w: width,
+                h: clipped_bot - clipped_top,
+                action,
+            });
         }
     }
+
+    // Thin scrollbar stripe on the sidebar's right edge (inside the border).
+    if content_h > height + 1.0 {
+        let max_scroll = (content_h - height).max(1.0);
+        let thumb_h = ((height / content_h) * height).max(32.0).min(height);
+        let frac = (sidebar_scroll / max_scroll).clamp(0.0, 1.0);
+        let thumb_y = frac * (height - thumb_h);
+        let sb_w = 6.0;
+        let sb_x = width - sb_w - 2.0;
+        let track_color = [theme.muted[0], theme.muted[1], theme.muted[2], 30];
+        let thumb_color = [theme.muted[0], theme.muted[1], theme.muted[2], 170];
+        items.push(Placed::Rect { x: sb_x, y: 0.0, w: sb_w, h: height, color: track_color });
+        items.push(Placed::Rect { x: sb_x, y: thumb_y, w: sb_w, h: thumb_h, color: thumb_color });
+    }
+
+    content_h
 }
 
 // ───── main content layout ──────────────────────────────────────────────────

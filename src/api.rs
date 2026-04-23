@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use winit::event_loop::EventLoopProxy;
 
-use crate::render::{render, RenderInput, Viewport};
+use crate::render::{measure, render, RenderInput, Viewport};
 use crate::tree::{TreeEntry, TreeKind};
 use crate::window::{click_at, Shared, UserEvent};
 
@@ -95,12 +95,13 @@ fn state_json(shared: &Arc<Shared>) -> String {
         .map(|t| format!("\"{}\"", json_escape(&t.root.display().to_string())))
         .unwrap_or_else(|| "null".to_string());
     format!(
-        "{{\"source_path\":{path_json},\"scroll\":{:.3},\"viewport\":{{\"w\":{},\"h\":{}}},\"source_len\":{},\"tree_root\":{root_json},\"sidebar_width\":{:.1}}}",
+        "{{\"source_path\":{path_json},\"scroll\":{:.3},\"viewport\":{{\"w\":{},\"h\":{}}},\"source_len\":{},\"tree_root\":{root_json},\"sidebar_width\":{:.1},\"sidebar_scroll\":{:.3}}}",
         s.scroll,
         s.viewport.width,
         s.viewport.height,
         s.source.len(),
         s.sidebar_width,
+        s.sidebar_scroll,
     )
 }
 
@@ -153,6 +154,7 @@ fn screenshot(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<(
             active_path: snap.source_path.as_deref(),
             base_dir: base_dir.as_deref(),
             sidebar_width: snap.sidebar_width,
+            sidebar_scroll: snap.sidebar_scroll,
             selection: snap.selection,
         },
         &mut images,
@@ -178,16 +180,34 @@ fn do_scroll(
     proxy: &EventLoopProxy<UserEvent>,
     q: &HashMap<String, String>,
 ) -> std::io::Result<()> {
+    let max_scroll = compute_max_scroll(shared);
     {
         let mut s = shared.state.lock().unwrap();
         if let Some(y) = q.get("y").and_then(|v| v.parse::<f32>().ok()) {
-            s.scroll = y.max(0.0);
+            s.scroll = y.clamp(0.0, max_scroll);
         } else if let Some(dy) = q.get("dy").and_then(|v| v.parse::<f32>().ok()) {
-            s.scroll = (s.scroll + dy).max(0.0);
+            s.scroll = (s.scroll + dy).clamp(0.0, max_scroll);
         }
     }
     let _ = proxy.send_event(UserEvent::Redraw);
     ok_json(stream, &state_json(shared))
+}
+
+fn compute_max_scroll(shared: &Arc<Shared>) -> f32 {
+    let snap = shared.snapshot();
+    let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+    let mut images = shared.images.lock().unwrap();
+    let doc_h = measure(
+        &snap.source,
+        snap.viewport.width,
+        snap.viewport.height,
+        base_dir.as_deref(),
+        snap.sidebar_width,
+        &snap.theme,
+        &shared.fonts,
+        &mut images,
+    );
+    (doc_h - snap.viewport.height as f32).max(0.0)
 }
 
 fn do_resize(
@@ -201,6 +221,14 @@ fn do_resize(
     if let (Some(w), Some(h)) = (w, h) {
         let mut s = shared.state.lock().unwrap();
         s.viewport = Viewport { width: w.max(1), height: h.max(1) };
+    }
+    // Re-clamp in case the resize shrank the doc / scroll became past-bottom.
+    let max_scroll = compute_max_scroll(shared);
+    {
+        let mut s = shared.state.lock().unwrap();
+        if s.scroll > max_scroll {
+            s.scroll = max_scroll;
+        }
     }
     let _ = proxy.send_event(UserEvent::Redraw);
     ok_json(stream, &state_json(shared))
@@ -286,9 +314,35 @@ fn do_sidebar(
                 s.sidebar_width = 0.0;
             }
         }
+        if let Some(y) = q.get("scroll").and_then(|v| v.parse::<f32>().ok()) {
+            s.sidebar_scroll = y.max(0.0);
+        } else if let Some(dy) = q.get("dscroll").and_then(|v| v.parse::<f32>().ok()) {
+            s.sidebar_scroll = (s.sidebar_scroll + dy).max(0.0);
+        }
     }
+    clamp_sidebar_scroll(shared);
     let _ = proxy.send_event(UserEvent::Redraw);
     ok_json(stream, &state_json(shared))
+}
+
+fn clamp_sidebar_scroll(shared: &Arc<Shared>) {
+    let snap = shared.snapshot();
+    let Some(tree) = snap.tree_flat.as_deref() else { return };
+    if snap.sidebar_width <= 0.0 {
+        return;
+    }
+    let size = snap.theme.body_size * 0.82;
+    let row_h = size * 1.5;
+    let top_pad = snap.theme.margin_y * 0.5;
+    let content_h = top_pad * 2.0 + row_h * tree.len() as f32;
+    let max_scroll = (content_h - snap.viewport.height as f32).max(0.0);
+    let mut s = shared.state.lock().unwrap();
+    if s.sidebar_scroll > max_scroll {
+        s.sidebar_scroll = max_scroll;
+    }
+    if s.sidebar_scroll < 0.0 {
+        s.sidebar_scroll = 0.0;
+    }
 }
 
 fn do_select(
@@ -346,6 +400,7 @@ fn do_copy(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> 
                 active_path: snap.source_path.as_deref(),
                 base_dir: base_dir.as_deref(),
                 sidebar_width: snap.sidebar_width,
+                sidebar_scroll: snap.sidebar_scroll,
                 selection: snap.selection,
             },
             &mut images,

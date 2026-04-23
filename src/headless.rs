@@ -37,6 +37,7 @@ pub fn render_to_png(
             active_path: source_path,
             base_dir,
             sidebar_width: if flat.is_some() { 260.0 } else { 0.0 },
+            sidebar_scroll: 0.0,
             selection: None,
         },
         &mut images,

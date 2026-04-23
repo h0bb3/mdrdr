@@ -12,14 +12,17 @@ use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::api;
 use crate::clipboard;
 use crate::font::Fonts;
 use crate::images::ImageCache;
 use crate::layout::HitAction;
-use crate::render::{compute_hit_targets, extract_selection, hit_test, measure, render, RenderInput, Viewport};
+use crate::render::{
+    compute_hit_targets, extract_selection, hit_test, in_scrollbar_strip, measure, render,
+    scrollbar_geom, RenderInput, SbGeom, Viewport,
+};
 use crate::theme::Theme;
 use crate::tree::FileTree;
 
@@ -42,6 +45,8 @@ pub struct AppState {
     pub sidebar_width_restore: f32,
     /// True while the user is dragging the sidebar's right edge.
     pub sidebar_dragging: bool,
+    /// Scroll offset inside the file tree (pixels from top). 0 → top.
+    pub sidebar_scroll: f32,
 
     /// Selection anchor and head in *document* coordinates (x from the left
     /// of the window including sidebar, y in the unscrolled document).
@@ -49,6 +54,11 @@ pub struct AppState {
     pub sel_anchor: Option<(f32, f32)>,
     pub sel_head: Option<(f32, f32)>,
     pub is_selecting: bool,
+
+    /// Scrollbar drag state. While active, mouse-move remaps mouse_y → scroll
+    /// using `scrollbar_grip` (offset between mouse_y and thumb top at press).
+    pub scrollbar_dragging: bool,
+    pub scrollbar_grip: f32,
 }
 
 pub struct Shared {
@@ -72,6 +82,7 @@ impl Shared {
             tree_flat: s.tree.as_ref().map(|t| t.flatten()),
             theme: Theme::light(),
             sidebar_width: s.sidebar_width,
+            sidebar_scroll: s.sidebar_scroll,
             selection,
         }
     }
@@ -85,6 +96,7 @@ pub struct Snapshot {
     pub tree_flat: Option<Vec<crate::tree::TreeEntry>>,
     pub theme: Theme,
     pub sidebar_width: f32,
+    pub sidebar_scroll: f32,
     pub selection: Option<((f32, f32), (f32, f32))>,
 }
 
@@ -94,6 +106,8 @@ struct App {
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
     proxy: EventLoopProxy<UserEvent>,
     modifiers: Modifiers,
+    /// Cached last-set cursor so we don't spam `set_cursor` every mouse move.
+    cursor: CursorIcon,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -135,21 +149,67 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::LineDelta(_, lines) => -lines * 40.0,
                     MouseScrollDelta::PixelDelta(pos) => -pos.y as f32,
                 };
-                {
-                    let mut s = self.shared.state.lock().unwrap();
-                    s.scroll = (s.scroll + dy).max(0.0);
+                let over_sidebar = {
+                    let s = self.shared.state.lock().unwrap();
+                    s.tree.is_some() && s.sidebar_width > 0.0 && (s.last_mouse.x as f32) < s.sidebar_width
+                };
+                if over_sidebar {
+                    {
+                        let mut s = self.shared.state.lock().unwrap();
+                        s.sidebar_scroll = (s.sidebar_scroll + dy).max(0.0);
+                    }
+                    self.clamp_sidebar_scroll();
+                } else {
+                    {
+                        let mut s = self.shared.state.lock().unwrap();
+                        s.scroll = (s.scroll + dy).max(0.0);
+                    }
+                    self.clamp_scroll();
                 }
-                self.clamp_scroll();
                 self.request_redraw();
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                let (was_dragging_sidebar, was_selecting, scroll) = {
+                let (dragging_sidebar, dragging_scrollbar, selecting, scroll, grip, sidebar_w, tree_visible, viewport) = {
                     let mut s = self.shared.state.lock().unwrap();
                     s.last_mouse = position;
-                    (s.sidebar_dragging, s.is_selecting, s.scroll)
+                    (
+                        s.sidebar_dragging,
+                        s.scrollbar_dragging,
+                        s.is_selecting,
+                        s.scroll,
+                        s.scrollbar_grip,
+                        s.sidebar_width,
+                        s.tree.is_some(),
+                        s.viewport,
+                    )
                 };
-                if was_dragging_sidebar {
+                self.update_cursor(
+                    position.x as f32,
+                    position.y as f32,
+                    dragging_sidebar,
+                    dragging_scrollbar,
+                    selecting,
+                    sidebar_w,
+                    tree_visible,
+                    viewport,
+                );
+                if dragging_scrollbar {
+                    if let Some(g) = self.current_scrollbar_geom() {
+                        let vh = g.track_h;
+                        let track_avail = (vh - g.thumb_h).max(1.0);
+                        let new_thumb_top =
+                            (position.y as f32 - grip).clamp(0.0, vh - g.thumb_h);
+                        let frac = new_thumb_top / track_avail;
+                        let new_scroll = frac * g.max_scroll;
+                        {
+                            let mut s = self.shared.state.lock().unwrap();
+                            s.scroll = new_scroll;
+                        }
+                        self.clamp_scroll();
+                        self.request_redraw();
+                    }
+                } else if dragging_sidebar {
                     let new_w = (position.x as f32).clamp(120.0, 640.0);
                     {
                         let mut s = self.shared.state.lock().unwrap();
@@ -157,7 +217,7 @@ impl ApplicationHandler<UserEvent> for App {
                         s.sidebar_width_restore = new_w;
                     }
                     self.request_redraw();
-                } else if was_selecting {
+                } else if selecting {
                     let doc = (position.x as f32, position.y as f32 + scroll);
                     {
                         let mut s = self.shared.state.lock().unwrap();
@@ -168,19 +228,43 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                let (pos, sidebar_w, tree_visible, scroll) = {
+                let (pos, sidebar_w, tree_visible, scroll, viewport) = {
                     let s = self.shared.state.lock().unwrap();
-                    (s.last_mouse, s.sidebar_width, s.tree.is_some(), s.scroll)
+                    (s.last_mouse, s.sidebar_width, s.tree.is_some(), s.scroll, s.viewport)
                 };
                 let x = pos.x as f32;
                 let y = pos.y as f32;
 
-                // Sidebar's right-edge drag strip.
+                // 1. Scrollbar (highest priority — it sits on top of content).
+                if let Some(g) = self.current_scrollbar_geom() {
+                    if in_scrollbar_strip(&g, viewport, x, y) {
+                        if y >= g.thumb_y && y < g.thumb_y + g.thumb_h {
+                            // Grab the thumb.
+                            let mut s = self.shared.state.lock().unwrap();
+                            s.scrollbar_dragging = true;
+                            s.scrollbar_grip = y - g.thumb_y;
+                        } else {
+                            // Page above / below.
+                            let page = g.track_h * 0.9;
+                            let mut s = self.shared.state.lock().unwrap();
+                            if y < g.thumb_y {
+                                s.scroll = (s.scroll - page).max(0.0);
+                            } else {
+                                s.scroll = (s.scroll + page).min(g.max_scroll);
+                            }
+                        }
+                        self.clamp_scroll();
+                        self.request_redraw();
+                        return;
+                    }
+                }
+
+                // 2. Sidebar's right-edge drag strip.
                 if tree_visible && sidebar_w > 0.0 && (x - sidebar_w).abs() <= 6.0 {
                     let mut s = self.shared.state.lock().unwrap();
                     s.sidebar_dragging = true;
                 } else if x < sidebar_w {
-                    // Inside sidebar — treat as a tree click.
+                    // 3. Inside sidebar — tree click.
                     {
                         let mut s = self.shared.state.lock().unwrap();
                         s.sel_anchor = None;
@@ -188,7 +272,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     click_at(&self.shared, x, y);
                 } else {
-                    // Content area — start a text selection.
+                    // 4. Content area — start a text selection.
                     let doc = (x, y + scroll);
                     let mut s = self.shared.state.lock().unwrap();
                     s.sel_anchor = Some(doc);
@@ -203,6 +287,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut s = self.shared.state.lock().unwrap();
                 s.sidebar_dragging = false;
                 s.is_selecting = false;
+                s.scrollbar_dragging = false;
             }
 
             WindowEvent::ModifiersChanged(mods) => {
@@ -338,6 +423,99 @@ impl App {
         }
     }
 
+    /// Decide which cursor icon to show based on what the pointer is over,
+    /// and push it to the window (only when it changes).
+    #[allow(clippy::too_many_arguments)]
+    fn update_cursor(
+        &mut self,
+        x: f32,
+        y: f32,
+        dragging_sidebar: bool,
+        dragging_scrollbar: bool,
+        selecting: bool,
+        sidebar_w: f32,
+        tree_visible: bool,
+        viewport: Viewport,
+    ) {
+        let icon = if dragging_scrollbar {
+            CursorIcon::Grabbing
+        } else if dragging_sidebar {
+            CursorIcon::EwResize
+        } else if selecting {
+            CursorIcon::Text
+        } else if let Some(g) = self.current_scrollbar_geom().filter(|g| {
+            in_scrollbar_strip(g, viewport, x, y)
+        }) {
+            if y >= g.thumb_y && y < g.thumb_y + g.thumb_h {
+                CursorIcon::Grab
+            } else {
+                CursorIcon::Pointer
+            }
+        } else if tree_visible && sidebar_w > 0.0 && (x - sidebar_w).abs() <= 6.0 {
+            CursorIcon::EwResize
+        } else if x < sidebar_w {
+            CursorIcon::Pointer
+        } else {
+            CursorIcon::Text
+        };
+        if icon != self.cursor {
+            if let Some(w) = &self.window {
+                w.set_cursor(icon);
+            }
+            self.cursor = icon;
+        }
+    }
+
+    /// Measure the sidebar's total content height and clamp
+    /// `sidebar_scroll` to [0, content_h - viewport_h].
+    fn clamp_sidebar_scroll(&self) {
+        let snap = self.shared.snapshot();
+        let Some(tree) = snap.tree_flat.as_deref() else { return };
+        if snap.sidebar_width <= 0.0 {
+            return;
+        }
+        // Mirror layout_sidebar's formula; cheap enough to inline here so we
+        // don't have to run the full layout just to count rows.
+        let size = snap.theme.body_size * 0.82;
+        let row_h = size * 1.5;
+        let top_pad = snap.theme.margin_y * 0.5;
+        let content_h = top_pad * 2.0 + row_h * tree.len() as f32;
+        let max_scroll = (content_h - snap.viewport.height as f32).max(0.0);
+        let mut s = self.shared.state.lock().unwrap();
+        if s.sidebar_scroll > max_scroll {
+            s.sidebar_scroll = max_scroll;
+        }
+        if s.sidebar_scroll < 0.0 {
+            s.sidebar_scroll = 0.0;
+        }
+    }
+
+    fn current_scrollbar_geom(&self) -> Option<SbGeom> {
+        let theme = Theme::light();
+        let (source, viewport, base_dir, sidebar_w, scroll) = {
+            let s = self.shared.state.lock().unwrap();
+            (
+                s.source.clone(),
+                s.viewport,
+                s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
+                s.sidebar_width,
+                s.scroll,
+            )
+        };
+        let mut images = self.shared.images.lock().unwrap();
+        let doc_h = measure(
+            &source,
+            viewport.width,
+            viewport.height,
+            base_dir.as_deref(),
+            sidebar_w,
+            &theme,
+            &self.shared.fonts,
+            &mut images,
+        );
+        scrollbar_geom(viewport, scroll, doc_h)
+    }
+
     fn copy_selection(&self) {
         let snap = self.shared.snapshot();
         if snap.selection.is_none() {
@@ -357,6 +535,7 @@ impl App {
                     active_path: snap.source_path.as_deref(),
                     base_dir: base_dir.as_deref(),
                     sidebar_width: snap.sidebar_width,
+                    sidebar_scroll: snap.sidebar_scroll,
                     selection: snap.selection,
                 },
                 &mut images,
@@ -394,6 +573,7 @@ impl App {
                 active_path: snap.source_path.as_deref(),
                 base_dir: base_dir.as_deref(),
                 sidebar_width: snap.sidebar_width,
+                sidebar_scroll: snap.sidebar_scroll,
                 selection: snap.selection,
             },
             &mut images,
@@ -429,6 +609,7 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
                 active_path: snap.source_path.as_deref(),
                 base_dir: base_dir.as_deref(),
                 sidebar_width: snap.sidebar_width,
+                sidebar_scroll: snap.sidebar_scroll,
                 selection: None,
             },
             &mut images,
@@ -475,9 +656,12 @@ pub fn run(arg: Option<PathBuf>) -> ExitCode {
             sidebar_width: 260.0,
             sidebar_width_restore: 260.0,
             sidebar_dragging: false,
+            sidebar_scroll: 0.0,
             sel_anchor: None,
             sel_head: None,
             is_selecting: false,
+            scrollbar_dragging: false,
+            scrollbar_grip: 0.0,
         }),
     });
 
@@ -489,7 +673,14 @@ pub fn run(arg: Option<PathBuf>) -> ExitCode {
 
     crate::watch::spawn(shared.clone(), proxy.clone());
 
-    let mut app = App { shared, window: None, surface: None, proxy, modifiers: Modifiers::default() };
+    let mut app = App {
+        shared,
+        window: None,
+        surface: None,
+        proxy,
+        modifiers: Modifiers::default(),
+        cursor: CursorIcon::Default,
+    };
 
     match event_loop.run_app(&mut app) {
         Ok(()) => ExitCode::SUCCESS,
