@@ -1284,11 +1284,10 @@ fn build_context_menu_items(
         items.push(("Copy text".to_string(), MenuAction::CopyText(text)));
     }
     if let Some(z) = copy_zone {
-        let (label, text) = match z.kind {
-            crate::layout::CopyKind::Code => ("Copy code", z.text.clone()),
-            crate::layout::CopyKind::Csv => ("Copy table as CSV", z.text.clone()),
-        };
-        items.push((label.to_string(), MenuAction::CopyText(text)));
+        // Zones can offer multiple formats (e.g. tables: CSV + Markdown).
+        for (label, text) in &z.actions {
+            items.push((label.clone(), MenuAction::CopyText(text.clone())));
+        }
     }
     if let Some(p) = copy_path {
         items.push(("Copy path".to_string(), MenuAction::CopyPath(p)));

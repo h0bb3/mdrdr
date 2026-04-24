@@ -114,24 +114,17 @@ pub struct HitTarget {
 }
 
 /// A rectangular region in document coords that, when right-clicked, offers
-/// a "Copy …" menu item — no visible button, just a hover-revealed
-/// affordance via the context menu. Produced for code blocks and tables.
+/// one or more "Copy …" menu items. No visible UI — the context menu
+/// surfaces the options. Produced for code blocks (one item: Copy code)
+/// and tables (two items: Copy as CSV / Copy as Markdown).
 #[derive(Debug, Clone)]
 pub struct CopyZone {
     pub x: f32,
     pub y: f32,
     pub w: f32,
     pub h: f32,
-    pub kind: CopyKind,
-    /// The text that goes on the clipboard (raw code for Code, RFC-4180
-    /// for Csv).
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CopyKind {
-    Code,
-    Csv,
+    /// (menu label, clipboard text) pairs, rendered in insertion order.
+    pub actions: Vec<(String, String)>,
 }
 
 pub struct Layout {
@@ -611,8 +604,7 @@ impl<'a> Ctx<'a> {
                     y: start_y,
                     w: rect_w,
                     h: rect_h,
-                    kind: CopyKind::Code,
-                    text: text.clone(),
+                    actions: vec![("Copy code".to_string(), text.clone())],
                 });
 
                 self.y = start_y + rect_h + self.theme.body_size * 0.5;
@@ -833,15 +825,17 @@ impl<'a> Ctx<'a> {
             self.items.push(Placed::Rect { x: cx - 0.5, y: y_start, w: 1.0, h: y - y_start, color: col_thin });
         }
 
-        // Right-click anywhere over the table to copy as CSV — the
-        // context menu picks this up via copy_zones.
+        // Right-click anywhere over the table to copy. Two formats:
+        // RFC-4180 CSV (for spreadsheets) and markdown (round-trip).
         self.copy_zones.push(CopyZone {
             x: x0,
             y: y_start,
             w: table_w,
             h: y - y_start,
-            kind: CopyKind::Csv,
-            text: table_to_csv(header, rows),
+            actions: vec![
+                ("Copy table as CSV".to_string(), table_to_csv(header, rows)),
+                ("Copy table as Markdown".to_string(), table_to_markdown(header, align, rows)),
+            ],
         });
 
         self.y = y + self.theme.body_size * 0.4;
@@ -1196,6 +1190,117 @@ fn table_to_csv(header: &[Vec<Inline>], rows: &[Vec<Vec<Inline>>]) -> String {
     for row in rows {
         out.push('\n');
         out.push_str(&row_csv(row));
+    }
+    out
+}
+
+/// Round-trip a table back to Markdown. Preserves inline formatting
+/// (`**bold**`, `*italic*`, backtick code, `$math$`, links, images) and
+/// emits GFM alignment markers (`:---`, `:---:`, `---:`).
+fn table_to_markdown(
+    header: &[Vec<Inline>],
+    align: &[Align],
+    rows: &[Vec<Vec<Inline>>],
+) -> String {
+    let cols = header.len();
+    let mut out = String::new();
+
+    // Header row.
+    out.push('|');
+    for cell in header {
+        out.push(' ');
+        out.push_str(inlines_to_md_cell(cell).trim());
+        out.push_str(" |");
+    }
+    out.push('\n');
+
+    // Alignment row.
+    out.push('|');
+    for i in 0..cols {
+        let a = align.get(i).copied().unwrap_or(Align::Left);
+        let sep = match a {
+            Align::Left => " :--- |",
+            Align::Center => " :---: |",
+            Align::Right => " ---: |",
+        };
+        out.push_str(sep);
+    }
+    out.push('\n');
+
+    // Body rows.
+    let empty: Vec<Inline> = Vec::new();
+    for row in rows {
+        out.push('|');
+        for c in 0..cols {
+            let cell = row.get(c).unwrap_or(&empty);
+            out.push(' ');
+            out.push_str(inlines_to_md_cell(cell).trim());
+            out.push_str(" |");
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Render inlines back to Markdown source, suitable for a table cell:
+/// escapes `|` and collapses newlines to spaces (the `|`-delimited row
+/// format can't express either).
+fn inlines_to_md_cell(inlines: &[Inline]) -> String {
+    let raw = inlines_to_markdown(inlines);
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '|' => out.push_str("\\|"),
+            '\n' | '\r' => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Inline tree → Markdown source. Inverse of the parser for the subset we
+/// care about: text, bold, italic, code, math, links, images. Unknown
+/// combinations fall through to plain text.
+fn inlines_to_markdown(inlines: &[Inline]) -> String {
+    let mut out = String::new();
+    for i in inlines {
+        match i {
+            Inline::Text(s) => out.push_str(s),
+            Inline::Bold(inner) => {
+                out.push_str("**");
+                out.push_str(&inlines_to_markdown(inner));
+                out.push_str("**");
+            }
+            Inline::Italic(inner) => {
+                out.push('*');
+                out.push_str(&inlines_to_markdown(inner));
+                out.push('*');
+            }
+            Inline::Code(s) => {
+                out.push('`');
+                out.push_str(s);
+                out.push('`');
+            }
+            Inline::Math(s) => {
+                out.push('$');
+                out.push_str(s);
+                out.push('$');
+            }
+            Inline::Link { text, href } => {
+                out.push('[');
+                out.push_str(&inlines_to_markdown(text));
+                out.push_str("](");
+                out.push_str(href);
+                out.push(')');
+            }
+            Inline::Image { alt, src } => {
+                out.push_str("![");
+                out.push_str(alt);
+                out.push_str("](");
+                out.push_str(src);
+                out.push(')');
+            }
+        }
     }
     out
 }
