@@ -185,6 +185,7 @@ fn screenshot(
             sidebar_zoom: snap.sidebar_zoom,
             selection: snap.selection,
             hover_pos,
+            search: None,
         },
         &mut images,
     );
@@ -422,6 +423,7 @@ fn do_hits(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> 
                 sidebar_zoom: snap.sidebar_zoom,
                 selection: None,
                 hover_pos: None,
+                search: None,
             },
             &mut images,
         )
@@ -533,6 +535,7 @@ fn do_copy(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> 
                 sidebar_zoom: snap.sidebar_zoom,
                 selection: snap.selection,
                 hover_pos: None,
+                search: None,
             },
             &mut images,
         )

@@ -42,6 +42,7 @@ pub fn render_to_png(
             sidebar_zoom: 1.0,
             selection: None,
             hover_pos: None,
+            search: None,
         },
         &mut images,
     );

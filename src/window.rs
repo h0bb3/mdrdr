@@ -47,6 +47,8 @@ pub enum MenuAction {
     /// Put this text on the clipboard. Used by "Copy text" (selection),
     /// "Copy code" (code block), and "Copy table as CSV" (table).
     CopyText(String),
+    /// Open the in-document search overlay.
+    Find,
 }
 
 /// A context menu floating near the cursor. Coordinates are the top-left in
@@ -59,6 +61,23 @@ pub struct ContextMenu {
     /// Entries for the "Outline ▸" submenu. Empty → outline row is hidden.
     /// Each entry is (indented_label, doc_y).
     pub outline_items: Vec<(String, f32)>,
+}
+
+/// In-document find bar. A small draggable overlay with a text input,
+/// prev/next arrows, match counter and close button.
+#[derive(Debug, Clone)]
+pub struct SearchUi {
+    pub query: String,
+    /// 0-based; clamped into [0, match_count) externally.
+    pub current: usize,
+    /// Last-known match count (updated by the render / scroll path).
+    pub match_count: usize,
+    /// Panel top-left in screen coords.
+    pub x: f32,
+    pub y: f32,
+    /// When Some, mouse delta from panel top-left at the moment the drag
+    /// started. Kept across CursorMoved events.
+    pub drag_grip: Option<(f32, f32)>,
 }
 
 pub struct AppState {
@@ -108,6 +127,9 @@ pub struct AppState {
 
     /// Active right-click context menu. `None` when closed.
     pub context_menu: Option<ContextMenu>,
+
+    /// Active in-document search overlay. `None` when closed.
+    pub search: Option<SearchUi>,
 }
 
 pub struct Shared {
@@ -146,6 +168,7 @@ impl Shared {
             selection,
             hover_pos,
             context_menu: s.context_menu.clone(),
+            search: s.search.clone(),
         }
     }
 }
@@ -167,6 +190,7 @@ pub struct Snapshot {
     /// flicker if left on during active interaction.
     pub hover_pos: Option<(f32, f32)>,
     pub context_menu: Option<ContextMenu>,
+    pub search: Option<SearchUi>,
 }
 
 struct App {
@@ -227,7 +251,7 @@ impl ApplicationHandler<UserEvent> for App {
                         (dy, (pos.y as f32) / 40.0)
                     }
                 };
-                let ctrl = self.modifiers.state().control_key();
+                let ctrl = self.shortcut_mod();
                 let over_sidebar = {
                     let s = self.shared.state.lock().unwrap();
                     s.tree.is_some()
@@ -282,6 +306,28 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 if menu_open {
                     // Repaint so the hovered-row tint follows the cursor.
+                    self.request_redraw();
+                }
+                // Search panel drag: move the overlay with the cursor
+                // while drag_grip is set, clamping inside the viewport.
+                {
+                    let mut s = self.shared.state.lock().unwrap();
+                    let vw = s.viewport.width as f32;
+                    let vh = s.viewport.height as f32;
+                    let mut moved = false;
+                    if let Some(su) = s.search.as_mut() {
+                        if let Some((gx, gy)) = su.drag_grip {
+                            su.x = (position.x as f32 - gx).clamp(0.0, (vw - SEARCH_PANEL_W).max(0.0));
+                            su.y = (position.y as f32 - gy).clamp(0.0, (vh - SEARCH_PANEL_H).max(0.0));
+                            moved = true;
+                        }
+                    }
+                    drop(s);
+                    if moved { self.request_redraw(); }
+                }
+                // Repaint when hovering the search buttons so their tint
+                // tracks the cursor.
+                if self.shared.state.lock().unwrap().search.is_some() {
                     self.request_redraw();
                 }
                 let cursor_changed = self.update_cursor(
@@ -359,6 +405,46 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 let x = pos.x as f32;
                 let y = pos.y as f32;
+
+                // 0a. Search overlay — if open and hit, handle buttons / drag
+                //     and short-circuit before anything else.
+                let search_ui = self.shared.state.lock().unwrap().search.clone();
+                if let Some(su) = search_ui {
+                    let hit = search_hit_test(&su, x, y);
+                    match hit {
+                        SearchHit::Close => {
+                            self.close_search();
+                            self.request_redraw();
+                            return;
+                        }
+                        SearchHit::Next => {
+                            self.step_search(false);
+                            self.request_redraw();
+                            return;
+                        }
+                        SearchHit::Prev => {
+                            self.step_search(true);
+                            self.request_redraw();
+                            return;
+                        }
+                        SearchHit::Drag => {
+                            let mut s = self.shared.state.lock().unwrap();
+                            if let Some(s2) = &mut s.search {
+                                s2.drag_grip = Some((x - s2.x, y - s2.y));
+                            }
+                            return;
+                        }
+                        SearchHit::Input | SearchHit::Panel => {
+                            // Clicks inside the panel are absorbed — the
+                            // panel itself doesn't take any focus action
+                            // beyond "don't fall through".
+                            return;
+                        }
+                        SearchHit::Outside => {
+                            // Let other handlers run; search stays open.
+                        }
+                    }
+                }
 
                 // 0. Context menu — if one is open, it captures this click.
                 //    Hit inside → execute item. Hit outside → just close.
@@ -543,6 +629,9 @@ impl ApplicationHandler<UserEvent> for App {
                     s.is_selecting = false;
                     s.scrollbar_dragging = false;
                     s.sidebar_scrollbar_dragging = false;
+                    if let Some(su) = s.search.as_mut() {
+                        su.drag_grip = None;
+                    }
                     let click = match (was_selecting, anchor, head) {
                         (true, Some(a), Some(h)) => {
                             let dx = (a.0 - h.0).abs();
@@ -574,6 +663,23 @@ impl ApplicationHandler<UserEvent> for App {
                 event: KeyEvent { logical_key, state: ElementState::Pressed, .. },
                 ..
             } => {
+                // Search overlay is modal for keyboard — when it's open,
+                // Enter / Shift+Enter cycles matches, Esc closes, other
+                // keys go into the query.
+                let search_open = self.shared.state.lock().unwrap().search.is_some();
+                if search_open {
+                    self.handle_search_key(&logical_key);
+                    self.request_redraw();
+                    return;
+                }
+                // Ctrl+F / Cmd+F opens the search overlay.
+                if self.shortcut_mod() {
+                    if matches!(logical_key.as_ref(), Key::Character(c) if c == "f") {
+                        self.open_search();
+                        self.request_redraw();
+                        return;
+                    }
+                }
                 let (vh, source, vw, base_dir) = {
                     let s = self.shared.state.lock().unwrap();
                     (
@@ -631,7 +737,7 @@ impl ApplicationHandler<UserEvent> for App {
                         event_loop.exit();
                         return;
                     }
-                    Key::Character(c) if c == "b" && !self.modifiers.state().control_key() => {
+                    Key::Character(c) if c == "b" && !self.shortcut_mod() => {
                         let mut s = self.shared.state.lock().unwrap();
                         if s.sidebar_width > 0.0 {
                             s.sidebar_width_restore = s.sidebar_width;
@@ -645,11 +751,11 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         None
                     }
-                    Key::Character(c) if c == "c" && self.modifiers.state().control_key() => {
+                    Key::Character(c) if c == "c" && self.shortcut_mod() => {
                         self.copy_selection();
                         None
                     }
-                    Key::Character(c) if c == "t" && !self.modifiers.state().control_key() => {
+                    Key::Character(c) if c == "t" && !self.shortcut_mod() => {
                         let mut s = self.shared.state.lock().unwrap();
                         s.dark = !s.dark;
                         None
@@ -681,6 +787,180 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 impl App {
+    /// True when the "app-shortcut" modifier is down. On Linux / Windows
+    /// that's Ctrl; on macOS it's Cmd (winit reports Cmd as super_key).
+    /// Accepting either everywhere keeps Ctrl-F / Ctrl-C muscle memory
+    /// working on any platform.
+    fn shortcut_mod(&self) -> bool {
+        let m = self.modifiers.state();
+        m.control_key() || m.super_key()
+    }
+
+    fn shift_mod(&self) -> bool {
+        self.modifiers.state().shift_key()
+    }
+
+    /// Open the search overlay, or re-focus it if already open. Positions
+    /// the panel at the top-right of the viewport the first time; preserves
+    /// position (the user may have dragged it) on subsequent opens.
+    fn open_search(&self) {
+        let mut s = self.shared.state.lock().unwrap();
+        if s.search.is_none() {
+            let vw = s.viewport.width as f32;
+            let panel_w = 360.0;
+            s.search = Some(SearchUi {
+                query: String::new(),
+                current: 0,
+                match_count: 0,
+                x: (vw - panel_w - 20.0).max(20.0),
+                y: 20.0,
+                drag_grip: None,
+            });
+        }
+    }
+
+    fn close_search(&self) {
+        let mut s = self.shared.state.lock().unwrap();
+        s.search = None;
+    }
+
+    /// Interpret one keypress while the search overlay owns the keyboard.
+    fn handle_search_key(&self, key: &winit::keyboard::Key) {
+        use winit::keyboard::Key;
+        match key.as_ref() {
+            Key::Named(NamedKey::Escape) => self.close_search(),
+            Key::Named(NamedKey::Enter) => {
+                let backward = self.shift_mod();
+                self.step_search(backward);
+            }
+            Key::Named(NamedKey::Backspace) => {
+                {
+                    let mut s = self.shared.state.lock().unwrap();
+                    if let Some(su) = &mut s.search {
+                        su.query.pop();
+                        su.current = 0;
+                    }
+                }
+                self.after_search_query_change();
+            }
+            Key::Character(txt) => {
+                // Skip control chars. Append the string (usually one char).
+                let mut changed = false;
+                {
+                    let mut s = self.shared.state.lock().unwrap();
+                    if let Some(su) = &mut s.search {
+                        for c in txt.chars() {
+                            if !c.is_control() {
+                                su.query.push(c);
+                                changed = true;
+                            }
+                        }
+                        if changed { su.current = 0; }
+                    }
+                }
+                if changed {
+                    self.after_search_query_change();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Recompute match count after the query changes and scroll to the
+    /// first match if any.
+    fn after_search_query_change(&self) {
+        let matches = self.compute_current_matches();
+        {
+            let mut s = self.shared.state.lock().unwrap();
+            if let Some(su) = &mut s.search {
+                su.match_count = matches.len();
+                if su.current >= su.match_count {
+                    su.current = 0;
+                }
+            }
+        }
+        if !matches.is_empty() {
+            self.scroll_to_match(matches[0].doc_y);
+        }
+    }
+
+    /// Ctrl+G / Enter / click-next advances; Shift-Enter / Shift+click goes
+    /// back. Wraps around.
+    fn step_search(&self, backward: bool) {
+        let matches = self.compute_current_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let idx = {
+            let mut s = self.shared.state.lock().unwrap();
+            let Some(su) = &mut s.search else { return };
+            su.match_count = matches.len();
+            if backward {
+                su.current = if su.current == 0 { matches.len() - 1 } else { su.current - 1 };
+            } else {
+                su.current = (su.current + 1) % matches.len();
+            }
+            su.current
+        };
+        self.scroll_to_match(matches[idx].doc_y);
+    }
+
+    fn compute_current_matches(&self) -> Vec<crate::render::ContentMatch> {
+        let snap = self.shared.snapshot();
+        let query = snap.search.as_ref().map(|s| s.query.clone()).unwrap_or_default();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+        let mut images = self.shared.images.lock().unwrap();
+        let blocks = crate::md::parse(&snap.source);
+        let lay = crate::layout::layout(
+            crate::layout::LayoutInput {
+                blocks: &blocks,
+                tree: snap.tree_flat.as_deref(),
+                active_path: snap.source_path.as_deref(),
+                base_dir: base_dir.as_deref(),
+                viewport_w: snap.viewport.width,
+                viewport_h: snap.viewport.height,
+                theme: &snap.theme,
+                fonts: &self.shared.fonts,
+                sidebar_width: snap.sidebar_width,
+                sidebar_scroll: snap.sidebar_scroll,
+                content_zoom: snap.content_zoom,
+                sidebar_zoom: snap.sidebar_zoom,
+            },
+            &mut images,
+        );
+        drop(images);
+        crate::render::find_content_matches(&lay.content_items, &query)
+    }
+
+    /// Centre the current match in the viewport, clamped to doc bounds.
+    fn scroll_to_match(&self, doc_y: f32) {
+        let theme = Theme::light();
+        let (source, vw, vh, base_dir, sidebar_w, content_zoom) = {
+            let s = self.shared.state.lock().unwrap();
+            (
+                s.source.clone(),
+                s.viewport.width,
+                s.viewport.height as f32,
+                s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
+                s.sidebar_width,
+                s.content_zoom,
+            )
+        };
+        let mut images = self.shared.images.lock().unwrap();
+        let doc_h = measure(
+            &source, vw, vh as u32,
+            base_dir.as_deref(), sidebar_w, content_zoom,
+            &theme, &self.shared.fonts, &mut images,
+        );
+        drop(images);
+        let target = (doc_y - vh * 0.35).max(0.0).min((doc_h - vh).max(0.0));
+        let mut s = self.shared.state.lock().unwrap();
+        s.scroll = target;
+    }
+
     fn request_redraw(&self) {
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -823,6 +1103,7 @@ impl App {
                 sidebar_zoom: snap.sidebar_zoom,
                 selection: None,
                 hover_pos: None,
+                search: None,
             },
             &mut images,
         )
@@ -849,6 +1130,7 @@ impl App {
                 sidebar_zoom: snap.sidebar_zoom,
                 selection: snap.selection,
                 hover_pos: None,
+                search: None,
             },
             &mut images,
         )?;
@@ -878,6 +1160,7 @@ impl App {
                 sidebar_zoom: snap.sidebar_zoom,
                 selection: None,
                 hover_pos: None,
+                search: None,
             },
             &mut images,
         )
@@ -903,6 +1186,7 @@ impl App {
                 sidebar_zoom: snap.sidebar_zoom,
                 selection: None,
                 hover_pos: None,
+                search: None,
             },
             &mut images,
         )
@@ -1004,6 +1288,7 @@ impl App {
                     sidebar_zoom: snap.sidebar_zoom,
                     selection: snap.selection,
                     hover_pos: None,
+                    search: None,
                 },
                 &mut images,
             )
@@ -1045,10 +1330,24 @@ impl App {
                 sidebar_zoom: snap.sidebar_zoom,
                 selection: snap.selection,
                 hover_pos: snap.hover_pos,
+                search: snap.search.as_ref().filter(|s| !s.query.is_empty()).map(|s| {
+                    crate::render::SearchHighlights {
+                        query: &s.query,
+                        current: if s.match_count > 0 { Some(s.current) } else { None },
+                    }
+                }),
             },
             &mut images,
         );
         drop(images);
+
+        if let Some(su) = &snap.search {
+            let hover = {
+                let s = self.shared.state.lock().unwrap();
+                Some((s.last_mouse.x as f32, s.last_mouse.y as f32))
+            };
+            draw_search_ui(&mut fb, &snap.theme, &self.shared.fonts, su, hover);
+        }
 
         if let Some(m) = &snap.context_menu {
             let hover = {
@@ -1092,6 +1391,7 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
                 sidebar_zoom: snap.sidebar_zoom,
                 selection: None,
                 hover_pos: None,
+                search: None,
             },
             &mut images,
         )
@@ -1277,6 +1577,7 @@ pub fn run(opts: WindowOptions) -> ExitCode {
             last_folder_click: None,
             dark: false,
             context_menu: None,
+            search: None,
         }),
     });
 
@@ -1313,6 +1614,144 @@ pub fn run(opts: WindowOptions) -> ExitCode {
     }
 }
 
+// ───── search overlay ──────────────────────────────────────────────────────
+
+const SEARCH_PANEL_W: f32 = 360.0;
+const SEARCH_PANEL_H: f32 = 40.0;
+const SEARCH_DRAG_W: f32 = 18.0;      // left strip that grabs drags
+const SEARCH_FONT_SIZE: f32 = 14.0;
+
+/// Geometry for each interactive part of the search panel — shared by
+/// drawing and hit-testing so they can't drift out of sync.
+#[derive(Debug, Clone, Copy)]
+struct SearchGeom {
+    panel: (f32, f32, f32, f32),    // x, y, w, h
+    drag_strip: (f32, f32, f32, f32),
+    input: (f32, f32, f32, f32),
+    prev_btn: (f32, f32, f32, f32),
+    next_btn: (f32, f32, f32, f32),
+    close_btn: (f32, f32, f32, f32),
+}
+
+fn search_geom(su: &SearchUi) -> SearchGeom {
+    let x = su.x; let y = su.y;
+    let w = SEARCH_PANEL_W; let h = SEARCH_PANEL_H;
+    let drag_strip = (x, y, SEARCH_DRAG_W, h);
+    let btn_sz = 26.0;
+    let close_btn = (x + w - btn_sz - 6.0, y + (h - btn_sz) * 0.5, btn_sz, btn_sz);
+    let next_btn = (close_btn.0 - btn_sz - 4.0, close_btn.1, btn_sz, btn_sz);
+    let prev_btn = (next_btn.0 - btn_sz - 4.0, next_btn.1, btn_sz, btn_sz);
+    let input = (
+        x + SEARCH_DRAG_W + 6.0,
+        y + 8.0,
+        prev_btn.0 - (x + SEARCH_DRAG_W + 6.0) - 6.0 - 50.0, // reserve ~50px for count
+        h - 16.0,
+    );
+    SearchGeom { panel: (x, y, w, h), drag_strip, input, prev_btn, next_btn, close_btn }
+}
+
+fn point_in(rect: (f32, f32, f32, f32), x: f32, y: f32) -> bool {
+    x >= rect.0 && x < rect.0 + rect.2 && y >= rect.1 && y < rect.1 + rect.3
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchHit { Drag, Prev, Next, Close, Input, Panel, Outside }
+
+fn search_hit_test(su: &SearchUi, x: f32, y: f32) -> SearchHit {
+    let g = search_geom(su);
+    if point_in(g.close_btn, x, y) { return SearchHit::Close; }
+    if point_in(g.next_btn, x, y) { return SearchHit::Next; }
+    if point_in(g.prev_btn, x, y) { return SearchHit::Prev; }
+    if point_in(g.drag_strip, x, y) { return SearchHit::Drag; }
+    if point_in(g.input, x, y) { return SearchHit::Input; }
+    if point_in(g.panel, x, y) { return SearchHit::Panel; }
+    SearchHit::Outside
+}
+
+fn draw_search_ui(
+    fb: &mut crate::render::Framebuffer,
+    theme: &Theme,
+    fonts: &Fonts,
+    su: &SearchUi,
+    hover: Option<(f32, f32)>,
+) {
+    let g = search_geom(su);
+    let (px, py, pw, ph) = g.panel;
+
+    // Shadow + panel + border.
+    fb.fill_rect(px as i32 + 3, py as i32 + 4, pw as i32, ph as i32, [0, 0, 0, 70]);
+    fb.fill_rect(px as i32, py as i32, pw as i32, ph as i32, theme.sidebar_bg);
+    let border = theme.muted;
+    fb.fill_rect(px as i32, py as i32, pw as i32, 1, border);
+    fb.fill_rect(px as i32, py as i32 + ph as i32 - 1, pw as i32, 1, border);
+    fb.fill_rect(px as i32, py as i32, 1, ph as i32, border);
+    fb.fill_rect(px as i32 + pw as i32 - 1, py as i32, 1, ph as i32, border);
+
+    // Drag grabber — six dots pattern, muted color.
+    let dots_x = px + SEARCH_DRAG_W * 0.5 - 2.5;
+    let dots_y_start = py + ph * 0.5 - 8.0;
+    for r in 0..3 {
+        for c in 0..2 {
+            let dx = dots_x + c as f32 * 5.0;
+            let dy = dots_y_start + r as f32 * 5.0;
+            fb.fill_rect(dx as i32, dy as i32, 2, 2, theme.muted);
+        }
+    }
+
+    // Input box.
+    let (ix, iy, iw, ih) = g.input;
+    fb.fill_rect(ix as i32, iy as i32, iw as i32, ih as i32, theme.bg);
+    fb.fill_rect(ix as i32, iy as i32, iw as i32, 1, theme.muted);
+    fb.fill_rect(ix as i32, iy as i32 + ih as i32 - 1, iw as i32, 1, theme.muted);
+    fb.fill_rect(ix as i32, iy as i32, 1, ih as i32, theme.muted);
+    fb.fill_rect(ix as i32 + iw as i32 - 1, iy as i32, 1, ih as i32, theme.muted);
+
+    // Query text + blinking-less cursor caret at the end.
+    let baseline = iy + ih * 0.5 + SEARCH_FONT_SIZE * 0.35;
+    let mut cx = ix + 6.0;
+    for ch in su.query.chars() {
+        let font = if crate::font::is_emoji(ch) { &fonts.emoji } else { &fonts.body };
+        fb.draw_glyph(font, ch, SEARCH_FONT_SIZE, cx, baseline, theme.fg);
+        cx += font.metrics(ch, SEARCH_FONT_SIZE).advance_width;
+    }
+    // Cursor at end.
+    fb.fill_rect(cx as i32, (baseline - SEARCH_FONT_SIZE * 0.85) as i32, 1, SEARCH_FONT_SIZE as i32, theme.fg);
+
+    // Match count "n / N" right of the input.
+    let count_label = if su.query.is_empty() {
+        String::new()
+    } else if su.match_count == 0 {
+        "no matches".to_string()
+    } else {
+        format!("{} / {}", su.current + 1, su.match_count)
+    };
+    let count_x = ix + iw + 6.0;
+    let mut ccx = count_x;
+    for ch in count_label.chars() {
+        fb.draw_glyph(&fonts.body, ch, SEARCH_FONT_SIZE - 1.0, ccx, baseline, theme.muted);
+        ccx += fonts.body.metrics(ch, SEARCH_FONT_SIZE - 1.0).advance_width;
+    }
+
+    // Buttons: prev (◄), next (▶), close (×). Hover tint.
+    let hover_rect = hover.and_then(|(hx, hy)| {
+        if point_in(g.prev_btn, hx, hy) { Some(g.prev_btn) }
+        else if point_in(g.next_btn, hx, hy) { Some(g.next_btn) }
+        else if point_in(g.close_btn, hx, hy) { Some(g.close_btn) }
+        else { None }
+    });
+    for (rect, ch) in [(g.prev_btn, '‹'), (g.next_btn, '›'), (g.close_btn, '×')] {
+        if Some(rect) == hover_rect {
+            fb.fill_rect(rect.0 as i32, rect.1 as i32, rect.2 as i32, rect.3 as i32, theme.sidebar_active_bg);
+        }
+        let f = &fonts.body;
+        let sz = 18.0;
+        let m = f.metrics(ch, sz);
+        let bx = rect.0 + (rect.2 - m.advance_width) * 0.5;
+        let by = rect.1 + rect.3 * 0.5 + sz * 0.35;
+        fb.draw_glyph(f, ch, sz, bx, by, theme.fg);
+    }
+}
+
 // ───── context menu ────────────────────────────────────────────────────────
 
 const MENU_ITEM_H: f32 = 28.0;
@@ -1344,6 +1783,7 @@ fn build_context_menu_items(
     if has_outline {
         items.push(("Outline  ▸".to_string(), MenuAction::Outline));
     }
+    items.push(("Find…  (Ctrl+F)".to_string(), MenuAction::Find));
     // Label names the theme the click will *switch to*, not the current one.
     let label = if dark { "Light Theme" } else { "Dark Theme" };
     items.push((label.to_string(), MenuAction::ToggleTheme));
@@ -1466,6 +1906,21 @@ fn apply_menu_action(shared: &Arc<Shared>, action: &MenuAction) {
             clipboard::copy(text);
         }
         MenuAction::Outline => { /* submenu trigger only — handled at hit-test */ }
+        MenuAction::Find => {
+            // Open the search overlay. Mirrors Ctrl+F.
+            let mut s = shared.state.lock().unwrap();
+            if s.search.is_none() {
+                let vw = s.viewport.width as f32;
+                s.search = Some(SearchUi {
+                    query: String::new(),
+                    current: 0,
+                    match_count: 0,
+                    x: (vw - 380.0).max(20.0),
+                    y: 20.0,
+                    drag_grip: None,
+                });
+            }
+        }
         MenuAction::ScrollTo(doc_y) => {
             // Mirror the HitAction::ScrollTo flow in click_at so clamping
             // against the real doc height stays consistent.

@@ -94,6 +94,123 @@ pub fn measure_text_width(f: &fontdue::Font, text: &str, size: f32) -> f32 {
     w
 }
 
+/// A substring match in the document — expressed in terms of the glyph
+/// indices inside `content_items`, plus the first glyph's doc-y (for
+/// scroll) and its x-bounds (for drawing a highlight rect).
+#[derive(Debug, Clone)]
+pub struct ContentMatch {
+    pub glyph_start: usize,
+    pub glyph_end: usize,  // inclusive
+    pub doc_y: f32,
+}
+
+/// ASCII case-insensitive substring search across the laid-out content.
+/// Walks glyphs in order, synthesising spaces at word gaps and newlines at
+/// baseline changes so multi-word queries find their target. Non-selectable
+/// "chrome" glyphs (e.g. the code-block "copy" button glyphs — now gone
+/// but the selectable flag is still honoured) are skipped.
+pub fn find_content_matches(items: &[Placed], query: &str) -> Vec<ContentMatch> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    // Build a parallel char/glyph-index stream. Synthetic gaps (space/newline)
+    // carry `None` so a match span can skip them when locating the start/end
+    // glyph.
+    let mut seq: Vec<(char, Option<usize>)> = Vec::new();
+    let mut last_baseline: Option<f32> = None;
+    let mut last_xend: Option<f32> = None;
+    for (i, item) in items.iter().enumerate() {
+        let Placed::Glyph { ch, size, x, baseline, selectable: true, .. } = item else { continue };
+        if let Some(bl) = last_baseline {
+            if (baseline - bl).abs() > 2.0 {
+                seq.push(('\n', None));
+                last_xend = None;
+            } else if let Some(xe) = last_xend {
+                if x - xe > 1.0 {
+                    seq.push((' ', None));
+                }
+            }
+        }
+        seq.push((ch.to_ascii_lowercase(), Some(i)));
+        last_baseline = Some(*baseline);
+        last_xend = Some(*x + *size * 0.5); // good enough to detect word gaps
+    }
+
+    let q: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
+    if q.len() > seq.len() {
+        return Vec::new();
+    }
+
+    let mut out: Vec<ContentMatch> = Vec::new();
+    let mut i = 0;
+    while i + q.len() <= seq.len() {
+        let window = &seq[i..i + q.len()];
+        let eq = window.iter().zip(&q).all(|((c, _), qc)| c == qc);
+        if eq {
+            let first = window.iter().find_map(|(_, g)| *g);
+            let last = window.iter().rev().find_map(|(_, g)| *g);
+            if let (Some(f), Some(l)) = (first, last) {
+                if let Placed::Glyph { baseline, .. } = items[f] {
+                    out.push(ContentMatch { glyph_start: f, glyph_end: l, doc_y: baseline });
+                }
+            }
+            i += q.len().max(1);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Bounding rects (one per visual line) for a glyph range, so a match can
+/// be highlighted by filling them. Same algorithm as `selection_rects` but
+/// fed an index range instead of document anchor points.
+pub fn match_rects(items: &[Placed], m: &ContentMatch, fonts: &Fonts) -> Vec<(f32, f32, f32, f32)> {
+    let mut out: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let mut cur_baseline: Option<f32> = None;
+    let mut cur_x0: f32 = 0.0;
+    let mut cur_x1: f32 = 0.0;
+    let mut cur_size: f32 = 0.0;
+
+    for i in m.glyph_start..=m.glyph_end {
+        let Some(Placed::Glyph { ch, font, size, x, baseline, selectable: true, .. }) = items.get(i) else {
+            continue;
+        };
+        let f = pick_font(fonts, *font);
+        let advance = f.metrics(*ch, *size).advance_width;
+        let gx0 = *x;
+        let gx1 = *x + advance;
+        match cur_baseline {
+            Some(bl) if (bl - baseline).abs() < 2.0 => {
+                cur_x1 = cur_x1.max(gx1);
+                cur_size = cur_size.max(*size);
+            }
+            Some(bl) => {
+                let top = bl - cur_size * 0.95;
+                let bot = bl + cur_size * 0.25;
+                out.push((cur_x0, top, (cur_x1 - cur_x0).max(1.0), bot - top));
+                cur_baseline = Some(*baseline);
+                cur_x0 = gx0;
+                cur_x1 = gx1;
+                cur_size = *size;
+            }
+            None => {
+                cur_baseline = Some(*baseline);
+                cur_x0 = gx0;
+                cur_x1 = gx1;
+                cur_size = *size;
+            }
+        }
+    }
+    if let Some(bl) = cur_baseline {
+        let top = bl - cur_size * 0.95;
+        let bot = bl + cur_size * 0.25;
+        out.push((cur_x0, top, (cur_x1 - cur_x0).max(1.0), bot - top));
+    }
+    out
+}
+
 pub struct RenderInput<'a> {
     pub source: &'a str,
     pub viewport: Viewport,
@@ -112,6 +229,16 @@ pub struct RenderInput<'a> {
     /// Mouse position in screen coords. Used to paint a hover highlight on
     /// the hit-target under the cursor (tree row / link).
     pub hover_pos: Option<(f32, f32)>,
+    /// Active in-document search. When set, every match is drawn with a
+    /// muted highlight and the current match gets the accent colour.
+    pub search: Option<SearchHighlights<'a>>,
+}
+
+/// What the renderer needs to paint search highlights. Computed by the
+/// caller from the already-laid-out items and the live query.
+pub struct SearchHighlights<'a> {
+    pub query: &'a str,
+    pub current: Option<usize>,
 }
 
 pub fn render(input: &RenderInput, images: &mut ImageCache) -> Framebuffer {
@@ -141,6 +268,7 @@ pub fn render(input: &RenderInput, images: &mut ImageCache) -> Framebuffer {
         input.fonts,
         input.selection,
         input.hover_pos,
+        input.search.as_ref(),
     )
 }
 
@@ -375,10 +503,29 @@ fn draw(
     fonts: &Fonts,
     selection: Option<((f32, f32), (f32, f32))>,
     hover_pos: Option<(f32, f32)>,
+    search: Option<&SearchHighlights>,
 ) -> Framebuffer {
     let mut fb = Framebuffer::new(viewport.width, viewport.height, theme.bg);
 
     draw_items(&mut fb, &lay.content_items, scroll, viewport, fonts);
+
+    // Search highlights: all matches tinted in muted, the current match in
+    // accent. Drawn after content so code-block bgs don't hide them.
+    if let Some(s) = search {
+        let matches = find_content_matches(&lay.content_items, s.query);
+        let vh = viewport.height as f32;
+        let base: Rgba = [theme.muted[0], theme.muted[1], theme.muted[2], 80];
+        let current: Rgba = [theme.accent[0], theme.accent[1], theme.accent[2], 140];
+        for (i, m) in matches.iter().enumerate() {
+            let rects = match_rects(&lay.content_items, m, fonts);
+            let color = if Some(i) == s.current { current } else { base };
+            for (x, y, w, rh) in rects {
+                let sy = y - scroll;
+                if sy + rh < 0.0 || sy > vh { continue; }
+                fb.fill_rect(x as i32, sy as i32, w.ceil() as i32, rh.ceil() as i32, color);
+            }
+        }
+    }
 
     // Selection highlight goes *after* content items so opaque block
     // backgrounds (code blocks, etc.) don't bury it. alpha keeps glyphs
