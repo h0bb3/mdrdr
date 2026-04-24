@@ -113,6 +113,27 @@ pub struct HitTarget {
     pub action: HitAction,
 }
 
+/// A rectangular region in document coords that, when right-clicked, offers
+/// a "Copy …" menu item — no visible button, just a hover-revealed
+/// affordance via the context menu. Produced for code blocks and tables.
+#[derive(Debug, Clone)]
+pub struct CopyZone {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub kind: CopyKind,
+    /// The text that goes on the clipboard (raw code for Code, RFC-4180
+    /// for Csv).
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyKind {
+    Code,
+    Csv,
+}
+
 pub struct Layout {
     pub content_items: Vec<Placed>,
     pub pinned_items: Vec<Placed>,
@@ -121,6 +142,10 @@ pub struct Layout {
     /// Hit targets in document coords (links inside content). y needs
     /// `- scroll` to translate to screen coords at hit-test time.
     pub content_hit_targets: Vec<HitTarget>,
+    /// Regions in document coords that offer a "Copy …" item when
+    /// right-clicked. Separate from hit_targets so clicks don't trigger
+    /// copy — only the context menu does.
+    pub copy_zones: Vec<CopyZone>,
     pub doc_height: f32,
     pub sidebar_width: f32,
     /// Total pixel height needed to render every tree row. Used to clamp
@@ -215,11 +240,13 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
 
     let mut content_items: Vec<Placed> = Vec::new();
     let mut content_hit_targets: Vec<HitTarget> = Vec::new();
+    let mut copy_zones: Vec<CopyZone> = Vec::new();
     let mut outline: Vec<OutlineEntry> = Vec::new();
     let doc_height = {
         let mut ctx = Ctx {
             items: &mut content_items,
             content_hits: &mut content_hit_targets,
+            copy_zones: &mut copy_zones,
             outline: &mut outline,
             y: content_theme.margin_y,
             content_left,
@@ -279,6 +306,7 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
         pinned_items,
         hit_targets,
         content_hit_targets,
+        copy_zones,
         doc_height,
         sidebar_width,
         sidebar_content_height,
@@ -336,10 +364,16 @@ fn layout_sidebar(
     let size = theme.body_size * 0.82 * sidebar_zoom;
     let row_h = size * 1.5;
     let top_pad = theme.margin_y * 0.5;
-    // Outline rows render a touch smaller and at the same row height.
-    let outline_rows = if active.is_some() { outline.len() } else { 0 };
-    let content_h = top_pad * 2.0 + row_h * (tree.len() as f32 + outline_rows as f32);
+    let content_h = top_pad * 2.0 + row_h * tree.len() as f32;
     let mut y = top_pad - sidebar_scroll;
+
+    // Keep names clear of the scrollbar strip when one is visible. Computed
+    // once — depends on total content height, not per row.
+    let right_inset = if content_h > height + 1.0 {
+        crate::render::SIDEBAR_SB_HIT_W + crate::render::SIDEBAR_SB_RIGHT_PAD
+    } else {
+        0.0
+    };
 
     for entry in tree {
         let row_y = y;
@@ -403,8 +437,9 @@ fn layout_sidebar(
             TreeKind::Markdown => fg,
         };
         let font = pick_font(fonts, font_id);
-        // Truncate name to fit.
-        let max_name_x = width - 8.0;
+        // Truncate name to fit; reserve the scrollbar strip so the ellipsis
+        // doesn't overdraw the thumb.
+        let max_name_x = width - 8.0 - right_inset;
         for ch in rel_name.chars() {
             let (glyph_font, fid) = if crate::font::is_emoji(ch) {
                 (&fonts.emoji, FontId::Emoji)
@@ -449,11 +484,6 @@ fn layout_sidebar(
         // to the tree row underneath.
         let clipped_top = row_y.max(0.0);
         let clipped_bot = (row_y + row_h).min(height);
-        let right_inset = if content_h > height + 1.0 {
-            crate::render::SIDEBAR_SB_HIT_W + crate::render::SIDEBAR_SB_RIGHT_PAD
-        } else {
-            0.0
-        };
         let row_w = (width - right_inset).max(1.0);
         if clipped_bot > clipped_top {
             hits.push(HitTarget {
@@ -465,75 +495,6 @@ fn layout_sidebar(
             });
         }
 
-        // Inject the outline right under the active file row, visually
-        // nested one step deeper than the file so it reads as a sub-part
-        // of the document rather than a sibling tree entry.
-        if is_active {
-            // The active row's text starts at `indent + marker_width +
-            // pad`. The marker is a single char rendered at `size`; a
-            // cheap-enough approximation is 1em (== `size`). Step in one
-            // extra level so the first outline entry sits clearly to
-            // the right of the file name.
-            let file_text_x = indent + size + size * 0.25;
-            let base_indent = file_text_x + 6.0;
-            let step = 10.0;
-            for o in outline {
-                let row_y_o = y;
-                y += row_h;
-                if row_y_o + row_h < 0.0 || row_y_o > height {
-                    continue;
-                }
-                let oindent = base_indent + (o.level.saturating_sub(1) as f32) * step;
-                let baseline_o = row_y_o + row_h * 0.5 + size * 0.35;
-                let color_o = theme.muted;
-                let body = pick_font(fonts, FontId::Body);
-                let mut x_o = oindent;
-                let max_name_x = width - 8.0 - right_inset;
-                for ch in o.text.chars() {
-                    let (glyph_font, fid) = if crate::font::is_emoji(ch) {
-                        (&fonts.emoji, FontId::Emoji)
-                    } else {
-                        (body, FontId::Body)
-                    };
-                    let m = glyph_font.metrics(ch, size);
-                    if x_o + m.advance_width > max_name_x {
-                        let e = body.metrics('…', size);
-                        items.push(Placed::Glyph {
-                            ch: '…',
-                            font: FontId::Body,
-                            size,
-                            x: x_o,
-                            baseline: baseline_o,
-                            color: color_o,
-                            selectable: true,
-                        });
-                        x_o += e.advance_width;
-                        break;
-                    }
-                    items.push(Placed::Glyph {
-                        ch,
-                        font: fid,
-                        size,
-                        x: x_o,
-                        baseline: baseline_o,
-                        color: color_o,
-                        selectable: true,
-                    });
-                    x_o += m.advance_width;
-                }
-                let clipped_top_o = row_y_o.max(0.0);
-                let clipped_bot_o = (row_y_o + row_h).min(height);
-                if clipped_bot_o > clipped_top_o {
-                    hits.push(HitTarget {
-                        x: 0.0,
-                        y: clipped_top_o,
-                        w: row_w,
-                        h: clipped_bot_o - clipped_top_o,
-                        action: HitAction::ScrollTo(o.doc_y),
-                    });
-                }
-            }
-        }
     }
 
     // Thin scrollbar stripe on the sidebar's right edge. Geometry comes
@@ -560,6 +521,7 @@ fn layout_sidebar(
 struct Ctx<'a> {
     items: &'a mut Vec<Placed>,
     content_hits: &'a mut Vec<HitTarget>,
+    copy_zones: &'a mut Vec<CopyZone>,
     outline: &'a mut Vec<OutlineEntry>,
     y: f32,
     content_left: f32,
@@ -642,54 +604,15 @@ impl<'a> Ctx<'a> {
                     baseline += lh;
                 }
 
-                // Copy-to-clipboard button in the top-right corner.
-                let btn_label = "copy";
-                let btn_size = size * 0.8;
-                let btn_font = &self.fonts.body;
-                let btn_text_w: f32 = btn_label
-                    .chars()
-                    .map(|c| btn_font.metrics(c, btn_size).advance_width)
-                    .sum();
-                let btn_pad_x = 8.0;
-                let btn_pad_y = 4.0;
-                let btn_w = btn_text_w + btn_pad_x * 2.0;
-                let btn_h = btn_size + btn_pad_y * 2.0;
-                let btn_x = rect_x + rect_w - btn_w - 6.0;
-                let btn_y = start_y + 6.0;
-                // Slightly darker than code_bg for visibility.
-                let btn_bg = [
-                    self.theme.code_bg[0].saturating_sub(14),
-                    self.theme.code_bg[1].saturating_sub(14),
-                    self.theme.code_bg[2].saturating_sub(14),
-                    0xff,
-                ];
-                self.items.push(Placed::Rect {
-                    x: btn_x, y: btn_y, w: btn_w, h: btn_h, color: btn_bg,
-                });
-                let mut lx = btn_x + btn_pad_x;
-                let lbaseline = btn_y + btn_pad_y + btn_size * 0.85;
-                for ch in btn_label.chars() {
-                    let m = btn_font.metrics(ch, btn_size);
-                    self.items.push(Placed::Glyph {
-                        ch,
-                        font: FontId::Body,
-                        size: btn_size,
-                        x: lx,
-                        baseline: lbaseline,
-                        color: self.theme.muted,
-                        // Chrome glyph — selection hit-test must skip it,
-                        // otherwise selecting the first code line snaps to
-                        // the "c/o/p/y" baseline above it.
-                        selectable: false,
-                    });
-                    lx += m.advance_width;
-                }
-                self.content_hits.push(HitTarget {
-                    x: btn_x,
-                    y: btn_y,
-                    w: btn_w,
-                    h: btn_h,
-                    action: HitAction::CopyCode(text.clone()),
+                // Right-click anywhere over the block to copy — no visible
+                // button. The context menu picks it up via copy_zones.
+                self.copy_zones.push(CopyZone {
+                    x: rect_x,
+                    y: start_y,
+                    w: rect_w,
+                    h: rect_h,
+                    kind: CopyKind::Code,
+                    text: text.clone(),
                 });
 
                 self.y = start_y + rect_h + self.theme.body_size * 0.5;
@@ -909,6 +832,17 @@ impl<'a> Ctx<'a> {
             cx += *w;
             self.items.push(Placed::Rect { x: cx - 0.5, y: y_start, w: 1.0, h: y - y_start, color: col_thin });
         }
+
+        // Right-click anywhere over the table to copy as CSV — the
+        // context menu picks this up via copy_zones.
+        self.copy_zones.push(CopyZone {
+            x: x0,
+            y: y_start,
+            w: table_w,
+            h: y - y_start,
+            kind: CopyKind::Csv,
+            text: table_to_csv(header, rows),
+        });
 
         self.y = y + self.theme.body_size * 0.4;
     }
@@ -1234,6 +1168,38 @@ impl<'a> Ctx<'a> {
 }
 
 /// Flatten an inline tree to plain text (for the outline / accessibility).
+/// Render a table as RFC 4180 CSV. Each cell is flattened to plain text;
+/// commas, quotes, and newlines force quoting with doubled-quote escape.
+fn table_to_csv(header: &[Vec<Inline>], rows: &[Vec<Vec<Inline>>]) -> String {
+    fn escape(s: &str) -> String {
+        if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+            let mut out = String::with_capacity(s.len() + 2);
+            out.push('"');
+            for c in s.chars() {
+                if c == '"' { out.push('"'); }
+                out.push(c);
+            }
+            out.push('"');
+            out
+        } else {
+            s.to_string()
+        }
+    }
+    fn row_csv(cells: &[Vec<Inline>]) -> String {
+        cells.iter()
+            .map(|c| escape(inlines_to_plain(c).trim()))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+    let mut out = String::new();
+    out.push_str(&row_csv(header));
+    for row in rows {
+        out.push('\n');
+        out.push_str(&row_csv(row));
+    }
+    out
+}
+
 fn inlines_to_plain(inlines: &[Inline]) -> String {
     let mut out = String::new();
     for i in inlines {

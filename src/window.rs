@@ -39,6 +39,14 @@ pub enum UserEvent {
 pub enum MenuAction {
     ToggleTheme,
     CopyPath(PathBuf),
+    /// Marker row: hovering it opens the Outline submenu. Not directly
+    /// executable — clicking does nothing by itself.
+    Outline,
+    /// Scroll the document to this doc-y. Used by outline submenu entries.
+    ScrollTo(f32),
+    /// Put this text on the clipboard. Used by "Copy text" (selection),
+    /// "Copy code" (code block), and "Copy table as CSV" (table).
+    CopyText(String),
 }
 
 /// A context menu floating near the cursor. Coordinates are the top-left in
@@ -48,6 +56,9 @@ pub struct ContextMenu {
     pub x: f32,
     pub y: f32,
     pub items: Vec<(String, MenuAction)>,
+    /// Entries for the "Outline ▸" submenu. Empty → outline row is hidden.
+    /// Each entry is (indented_label, doc_y).
+    pub outline_items: Vec<(String, f32)>,
 }
 
 pub struct AppState {
@@ -351,16 +362,30 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // 0. Context menu — if one is open, it captures this click.
                 //    Hit inside → execute item. Hit outside → just close.
+                //    Clicking the "Outline ▸" row leaves the menu open so
+                //    the submenu stays reachable.
                 if let Some(m) = menu.as_ref() {
                     let hit = menu_item_hit(m, x, y, &self.shared.fonts);
-                    {
-                        let mut s = self.shared.state.lock().unwrap();
-                        s.context_menu = None;
+                    match hit {
+                        Some(MenuAction::Outline) => {
+                            // keep menu open
+                            self.request_redraw();
+                        }
+                        Some(action) => {
+                            {
+                                let mut s = self.shared.state.lock().unwrap();
+                                s.context_menu = None;
+                            }
+                            apply_menu_action(&self.shared, &action);
+                            self.request_redraw();
+                        }
+                        None => {
+                            let mut s = self.shared.state.lock().unwrap();
+                            s.context_menu = None;
+                            drop(s);
+                            self.request_redraw();
+                        }
                     }
-                    if let Some(action) = hit {
-                        apply_menu_action(&self.shared, &action);
-                    }
-                    self.request_redraw();
                     return;
                 }
 
@@ -388,7 +413,18 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                // 2. Sidebar's internal scrollbar strip (intercept before
+                // 2. Sidebar's right-edge drag strip (resize sidebar width).
+                //    Claim this before the scrollbar strip — the resize
+                //    hit region is only 6px around the edge, and would
+                //    otherwise be swallowed by the wider scrollbar strip.
+                if tree_visible && sidebar_w > 0.0 && (x - sidebar_w).abs() <= 6.0 {
+                    let mut s = self.shared.state.lock().unwrap();
+                    s.sidebar_dragging = true;
+                    self.request_redraw();
+                    return;
+                }
+
+                // 3. Sidebar's internal scrollbar strip (intercept before
                 //    anything in the sidebar so it doesn't click-through
                 //    to a tree row underneath).
                 if tree_visible {
@@ -414,11 +450,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                // 3. Sidebar's right-edge drag strip (resize sidebar width).
-                if tree_visible && sidebar_w > 0.0 && (x - sidebar_w).abs() <= 6.0 {
-                    let mut s = self.shared.state.lock().unwrap();
-                    s.sidebar_dragging = true;
-                } else if x < sidebar_w {
+                if x < sidebar_w {
                     // 3. Inside sidebar — tree click.
                     {
                         let mut s = self.shared.state.lock().unwrap();
@@ -443,17 +475,17 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
                 // Open (or reposition) the context menu at the cursor. The
                 // menu is small and position-clamped to stay on-screen.
-                let (pos, viewport, dark, active_path) = {
+                let (pos, viewport, dark, active_path, scroll, sidebar_w) = {
                     let s = self.shared.state.lock().unwrap();
-                    (s.last_mouse, s.viewport, s.dark, s.source_path.clone())
+                    (s.last_mouse, s.viewport, s.dark, s.source_path.clone(), s.scroll, s.sidebar_width)
                 };
+                let px = pos.x as f32;
+                let py = pos.y as f32;
                 // Contextual path for "Copy path": if the cursor is over a
                 // tree row, copy that path; otherwise copy the currently
                 // open document's path (if any).
                 let copy_path = {
                     let (pinned, _content) = self.current_hit_targets();
-                    let px = pos.x as f32;
-                    let py = pos.y as f32;
                     if let Some(hit) = crate::render::hit_test(&pinned, px, py) {
                         match &hit.action {
                             HitAction::Open(p)
@@ -465,7 +497,23 @@ impl ApplicationHandler<UserEvent> for App {
                         active_path.clone()
                     }
                 };
-                let items = build_context_menu_items(dark, copy_path);
+                // Copy zones (code blocks / tables) — only in the content
+                // area, not over the sidebar.
+                let zones = if px >= sidebar_w { self.current_copy_zones() } else { Vec::new() };
+                let doc_y = py + scroll;
+                let zone_hit = zones
+                    .iter()
+                    .find(|z| px >= z.x && px < z.x + z.w && doc_y >= z.y && doc_y < z.y + z.h)
+                    .cloned();
+                let copy_selection = self.current_selection_text();
+                let outline_items = outline_to_menu_items(&self.current_outline());
+                let items = build_context_menu_items(
+                    dark,
+                    copy_path,
+                    !outline_items.is_empty(),
+                    copy_selection,
+                    zone_hit.as_ref(),
+                );
                 let menu_w = context_menu_width(&items, &self.shared.fonts);
                 let menu_h = context_menu_height(&items);
                 let mut mx = pos.x as f32;
@@ -479,7 +527,7 @@ impl ApplicationHandler<UserEvent> for App {
                     s.sel_anchor = None;
                     s.sel_head = None;
                     s.is_selecting = false;
-                    s.context_menu = Some(ContextMenu { x: mx, y: my, items });
+                    s.context_menu = Some(ContextMenu { x: mx, y: my, items, outline_items });
                 }
                 self.request_redraw();
             }
@@ -754,6 +802,86 @@ impl App {
         }
         let scroll = self.shared.state.lock().unwrap().scroll;
         crate::render::hit_test(&content, x, y + scroll).map(|t| (t.x, t.y, t.w, t.h))
+    }
+
+    fn current_copy_zones(&self) -> Vec<crate::layout::CopyZone> {
+        let snap = self.shared.snapshot();
+        let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+        let mut images = self.shared.images.lock().unwrap();
+        crate::render::compute_copy_zones(
+            &RenderInput {
+                source: &snap.source,
+                viewport: snap.viewport,
+                scroll: snap.scroll,
+                theme: &snap.theme,
+                fonts: &self.shared.fonts,
+                tree: snap.tree_flat.as_deref(),
+                active_path: snap.source_path.as_deref(),
+                base_dir: base_dir.as_deref(),
+                sidebar_width: snap.sidebar_width,
+                sidebar_scroll: snap.sidebar_scroll,
+                content_zoom: snap.content_zoom,
+                sidebar_zoom: snap.sidebar_zoom,
+                selection: None,
+                hover_pos: None,
+            },
+            &mut images,
+        )
+    }
+
+    fn current_selection_text(&self) -> Option<String> {
+        let snap = self.shared.snapshot();
+        snap.selection?;
+        let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+        let mut images = self.shared.images.lock().unwrap();
+        let text = extract_selection(
+            &RenderInput {
+                source: &snap.source,
+                viewport: snap.viewport,
+                scroll: snap.scroll,
+                theme: &snap.theme,
+                fonts: &self.shared.fonts,
+                tree: snap.tree_flat.as_deref(),
+                active_path: snap.source_path.as_deref(),
+                base_dir: base_dir.as_deref(),
+                sidebar_width: snap.sidebar_width,
+                sidebar_scroll: snap.sidebar_scroll,
+                content_zoom: snap.content_zoom,
+                sidebar_zoom: snap.sidebar_zoom,
+                selection: snap.selection,
+                hover_pos: None,
+            },
+            &mut images,
+        )?;
+        if text.is_empty() { None } else { Some(text) }
+    }
+
+    fn current_outline(&self) -> Vec<crate::layout::OutlineEntry> {
+        let snap = self.shared.snapshot();
+        if snap.source_path.is_none() {
+            return Vec::new();
+        }
+        let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+        let mut images = self.shared.images.lock().unwrap();
+        crate::render::compute_outline(
+            &RenderInput {
+                source: &snap.source,
+                viewport: snap.viewport,
+                scroll: snap.scroll,
+                theme: &snap.theme,
+                fonts: &self.shared.fonts,
+                tree: snap.tree_flat.as_deref(),
+                active_path: snap.source_path.as_deref(),
+                base_dir: base_dir.as_deref(),
+                sidebar_width: snap.sidebar_width,
+                sidebar_scroll: snap.sidebar_scroll,
+                content_zoom: snap.content_zoom,
+                sidebar_zoom: snap.sidebar_zoom,
+                selection: None,
+                hover_pos: None,
+            },
+            &mut images,
+        )
     }
 
     fn current_hit_targets(&self) -> (Vec<crate::layout::HitTarget>, Vec<crate::layout::HitTarget>) {
@@ -1147,15 +1275,41 @@ const MENU_PAD_Y: f32 = 4.0;
 fn build_context_menu_items(
     dark: bool,
     copy_path: Option<PathBuf>,
+    has_outline: bool,
+    copy_selection: Option<String>,
+    copy_zone: Option<&crate::layout::CopyZone>,
 ) -> Vec<(String, MenuAction)> {
     let mut items: Vec<(String, MenuAction)> = Vec::new();
+    // Copy actions come first — they're the most common right-click intent.
+    if let Some(text) = copy_selection {
+        items.push(("Copy text".to_string(), MenuAction::CopyText(text)));
+    }
+    if let Some(z) = copy_zone {
+        let (label, text) = match z.kind {
+            crate::layout::CopyKind::Code => ("Copy code", z.text.clone()),
+            crate::layout::CopyKind::Csv => ("Copy table as CSV", z.text.clone()),
+        };
+        items.push((label.to_string(), MenuAction::CopyText(text)));
+    }
     if let Some(p) = copy_path {
         items.push(("Copy path".to_string(), MenuAction::CopyPath(p)));
+    }
+    if has_outline {
+        items.push(("Outline  ▸".to_string(), MenuAction::Outline));
     }
     // Label names the theme the click will *switch to*, not the current one.
     let label = if dark { "Light Theme" } else { "Dark Theme" };
     items.push((label.to_string(), MenuAction::ToggleTheme));
     items
+}
+
+/// Turn the heading outline into submenu rows. The leading indent visually
+/// nests subsections under their parent heading.
+fn outline_to_menu_items(outline: &[crate::layout::OutlineEntry]) -> Vec<(String, f32)> {
+    outline.iter().map(|o| {
+        let indent: String = "  ".repeat(o.level.saturating_sub(1) as usize);
+        (format!("{}{}", indent, o.text), o.doc_y)
+    }).collect()
 }
 
 fn context_menu_width(items: &[(String, MenuAction)], fonts: &Fonts) -> f32 {
@@ -1174,7 +1328,13 @@ fn context_menu_height(items: &[(String, MenuAction)]) -> f32 {
 }
 
 /// Return the MenuAction at (x, y) or None if outside the menu box.
+/// Submenu hits take precedence over main-menu hits.
 fn menu_item_hit(m: &ContextMenu, x: f32, y: f32, fonts: &Fonts) -> Option<MenuAction> {
+    if submenu_open(m, x, y, fonts) {
+        if let Some(a) = submenu_item_hit(m, x, y, fonts) {
+            return Some(a);
+        }
+    }
     let w = context_menu_width(&m.items, fonts);
     let h = context_menu_height(&m.items);
     if x < m.x || x >= m.x + w || y < m.y || y >= m.y + h {
@@ -1185,6 +1345,67 @@ fn menu_item_hit(m: &ContextMenu, x: f32, y: f32, fonts: &Fonts) -> Option<MenuA
     m.items.get(idx).map(|(_, a)| a.clone())
 }
 
+/// Index of the "Outline ▸" row in the main menu, if present.
+fn outline_row_index(m: &ContextMenu) -> Option<usize> {
+    m.items.iter().position(|(_, a)| matches!(a, MenuAction::Outline))
+}
+
+fn submenu_anchor(m: &ContextMenu, fonts: &Fonts) -> Option<(f32, f32, f32, f32)> {
+    let idx = outline_row_index(m)?;
+    if m.outline_items.is_empty() {
+        return None;
+    }
+    let main_w = context_menu_width(&m.items, fonts);
+    let sw = submenu_width(&m.outline_items, fonts);
+    let sh = submenu_height(&m.outline_items);
+    // Right side of the main menu. (Assumes enough room — if off-screen
+    // we'd flip to the left; keep it simple for now.)
+    let sx = m.x + main_w - 2.0;
+    let sy = m.y + MENU_PAD_Y + idx as f32 * MENU_ITEM_H - MENU_PAD_Y;
+    Some((sx, sy, sw, sh))
+}
+
+fn submenu_width(items: &[(String, f32)], fonts: &Fonts) -> f32 {
+    let mut w = 0.0f32;
+    for (label, _) in items {
+        let lw = measure_text_width(&fonts.body, label, MENU_FONT_SIZE);
+        if lw > w { w = lw; }
+    }
+    (w + MENU_PAD_X * 2.0).max(160.0)
+}
+
+fn submenu_height(items: &[(String, f32)]) -> f32 {
+    MENU_PAD_Y * 2.0 + MENU_ITEM_H * items.len() as f32
+}
+
+/// True when the outline row is hovered, OR the submenu box is hovered.
+fn submenu_open(m: &ContextMenu, x: f32, y: f32, fonts: &Fonts) -> bool {
+    let Some((sx, sy, sw, sh)) = submenu_anchor(m, fonts) else { return false };
+    if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
+        return true;
+    }
+    // Or over the main-menu "Outline" row.
+    if let Some(idx) = outline_row_index(m) {
+        let main_w = context_menu_width(&m.items, fonts);
+        let row_y = m.y + MENU_PAD_Y + idx as f32 * MENU_ITEM_H;
+        if x >= m.x && x < m.x + main_w && y >= row_y && y < row_y + MENU_ITEM_H {
+            return true;
+        }
+    }
+    false
+}
+
+fn submenu_item_hit(m: &ContextMenu, x: f32, y: f32, fonts: &Fonts) -> Option<MenuAction> {
+    let (sx, sy, sw, sh) = submenu_anchor(m, fonts)?;
+    if x < sx || x >= sx + sw || y < sy || y >= sy + sh {
+        return None;
+    }
+    let local_y = y - sy - MENU_PAD_Y;
+    if local_y < 0.0 { return None; }
+    let idx = (local_y / MENU_ITEM_H) as usize;
+    m.outline_items.get(idx).map(|(_, doc_y)| MenuAction::ScrollTo(*doc_y))
+}
+
 fn apply_menu_action(shared: &Arc<Shared>, action: &MenuAction) {
     match action {
         MenuAction::ToggleTheme => {
@@ -1193,6 +1414,36 @@ fn apply_menu_action(shared: &Arc<Shared>, action: &MenuAction) {
         }
         MenuAction::CopyPath(path) => {
             clipboard::copy(&path.to_string_lossy());
+        }
+        MenuAction::CopyText(text) => {
+            clipboard::copy(text);
+        }
+        MenuAction::Outline => { /* submenu trigger only — handled at hit-test */ }
+        MenuAction::ScrollTo(doc_y) => {
+            // Mirror the HitAction::ScrollTo flow in click_at so clamping
+            // against the real doc height stays consistent.
+            let theme = Theme::light();
+            let (source, vw, vh, base_dir, sidebar_w, content_zoom) = {
+                let s = shared.state.lock().unwrap();
+                (
+                    s.source.clone(),
+                    s.viewport.width,
+                    s.viewport.height as f32,
+                    s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
+                    s.sidebar_width,
+                    s.content_zoom,
+                )
+            };
+            let mut images = shared.images.lock().unwrap();
+            let doc_h = measure(
+                &source, vw, vh as u32,
+                base_dir.as_deref(), sidebar_w, content_zoom,
+                &theme, &shared.fonts, &mut images,
+            );
+            drop(images);
+            let max_scroll = (doc_h - vh).max(0.0);
+            let mut s = shared.state.lock().unwrap();
+            s.scroll = (*doc_y - 8.0).clamp(0.0, max_scroll);
         }
     }
 }
@@ -1207,40 +1458,57 @@ fn draw_context_menu(
     m: &ContextMenu,
     hover: Option<(f32, f32)>,
 ) {
-    let w = context_menu_width(&m.items, fonts);
-    let h = context_menu_height(&m.items);
-    let x0 = m.x as i32;
-    let y0 = m.y as i32;
+    draw_menu_panel(fb, theme, fonts, m.x, m.y, &m.items, hover);
+
+    // Submenu, if the hover falls on the trigger row or inside the panel.
+    if let Some((hx, hy)) = hover {
+        if !m.outline_items.is_empty() && submenu_open(m, hx, hy, fonts) {
+            if let Some((sx, sy, _sw, _sh)) = submenu_anchor(m, fonts) {
+                draw_submenu_panel(fb, theme, fonts, sx, sy, &m.outline_items, hover);
+            }
+        }
+    }
+}
+
+fn draw_menu_panel(
+    fb: &mut crate::render::Framebuffer,
+    theme: &Theme,
+    fonts: &Fonts,
+    mx: f32,
+    my: f32,
+    items: &[(String, MenuAction)],
+    hover: Option<(f32, f32)>,
+) {
+    let w = context_menu_width(items, fonts);
+    let h = context_menu_height(items);
+    let x0 = mx as i32;
+    let y0 = my as i32;
     let wi = w.ceil() as i32;
     let hi = h.ceil() as i32;
 
-    // Drop shadow — a soft offset rect underneath.
     let shadow: crate::theme::Rgba = [0, 0, 0, 60];
     fb.fill_rect(x0 + 2, y0 + 3, wi, hi, shadow);
-    // Panel.
     fb.fill_rect(x0, y0, wi, hi, theme.sidebar_bg);
-    // Border (1px on each edge, using muted color).
     let border = theme.muted;
     fb.fill_rect(x0, y0, wi, 1, border);
     fb.fill_rect(x0, y0 + hi - 1, wi, 1, border);
     fb.fill_rect(x0, y0, 1, hi, border);
     fb.fill_rect(x0 + wi - 1, y0, 1, hi, border);
 
-    // Hover row.
     let hover_idx = hover.and_then(|(hx, hy)| {
-        if hx < m.x || hx >= m.x + w || hy < m.y || hy >= m.y + h {
+        if hx < mx || hx >= mx + w || hy < my || hy >= my + h {
             return None;
         }
-        let local_y = hy - m.y - MENU_PAD_Y;
+        let local_y = hy - my - MENU_PAD_Y;
         let idx = (local_y / MENU_ITEM_H) as usize;
-        if idx < m.items.len() { Some(idx) } else { None }
+        if idx < items.len() { Some(idx) } else { None }
     });
 
-    for (i, (label, _)) in m.items.iter().enumerate() {
-        let iy = m.y + MENU_PAD_Y + MENU_ITEM_H * i as f32;
+    for (i, (label, _)) in items.iter().enumerate() {
+        let iy = my + MENU_PAD_Y + MENU_ITEM_H * i as f32;
         if Some(i) == hover_idx {
             fb.fill_rect(
-                (m.x + 1.0) as i32,
+                (mx + 1.0) as i32,
                 iy as i32,
                 (w - 2.0) as i32,
                 MENU_ITEM_H as i32,
@@ -1248,10 +1516,67 @@ fn draw_context_menu(
             );
         }
         let baseline = iy + MENU_ITEM_H * 0.5 + MENU_FONT_SIZE * 0.35;
-        let mut cx = m.x + MENU_PAD_X;
+        let mut cx = mx + MENU_PAD_X;
         for ch in label.chars() {
-            fb.draw_glyph(&fonts.body, ch, MENU_FONT_SIZE, cx, baseline, theme.fg);
-            cx += fonts.body.metrics(ch, MENU_FONT_SIZE).advance_width;
+            let font = if crate::font::is_emoji(ch) { &fonts.emoji } else { &fonts.body };
+            fb.draw_glyph(font, ch, MENU_FONT_SIZE, cx, baseline, theme.fg);
+            cx += font.metrics(ch, MENU_FONT_SIZE).advance_width;
+        }
+    }
+}
+
+fn draw_submenu_panel(
+    fb: &mut crate::render::Framebuffer,
+    theme: &Theme,
+    fonts: &Fonts,
+    sx: f32,
+    sy: f32,
+    items: &[(String, f32)],
+    hover: Option<(f32, f32)>,
+) {
+    let w = submenu_width(items, fonts);
+    let h = submenu_height(items);
+    let x0 = sx as i32;
+    let y0 = sy as i32;
+    let wi = w.ceil() as i32;
+    let hi = h.ceil() as i32;
+
+    let shadow: crate::theme::Rgba = [0, 0, 0, 60];
+    fb.fill_rect(x0 + 2, y0 + 3, wi, hi, shadow);
+    fb.fill_rect(x0, y0, wi, hi, theme.sidebar_bg);
+    let border = theme.muted;
+    fb.fill_rect(x0, y0, wi, 1, border);
+    fb.fill_rect(x0, y0 + hi - 1, wi, 1, border);
+    fb.fill_rect(x0, y0, 1, hi, border);
+    fb.fill_rect(x0 + wi - 1, y0, 1, hi, border);
+
+    let hover_idx = hover.and_then(|(hx, hy)| {
+        if hx < sx || hx >= sx + w || hy < sy || hy >= sy + h {
+            return None;
+        }
+        let local_y = hy - sy - MENU_PAD_Y;
+        if local_y < 0.0 { return None; }
+        let idx = (local_y / MENU_ITEM_H) as usize;
+        if idx < items.len() { Some(idx) } else { None }
+    });
+
+    for (i, (label, _)) in items.iter().enumerate() {
+        let iy = sy + MENU_PAD_Y + MENU_ITEM_H * i as f32;
+        if Some(i) == hover_idx {
+            fb.fill_rect(
+                (sx + 1.0) as i32,
+                iy as i32,
+                (w - 2.0) as i32,
+                MENU_ITEM_H as i32,
+                theme.sidebar_active_bg,
+            );
+        }
+        let baseline = iy + MENU_ITEM_H * 0.5 + MENU_FONT_SIZE * 0.35;
+        let mut cx = sx + MENU_PAD_X;
+        for ch in label.chars() {
+            let font = if crate::font::is_emoji(ch) { &fonts.emoji } else { &fonts.body };
+            fb.draw_glyph(font, ch, MENU_FONT_SIZE, cx, baseline, theme.fg);
+            cx += font.metrics(ch, MENU_FONT_SIZE).advance_width;
         }
     }
 }

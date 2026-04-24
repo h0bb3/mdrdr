@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::font::Fonts;
 use crate::images::ImageCache;
-use crate::layout::{layout, pick_font, HitTarget, Layout, LayoutInput, Placed};
+use crate::layout::{layout, pick_font, CopyZone, HitTarget, Layout, LayoutInput, OutlineEntry, Placed};
 use crate::md::parse;
 use crate::theme::{Rgba, Theme};
 use crate::tree::TreeEntry;
@@ -315,6 +315,56 @@ pub fn compute_all_hit_targets(
         images,
     );
     (lay.hit_targets, lay.content_hit_targets)
+}
+
+/// Document-coord zones that offer a contextual "Copy …" item when the
+/// cursor is over them at right-click time. y is doc space — caller must
+/// add `scroll` to the cursor's screen-y before comparing.
+pub fn compute_copy_zones(input: &RenderInput, images: &mut ImageCache) -> Vec<CopyZone> {
+    let blocks = parse(input.source);
+    let lay = layout(
+        LayoutInput {
+            blocks: &blocks,
+            tree: input.tree,
+            active_path: input.active_path,
+            base_dir: input.base_dir,
+            viewport_w: input.viewport.width,
+            viewport_h: input.viewport.height,
+            theme: input.theme,
+            fonts: input.fonts,
+            sidebar_width: input.sidebar_width,
+            sidebar_scroll: input.sidebar_scroll,
+            content_zoom: input.content_zoom,
+            sidebar_zoom: input.sidebar_zoom,
+        },
+        images,
+    );
+    lay.copy_zones
+}
+
+/// Heading outline of the current document. Computed by the same layout
+/// pass that the render pipeline uses, so doc_y values line up with the
+/// current viewport.
+pub fn compute_outline(input: &RenderInput, images: &mut ImageCache) -> Vec<OutlineEntry> {
+    let blocks = parse(input.source);
+    let lay = layout(
+        LayoutInput {
+            blocks: &blocks,
+            tree: input.tree,
+            active_path: input.active_path,
+            base_dir: input.base_dir,
+            viewport_w: input.viewport.width,
+            viewport_h: input.viewport.height,
+            theme: input.theme,
+            fonts: input.fonts,
+            sidebar_width: input.sidebar_width,
+            sidebar_scroll: input.sidebar_scroll,
+            content_zoom: input.content_zoom,
+            sidebar_zoom: input.sidebar_zoom,
+        },
+        images,
+    );
+    lay.outline
 }
 
 fn draw(
