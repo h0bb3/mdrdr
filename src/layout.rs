@@ -832,7 +832,10 @@ impl<'a> Ctx<'a> {
         let pad_x = 12.0;
         let pad_y = 8.0;
         let line_color = self.theme.muted;
-        let header_bg: Rgba = [0xef, 0xec, 0xe3, 0xff];
+        // Header fill follows the theme so the table styling survives
+        // the dark-mode switch. code_bg is the "slightly recessed" color in
+        // both palettes — same role we want here.
+        let header_bg: Rgba = self.theme.code_bg;
         let stroke: Rgba = [line_color[0], line_color[1], line_color[2], 180];
 
         // Natural width for each column = max of (header, body) single-line widths.
