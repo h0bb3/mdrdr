@@ -109,32 +109,39 @@ pub struct ContentMatch {
 /// baseline changes so multi-word queries find their target. Non-selectable
 /// "chrome" glyphs (e.g. the code-block "copy" button glyphs — now gone
 /// but the selectable flag is still honoured) are skipped.
-pub fn find_content_matches(items: &[Placed], query: &str) -> Vec<ContentMatch> {
+pub fn find_content_matches(items: &[Placed], query: &str, fonts: &Fonts) -> Vec<ContentMatch> {
     if query.is_empty() {
         return Vec::new();
     }
 
     // Build a parallel char/glyph-index stream. Synthetic gaps (space/newline)
     // carry `None` so a match span can skip them when locating the start/end
-    // glyph.
+    // glyph. Uses real font metrics to compute each glyph's advance — an
+    // earlier size*0.5 heuristic over-estimated the gap between adjacent
+    // narrow glyphs (i, l, t, …) and inserted spurious spaces, which made
+    // every multi-char query fail.
     let mut seq: Vec<(char, Option<usize>)> = Vec::new();
     let mut last_baseline: Option<f32> = None;
     let mut last_xend: Option<f32> = None;
     for (i, item) in items.iter().enumerate() {
-        let Placed::Glyph { ch, size, x, baseline, selectable: true, .. } = item else { continue };
+        let Placed::Glyph { ch, font, size, x, baseline, selectable: true, .. } = item else { continue };
         if let Some(bl) = last_baseline {
             if (baseline - bl).abs() > 2.0 {
                 seq.push(('\n', None));
                 last_xend = None;
             } else if let Some(xe) = last_xend {
-                if x - xe > 1.0 {
+                // A gap of ~0.25em-ish between words; anything smaller is
+                // inter-letter kerning.
+                if x - xe > *size * 0.15 {
                     seq.push((' ', None));
                 }
             }
         }
         seq.push((ch.to_ascii_lowercase(), Some(i)));
+        let f = pick_font(fonts, *font);
+        let adv = f.metrics(*ch, *size).advance_width;
         last_baseline = Some(*baseline);
-        last_xend = Some(*x + *size * 0.5); // good enough to detect word gaps
+        last_xend = Some(*x + adv);
     }
 
     let q: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
@@ -512,7 +519,7 @@ fn draw(
     // Search highlights: all matches tinted in muted, the current match in
     // accent. Drawn after content so code-block bgs don't hide them.
     if let Some(s) = search {
-        let matches = find_content_matches(&lay.content_items, s.query);
+        let matches = find_content_matches(&lay.content_items, s.query, fonts);
         let vh = viewport.height as f32;
         let base: Rgba = [theme.muted[0], theme.muted[1], theme.muted[2], 80];
         let current: Rgba = [theme.accent[0], theme.accent[1], theme.accent[2], 140];

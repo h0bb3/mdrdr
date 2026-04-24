@@ -800,20 +800,26 @@ impl App {
         self.modifiers.state().shift_key()
     }
 
-    /// Open the search overlay, or re-focus it if already open. Positions
-    /// the panel at the top-right of the viewport the first time; preserves
-    /// position (the user may have dragged it) on subsequent opens.
+    /// Open the search overlay at the current mouse position (clamped
+    /// inside the viewport). Leaves the existing overlay alone if already
+    /// open — the user may have dragged it somewhere specific.
     fn open_search(&self) {
         let mut s = self.shared.state.lock().unwrap();
         if s.search.is_none() {
             let vw = s.viewport.width as f32;
-            let panel_w = 360.0;
+            let vh = s.viewport.height as f32;
+            let mx = s.last_mouse.x as f32;
+            let my = s.last_mouse.y as f32;
+            // Anchor the panel just right-and-down of the cursor; nudge
+            // back on-screen if we're near an edge.
+            let x = (mx - SEARCH_DRAG_W * 0.5).clamp(0.0, (vw - SEARCH_PANEL_W).max(0.0));
+            let y = (my - SEARCH_PANEL_H * 0.5).clamp(0.0, (vh - SEARCH_PANEL_H).max(0.0));
             s.search = Some(SearchUi {
                 query: String::new(),
                 current: 0,
                 match_count: 0,
-                x: (vw - panel_w - 20.0).max(20.0),
-                y: 20.0,
+                x,
+                y,
                 drag_grip: None,
             });
         }
@@ -932,7 +938,7 @@ impl App {
             &mut images,
         );
         drop(images);
-        crate::render::find_content_matches(&lay.content_items, &query)
+        crate::render::find_content_matches(&lay.content_items, &query, &self.shared.fonts)
     }
 
     /// Centre the current match in the viewport, clamped to doc bounds.
@@ -1717,11 +1723,13 @@ fn draw_search_ui(
     // Cursor at end.
     fb.fill_rect(cx as i32, (baseline - SEARCH_FONT_SIZE * 0.85) as i32, 1, SEARCH_FONT_SIZE as i32, theme.fg);
 
-    // Match count "n / N" right of the input.
+    // Match count "n / N" right of the input. `0 / 0` when there are none
+    // rather than a wordy "no matches" — keeps the width stable while
+    // typing and matches the convention used by most editors.
     let count_label = if su.query.is_empty() {
         String::new()
     } else if su.match_count == 0 {
-        "no matches".to_string()
+        "0 / 0".to_string()
     } else {
         format!("{} / {}", su.current + 1, su.match_count)
     };
@@ -1907,16 +1915,22 @@ fn apply_menu_action(shared: &Arc<Shared>, action: &MenuAction) {
         }
         MenuAction::Outline => { /* submenu trigger only — handled at hit-test */ }
         MenuAction::Find => {
-            // Open the search overlay. Mirrors Ctrl+F.
+            // Open the search overlay at the mouse position, mirroring
+            // what Ctrl+F does.
             let mut s = shared.state.lock().unwrap();
             if s.search.is_none() {
                 let vw = s.viewport.width as f32;
+                let vh = s.viewport.height as f32;
+                let mx = s.last_mouse.x as f32;
+                let my = s.last_mouse.y as f32;
+                let x = (mx - SEARCH_DRAG_W * 0.5).clamp(0.0, (vw - SEARCH_PANEL_W).max(0.0));
+                let y = (my - SEARCH_PANEL_H * 0.5).clamp(0.0, (vh - SEARCH_PANEL_H).max(0.0));
                 s.search = Some(SearchUi {
                     query: String::new(),
                     current: 0,
                     match_count: 0,
-                    x: (vw - 380.0).max(20.0),
-                    y: 20.0,
+                    x,
+                    y,
                     drag_grip: None,
                 });
             }
