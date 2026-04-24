@@ -6,8 +6,15 @@
 //!   - \cmd expansion to Unicode (Greek, operators, big ops)
 //!   - { ... } grouping
 //!   - a^b  a_b  with single char or group
-//!   - \frac{num}{den}     — stacked with a rule
-//!   - \sqrt{x}            — radical sign + overline
+//!   - \frac{num}{den}                — stacked with a rule
+//!   - \sqrt{x}                       — radical sign + overline
+//!   - \hat, \bar, \tilde, \vec, \dot, \ddot — accent above a base
+//!   - \max \min \log \ln \sin ...    — named operators in upright roman
+//!   - \text{…}, \mathrm{…}           — upright run
+//!   - \mathbb{…}                     — blackboard-bold via U+1D5xx
+//!   - \left<d> … \right<d>           — auto-sized delimiters
+//!   - \big \Big \bigg \Bigg <d>      — fixed-size enlarged delimiters
+//!   - \quad \qquad                   — horizontal spacing
 //!
 //! Ample room for growth later. Good enough for typical notes.
 
@@ -109,7 +116,25 @@ enum Node {
     Sup { base: Box<Node>, exp: Box<Node> },
     Sub { base: Box<Node>, sub: Box<Node> },
     SubSup { base: Box<Node>, sub: Box<Node>, sup: Box<Node> },
+    /// \hat, \bar, \tilde, …
+    Accent { kind: AccentKind, base: Box<Node> },
+    /// Named operator rendered in upright roman: max, min, log, sin, …
+    Op(String),
+    /// \text{…} / \mathrm{…} — upright content; letters are NOT italicised.
+    Text(String),
+    /// \mathbb{…} — letters/digits remapped to blackboard-bold Unicode points.
+    Mathbb(String),
+    /// Horizontal space measured in ems (\quad = 1, \qquad = 2).
+    Space(f32),
+    /// \left<d> … \right<d> — the outer glyphs stretch with the content.
+    /// Either delimiter may be `None` for \left.  /  \right.
+    Delim { left: Option<char>, right: Option<char>, inner: Box<Node> },
+    /// \big / \Big / \bigg / \Bigg <delim> — fixed-size enlarged delimiter.
+    BigDelim { ch: char, scale: f32 },
 }
+
+#[derive(Debug, Copy, Clone)]
+enum AccentKind { Hat, Bar, Tilde, Vec, Dot, Ddot }
 
 struct Parser<'a> {
     toks: &'a [Tok],
@@ -126,6 +151,11 @@ fn parse_row(p: &mut Parser) -> Node {
     let mut nodes: Vec<Node> = Vec::new();
     while let Some(t) = p.peek() {
         if matches!(t, Tok::Close) { break; }
+        // \right terminates a row begun by \left — the outer \left handler
+        // consumes it. Peek-only; do not bump here.
+        if let Tok::Command(s) = t {
+            if s == "right" { break; }
+        }
         let mut base = parse_atom(p);
         // Attach ^ and/or _ to the preceding atom.
         let mut sup: Option<Node> = None;
@@ -185,6 +215,50 @@ fn expand_command(name: &str, p: &mut Parser) -> Node {
             let inner = parse_atom(p);
             Node::Sqrt(Box::new(inner))
         }
+        "hat"   => Node::Accent { kind: AccentKind::Hat,   base: Box::new(parse_atom(p)) },
+        "bar"   => Node::Accent { kind: AccentKind::Bar,   base: Box::new(parse_atom(p)) },
+        "tilde" => Node::Accent { kind: AccentKind::Tilde, base: Box::new(parse_atom(p)) },
+        "vec"   => Node::Accent { kind: AccentKind::Vec,   base: Box::new(parse_atom(p)) },
+        "dot"   => Node::Accent { kind: AccentKind::Dot,   base: Box::new(parse_atom(p)) },
+        "ddot"  => Node::Accent { kind: AccentKind::Ddot,  base: Box::new(parse_atom(p)) },
+
+        // Named upright operators. Render as roman glyphs in a row.
+        "max" | "min" | "log" | "ln" | "exp" | "sin" | "cos" | "tan"
+        | "sec" | "csc" | "cot" | "sinh" | "cosh" | "tanh"
+        | "det" | "dim" | "ker" | "arg" | "gcd" | "lim" | "deg" | "mod"
+        | "Pr"  => Node::Op(name.to_string()),
+
+        // Upright runs. \mathrm is treated identically to \text for this minimal
+        // subset; \mathbf would be bold but we don't have a bold body font path
+        // here — treat as upright too rather than render '\mathbf' literally.
+        "text" | "mathrm" | "mathbf" | "operatorname" => {
+            Node::Text(parse_text_group(p))
+        }
+        "mathit" => parse_atom(p),
+
+        "mathbb" | "mathds" => Node::Mathbb(parse_text_group(p)),
+
+        // Horizontal spacing.
+        "quad"   => Node::Space(1.0),
+        "qquad"  => Node::Space(2.0),
+        "thinspace" => Node::Space(0.167),
+        "thickspace" | "medspace" => Node::Space(0.28),
+
+        // Auto-sized delimiters.
+        "left"  => parse_left_right(p),
+        // A stray \right (no matching \left) — treat the following delim as a
+        // plain atom so we don't swallow tokens.
+        "right" => match parse_delim(p) {
+            Some(ch) => Node::Atom { ch, italic: false },
+            None => Node::Atom { ch: ' ', italic: false },
+        },
+
+        // Fixed-size big delimiters. LaTeX step sizes.
+        "big"  => big_delim(p, 1.2),
+        "Big"  => big_delim(p, 1.5),
+        "bigg" => big_delim(p, 1.8),
+        "Bigg" => big_delim(p, 2.2),
+
         _ => {
             if let Some(c) = command_to_char(name) {
                 Node::Atom { ch: c, italic: false }
@@ -199,6 +273,83 @@ fn expand_command(name: &str, p: &mut Parser) -> Node {
             }
         }
     }
+}
+
+/// Parse `<delim> … \right<delim>` after `\left` has been consumed.
+fn parse_left_right(p: &mut Parser) -> Node {
+    let left = parse_delim(p);
+    let inner = parse_row(p);
+    // Consume the terminating \right (if present) and its delim.
+    let right = if matches!(p.peek(), Some(Tok::Command(s)) if s == "right") {
+        p.bump();
+        parse_delim(p)
+    } else {
+        None
+    };
+    Node::Delim { left, right, inner: Box::new(inner) }
+}
+
+fn big_delim(p: &mut Parser, scale: f32) -> Node {
+    let ch = parse_delim(p).unwrap_or(' ');
+    Node::BigDelim { ch, scale }
+}
+
+/// Read one delimiter. Accepts a literal char, `{` / `}`, or a named
+/// delimiter command. `\left.` / `\right.` means no delimiter — returns None.
+fn parse_delim(p: &mut Parser) -> Option<char> {
+    match p.bump().cloned()? {
+        Tok::Char('.') => None,
+        Tok::Char(c)   => Some(c),
+        Tok::Open      => Some('{'),
+        Tok::Close     => Some('}'),
+        Tok::Command(s) => match s.as_str() {
+            "lbrace" => Some('{'),
+            "rbrace" => Some('}'),
+            "lvert"  | "vert" | "mid" => Some('|'),
+            "lVert"  | "Vert" => Some('‖'),
+            "langle" => Some('⟨'),
+            "rangle" => Some('⟩'),
+            "lceil"  => Some('⌈'),
+            "rceil"  => Some('⌉'),
+            "lfloor" => Some('⌊'),
+            "rfloor" => Some('⌋'),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Consume a `{ … }` group and concatenate its inner characters into a string.
+/// Inner commands are resolved: named commands mapping to a single character
+/// are emitted as that character; anything else falls back to its name.
+fn parse_text_group(p: &mut Parser) -> String {
+    let mut out = String::new();
+    if matches!(p.peek(), Some(Tok::Open)) {
+        p.bump();
+    } else {
+        // No group — consume a single atom-equivalent char.
+        if let Some(Tok::Char(c)) = p.bump().cloned() { out.push(c); }
+        return out;
+    }
+    let mut depth: usize = 1;
+    while let Some(tok) = p.bump().cloned() {
+        match tok {
+            Tok::Close => {
+                depth -= 1;
+                if depth == 0 { break; }
+                out.push('}');
+            }
+            Tok::Open => { depth += 1; out.push('{'); }
+            Tok::Char(c) => out.push(c),
+            Tok::Caret => out.push('^'),
+            Tok::Underscore => out.push('_'),
+            Tok::Command(s) => {
+                if let Some(c) = command_to_char(&s) { out.push(c); }
+                else { out.push('\\'); out.push_str(&s); }
+            }
+        }
+    }
+    out
 }
 
 fn command_to_char(name: &str) -> Option<char> {
@@ -246,6 +397,173 @@ fn layout_node(node: &Node, size: f32, fonts: &Fonts) -> MathBox {
         Node::Sup { base, exp } => layout_sup(base, exp, size, fonts),
         Node::Sub { base, sub } => layout_sub(base, sub, size, fonts),
         Node::SubSup { base, sub, sup } => layout_subsup(base, sub, sup, size, fonts),
+        Node::Accent { kind, base } => layout_accent(*kind, base, size, fonts),
+        Node::Op(name) => layout_upright_run(name, size, fonts),
+        Node::Text(s) => layout_upright_run(s, size, fonts),
+        Node::Mathbb(s) => {
+            let mapped: String = s.chars().map(mathbb_char).collect();
+            layout_upright_run(&mapped, size, fonts)
+        }
+        Node::Space(em) => MathBox {
+            glyphs: vec![], rules: vec![], width: em * size, ascent: 0.0, descent: 0.0,
+        },
+        Node::Delim { left, right, inner } => layout_delim(*left, *right, inner, size, fonts),
+        Node::BigDelim { ch, scale } => layout_big_delim(*ch, *scale, size, fonts),
+    }
+}
+
+fn layout_upright_run(s: &str, size: f32, fonts: &Fonts) -> MathBox {
+    let font_id = FontId::Body;
+    let f = pick_font(fonts, font_id);
+    let mut glyphs = Vec::with_capacity(s.chars().count());
+    let mut x = 0.0f32;
+    let mut asc: f32 = 0.0;
+    let mut desc: f32 = 0.0;
+    let lm = f.horizontal_line_metrics(size);
+    let line_asc = lm.map(|l| l.ascent).unwrap_or(size * 0.7);
+    let line_desc = lm.map(|l| -l.descent).unwrap_or(size * 0.2);
+    for ch in s.chars() {
+        let m = f.metrics(ch, size);
+        glyphs.push(MathGlyph { ch, x, y: 0.0, size, font: font_id });
+        x += m.advance_width;
+        let glyph_top = (m.ymin as f32 + m.height as f32).max(0.0);
+        let glyph_bot = (-(m.ymin as f32)).max(0.0);
+        asc = asc.max(glyph_top).max(line_asc * 0.6);
+        desc = desc.max(glyph_bot).max(line_desc * 0.2);
+    }
+    MathBox { glyphs, rules: vec![], width: x, ascent: asc, descent: desc }
+}
+
+fn layout_accent(kind: AccentKind, base: &Node, size: f32, fonts: &Fonts) -> MathBox {
+    let b = layout_node(base, size, fonts);
+    let mut glyphs = b.glyphs;
+    let rules = b.rules;
+
+    // Pick a spacing-mark character that lives mostly above its baseline.
+    // Size is slightly smaller than the base so it reads as a mark, not a digit.
+    let asize = size * 0.85;
+    let ch = match kind {
+        AccentKind::Hat   => 'ˆ',
+        AccentKind::Tilde => '˜',
+        AccentKind::Bar   => '¯',
+        AccentKind::Vec   => '→',
+        AccentKind::Dot   => '˙',
+        AccentKind::Ddot  => '¨',
+    };
+    let font_id = FontId::Body;
+    let f = pick_font(fonts, font_id);
+    let m = f.metrics(ch, asize);
+
+    // Centre the mark horizontally on the base's advance width.
+    let cx = (b.width - m.advance_width) / 2.0;
+    // Place the mark's baseline just above the base's ascent so the glyph
+    // sits in the gap. Small gap so wide accents (like → for \vec) don't
+    // visually collide with tall base glyphs.
+    let gap = size * 0.04;
+    let cy = -(b.ascent + gap);
+
+    let glyph_ascent = (m.ymin as f32 + m.height as f32).max(0.0);
+    glyphs.push(MathGlyph { ch, x: cx, y: cy, size: asize, font: font_id });
+
+    MathBox {
+        glyphs,
+        rules,
+        width: b.width,
+        ascent: b.ascent + gap + glyph_ascent,
+        descent: b.descent,
+    }
+}
+
+/// Auto-sized delimiters. Not a real piece-wise assembly — we just scale the
+/// delimiter glyph so its height matches (roughly) the inner content.
+fn layout_delim(
+    left: Option<char>,
+    right: Option<char>,
+    inner: &Node,
+    size: f32,
+    fonts: &Fonts,
+) -> MathBox {
+    let b = layout_node(inner, size, fonts);
+    let total_h = (b.ascent + b.descent).max(size);
+    // Grow the delim glyph enough to cover the content; clamp so tiny content
+    // doesn't give tiny parens.
+    let delim_size = (total_h * 1.1).max(size).min(size * 4.0);
+
+    let font_id = FontId::Body;
+    let f = pick_font(fonts, font_id);
+
+    // Shift the inner content right to make room for the opening delim.
+    let (l_w, l_glyph) = match left {
+        Some(ch) => {
+            let m = f.metrics(ch, delim_size);
+            (m.advance_width, Some((ch, m)))
+        }
+        None => (0.0, None),
+    };
+    let (r_w, r_glyph) = match right {
+        Some(ch) => {
+            let m = f.metrics(ch, delim_size);
+            (m.advance_width, Some((ch, m)))
+        }
+        None => (0.0, None),
+    };
+
+    let mut glyphs = Vec::with_capacity(b.glyphs.len() + 2);
+    for g in b.glyphs {
+        glyphs.push(MathGlyph { ch: g.ch, x: g.x + l_w, y: g.y, size: g.size, font: g.font });
+    }
+    let rules: Vec<MathRule> = b.rules.into_iter().map(|r| MathRule {
+        x: r.x + l_w, y: r.y, w: r.w, h: r.h,
+    }).collect();
+
+    // Delim glyphs: render at their natural baseline (y = 0). fontdue will
+    // place the larger paren bitmap relative to that, which gives an
+    // approximately centered result — good enough for our notes.
+    if let Some((ch, _)) = l_glyph {
+        glyphs.insert(0, MathGlyph { ch, x: 0.0, y: 0.0, size: delim_size, font: font_id });
+    }
+    if let Some((ch, _)) = r_glyph {
+        glyphs.push(MathGlyph { ch, x: l_w + b.width, y: 0.0, size: delim_size, font: font_id });
+    }
+
+    // The scaled delim may stick above/below the inner — widen the box.
+    let delim_asc = delim_size * 0.75;
+    let delim_desc = delim_size * 0.25;
+    MathBox {
+        glyphs,
+        rules,
+        width: l_w + b.width + r_w,
+        ascent: b.ascent.max(delim_asc),
+        descent: b.descent.max(delim_desc),
+    }
+}
+
+fn layout_big_delim(ch: char, scale: f32, size: f32, fonts: &Fonts) -> MathBox {
+    let font_id = FontId::Body;
+    let f = pick_font(fonts, font_id);
+    let dsize = size * scale;
+    let m = f.metrics(ch, dsize);
+    let glyph = MathGlyph { ch, x: 0.0, y: 0.0, size: dsize, font: font_id };
+    MathBox {
+        glyphs: vec![glyph],
+        rules: vec![],
+        width: m.advance_width,
+        ascent: dsize * 0.75,
+        descent: dsize * 0.25,
+    }
+}
+
+/// Map an ASCII letter/digit to its blackboard-bold Unicode equivalent, if
+/// one exists. The special letters C H N P Q R Z have dedicated double-struck
+/// codepoints (ℂ, ℍ, …) outside the normal 𝔸–𝕫 block.
+fn mathbb_char(c: char) -> char {
+    match c {
+        '0' => '𝟘', '1' => '𝟙', '2' => '𝟚', '3' => '𝟛', '4' => '𝟜',
+        '5' => '𝟝', '6' => '𝟞', '7' => '𝟟', '8' => '𝟠', '9' => '𝟡',
+        'C' => 'ℂ', 'H' => 'ℍ', 'N' => 'ℕ', 'P' => 'ℙ', 'Q' => 'ℚ', 'R' => 'ℝ', 'Z' => 'ℤ',
+        'A'..='Z' => std::char::from_u32(0x1D538 + (c as u32 - 'A' as u32)).unwrap_or(c),
+        'a'..='z' => std::char::from_u32(0x1D552 + (c as u32 - 'a' as u32)).unwrap_or(c),
+        other => other,
     }
 }
 
