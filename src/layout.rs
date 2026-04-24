@@ -767,18 +767,29 @@ impl<'a> Ctx<'a> {
                 // Padding around the diagram and horizontal centering.
                 let pad = 16.0;
                 let outer_w = r.width + pad * 2.0;
+                let outer_h = r.height + pad * 2.0;
+                let outer_w_clipped = outer_w.min(avail);
                 let x0 = self.content_left + indent + ((avail - outer_w) / 2.0).max(0.0);
+                let start_y = self.y;
                 let y0 = self.y + pad;
                 self.items.push(Placed::Rect {
                     x: x0,
-                    y: self.y,
-                    w: outer_w.min(avail),
-                    h: r.height + pad * 2.0,
+                    y: start_y,
+                    w: outer_w_clipped,
+                    h: outer_h,
                     color: self.theme.code_bg,
                 });
                 for item in r.items.drain(..) {
                     self.items.push(shift_placed(item, x0 + pad, y0));
                 }
+                // Right-click anywhere over the diagram to copy its source.
+                self.copy_zones.push(CopyZone {
+                    x: x0,
+                    y: start_y,
+                    w: outer_w_clipped,
+                    h: outer_h,
+                    actions: vec![("Copy mermaid source".to_string(), src.clone())],
+                });
                 self.y = y0 + r.height + pad + self.theme.body_size * 0.5;
             }
             Block::DisplayMath(src) => {
