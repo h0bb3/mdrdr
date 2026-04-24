@@ -38,6 +38,7 @@ pub enum UserEvent {
 #[derive(Debug, Clone)]
 pub enum MenuAction {
     ToggleTheme,
+    CopyPath(PathBuf),
 }
 
 /// A context menu floating near the cursor. Coordinates are the top-left in
@@ -442,11 +443,29 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
                 // Open (or reposition) the context menu at the cursor. The
                 // menu is small and position-clamped to stay on-screen.
-                let (pos, viewport, dark) = {
+                let (pos, viewport, dark, active_path) = {
                     let s = self.shared.state.lock().unwrap();
-                    (s.last_mouse, s.viewport, s.dark)
+                    (s.last_mouse, s.viewport, s.dark, s.source_path.clone())
                 };
-                let items = build_context_menu_items(dark);
+                // Contextual path for "Copy path": if the cursor is over a
+                // tree row, copy that path; otherwise copy the currently
+                // open document's path (if any).
+                let copy_path = {
+                    let (pinned, _content) = self.current_hit_targets();
+                    let px = pos.x as f32;
+                    let py = pos.y as f32;
+                    if let Some(hit) = crate::render::hit_test(&pinned, px, py) {
+                        match &hit.action {
+                            HitAction::Open(p)
+                            | HitAction::Toggle(p)
+                            | HitAction::SetRoot(p) => Some(p.clone()),
+                            _ => active_path.clone(),
+                        }
+                    } else {
+                        active_path.clone()
+                    }
+                };
+                let items = build_context_menu_items(dark, copy_path);
                 let menu_w = context_menu_width(&items, &self.shared.fonts);
                 let menu_h = context_menu_height(&items);
                 let mut mx = pos.x as f32;
@@ -1125,10 +1144,18 @@ const MENU_FONT_SIZE: f32 = 14.0;
 const MENU_PAD_X: f32 = 14.0;
 const MENU_PAD_Y: f32 = 4.0;
 
-fn build_context_menu_items(dark: bool) -> Vec<(String, MenuAction)> {
+fn build_context_menu_items(
+    dark: bool,
+    copy_path: Option<PathBuf>,
+) -> Vec<(String, MenuAction)> {
+    let mut items: Vec<(String, MenuAction)> = Vec::new();
+    if let Some(p) = copy_path {
+        items.push(("Copy path".to_string(), MenuAction::CopyPath(p)));
+    }
     // Label names the theme the click will *switch to*, not the current one.
     let label = if dark { "Light Theme" } else { "Dark Theme" };
-    vec![(label.to_string(), MenuAction::ToggleTheme)]
+    items.push((label.to_string(), MenuAction::ToggleTheme));
+    items
 }
 
 fn context_menu_width(items: &[(String, MenuAction)], fonts: &Fonts) -> f32 {
@@ -1163,6 +1190,9 @@ fn apply_menu_action(shared: &Arc<Shared>, action: &MenuAction) {
         MenuAction::ToggleTheme => {
             let mut s = shared.state.lock().unwrap();
             s.dark = !s.dark;
+        }
+        MenuAction::CopyPath(path) => {
+            clipboard::copy(&path.to_string_lossy());
         }
     }
 }
