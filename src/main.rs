@@ -50,12 +50,12 @@ fn main() -> ExitCode {
             usage();
             ExitCode::SUCCESS
         }
-        // No args, or a bare path (`mdrdr .`, `mdrdr foo.md`) — run the
-        // `open` path. Lets the OS use `mdrdr` directly as a MIME handler
-        // and makes the CLI feel like `less` / `bat`.
+        // No args, a bare path, or a bare flag — all shorthand for `open`.
+        // Lets the OS use `mdrdr` directly as a MIME handler, makes the
+        // CLI feel like `less` / `bat`, and lets `mdrdr --api foo.md`
+        // work without typing the subcommand.
         None => cmd_open(&[]),
-        Some(other) if !other.starts_with('-') => cmd_open(&args),
-        _ => usage(),
+        _ => cmd_open(&args),
     }
 }
 

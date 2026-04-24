@@ -430,9 +430,21 @@ fn layout_sidebar(
             TreeKind::Markdown => fg,
         };
         let font = pick_font(fonts, font_id);
-        // Truncate name to fit; reserve the scrollbar strip so the ellipsis
-        // doesn't overdraw the thumb.
+        // Truncate name to fit the sidebar, reserving space for:
+        //   - the right-edge padding (8px)
+        //   - the scrollbar strip when present (right_inset)
+        //   - the ellipsis itself, IF truncation is needed (otherwise the
+        //     '…' glyph's advance extends past max_name_x and bleeds into
+        //     the content area / over the scrollbar thumb).
         let max_name_x = width - 8.0 - right_inset;
+        let total_w: f32 = rel_name.chars().map(|ch| {
+            let gf = if crate::font::is_emoji(ch) { &fonts.emoji } else { font };
+            gf.metrics(ch, size).advance_width
+        }).sum();
+        let needs_truncate = x + total_w > max_name_x;
+        let ell_w = font.metrics('…', size).advance_width;
+        let limit = if needs_truncate { max_name_x - ell_w } else { max_name_x };
+
         for ch in rel_name.chars() {
             let (glyph_font, fid) = if crate::font::is_emoji(ch) {
                 (&fonts.emoji, FontId::Emoji)
@@ -440,18 +452,19 @@ fn layout_sidebar(
                 (font, font_id)
             };
             let m = glyph_font.metrics(ch, size);
-            if x + m.advance_width > max_name_x {
-                let e = font.metrics('…', size);
-                items.push(Placed::Glyph {
-                    ch: '…',
-                    font: font_id,
-                    size,
-                    x,
-                    baseline,
-                    color,
-                    selectable: true,
-                });
-                x += e.advance_width;
+            if x + m.advance_width > limit {
+                if needs_truncate {
+                    items.push(Placed::Glyph {
+                        ch: '…',
+                        font: font_id,
+                        size,
+                        x,
+                        baseline,
+                        color,
+                        selectable: true,
+                    });
+                    x += ell_w;
+                }
                 break;
             }
             items.push(Placed::Glyph {
