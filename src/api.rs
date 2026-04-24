@@ -315,6 +315,10 @@ fn action_json(a: &crate::layout::HitAction) -> String {
         CopyCode(_) => "{\"kind\":\"copy_code\"}".to_string(),
         ScrollTo(y) => format!("{{\"kind\":\"scroll_to\",\"y\":{:.3}}}", y),
         SetRoot(p) => format!("{{\"kind\":\"set_root\",\"path\":\"{}\"}}", json_escape(&p.display().to_string())),
+        ToggleTask { box_byte, now_checked } => format!(
+            "{{\"kind\":\"toggle_task\",\"byte\":{},\"checked\":{}}}",
+            box_byte, now_checked
+        ),
     }
 }
 

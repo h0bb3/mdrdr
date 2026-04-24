@@ -1159,6 +1159,38 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
             // Re-rooting invalidates any pending double-click anchor.
             s.last_folder_click = None;
         }
+        HitAction::ToggleTask { box_byte, now_checked } => {
+            // Flip the byte inside the brackets and rewrite the file.
+            // Doing it on the in-memory buffer first keeps the UI snappy;
+            // the filesystem write is best-effort, and the watcher will
+            // reconcile on the next mtime tick either way.
+            let write_target = {
+                let mut s = shared.state.lock().unwrap();
+                let src = &mut s.source;
+                let idx = *box_byte + 1;
+                let new_ch = if *now_checked { b'x' } else { b' ' };
+                if idx < src.len() {
+                    // Validate we're actually looking at a `[ ]` / `[x]`.
+                    let b = src.as_bytes();
+                    let at = b.get(idx).copied();
+                    let open = b.get(*box_byte).copied();
+                    let close = b.get(*box_byte + 2).copied();
+                    if open == Some(b'[') && close == Some(b']') && matches!(at, Some(b' ') | Some(b'x') | Some(b'X')) {
+                        // str is utf-8; these 3 bytes are ASCII, so SAFETY
+                        // of in-place byte patch is preserved.
+                        unsafe { src.as_bytes_mut()[idx] = new_ch; }
+                    }
+                }
+                s.source_path.clone()
+            };
+            if let Some(path) = write_target {
+                let body = {
+                    let s = shared.state.lock().unwrap();
+                    s.source.clone()
+                };
+                let _ = std::fs::write(&path, body);
+            }
+        }
         HitAction::ScrollTo(y) => {
             // Clamp against the actual doc height so clicking "Smallest
             // heading" near the end doesn't scroll past the bottom.

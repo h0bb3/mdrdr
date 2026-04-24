@@ -32,7 +32,7 @@ pub enum Block {
     Heading { level: u8, inlines: Vec<Inline> },
     Paragraph(Vec<Inline>),
     CodeBlock { lang: Option<String>, text: String },
-    List { ordered: bool, items: Vec<Vec<Inline>> },
+    List { ordered: bool, items: Vec<ListItem> },
     BlockQuote(Vec<Block>),
     ThematicBreak,
     DisplayMath(String),
@@ -42,6 +42,24 @@ pub enum Block {
         align: Vec<Align>,
         rows: Vec<Vec<Vec<Inline>>>,
     },
+}
+
+/// One row in a bulleted or ordered list. `task` is `Some` when the item
+/// starts with a GFM task-list marker (`[ ]` / `[x]`), and carries the byte
+/// offset of the `[` in the original source so a click on the checkbox can
+/// patch the file in-place.
+#[derive(Debug, Clone)]
+pub struct ListItem {
+    pub inlines: Vec<Inline>,
+    pub task: Option<TaskState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TaskState {
+    pub checked: bool,
+    /// Byte offset in the source where the `[` of the checkbox lives.
+    /// Click handler writes `x` or ` ` to `box_byte + 1` to toggle.
+    pub box_byte: usize,
 }
 
 /// Cheap pass to count top-level headings for sidebar-outline sizing,
@@ -72,11 +90,25 @@ pub fn count_headings(src: &str) -> usize {
 }
 
 pub fn parse(src: &str) -> Vec<Block> {
-    let lines: Vec<&str> = src.lines().collect();
-    parse_lines(&lines)
+    // Walk source line-by-line *with* byte offsets so task-list parsing can
+    // later patch the original file at the exact `[` of the checkbox.
+    let mut lines: Vec<&str> = Vec::new();
+    let mut starts: Vec<usize> = Vec::new();
+    let mut pos = 0;
+    for chunk in src.split_inclusive('\n') {
+        starts.push(pos);
+        let trimmed = chunk.trim_end_matches(|c: char| c == '\n' || c == '\r');
+        lines.push(trimmed);
+        pos += chunk.len();
+    }
+    parse_lines(&lines, Some(&starts))
 }
 
-fn parse_lines(lines: &[&str]) -> Vec<Block> {
+/// `line_starts` is `Some` only when the `lines` slice refers back to the
+/// original source — then it can supply absolute byte offsets for task
+/// list detection. Recursive callers that re-slice owned strings pass
+/// `None`, which disables toggle-in-place for tasks inside blockquotes.
+fn parse_lines(lines: &[&str], line_starts: Option<&[usize]>) -> Vec<Block> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -160,18 +192,35 @@ fn parse_lines(lines: &[&str]) -> Vec<Block> {
                 }
             }
             let refs: Vec<&str> = inner_lines.iter().map(|s| s.as_str()).collect();
-            out.push(Block::BlockQuote(parse_lines(&refs)));
+            // Inner refs are owned Strings — offsets don't map back to the
+            // original source, so task detection is disabled here.
+            out.push(Block::BlockQuote(parse_lines(&refs, None)));
             continue;
         }
 
         if let Some((ordered, _)) = list_marker(trim) {
-            let mut items: Vec<Vec<Inline>> = Vec::new();
+            let mut items: Vec<ListItem> = Vec::new();
             while i < lines.len() {
                 let ln = lines[i];
                 let tln = ln.trim_start();
                 if let Some((o, me)) = list_marker(tln) {
                     if o != ordered { break; }
-                    items.push(parse_inlines(&tln[me..]));
+                    let rest = &tln[me..];
+                    // GFM task-list marker: `[ ]` or `[x]` / `[X]` right
+                    // after the list marker, followed by whitespace.
+                    let task = parse_task_prefix(rest).and_then(|checked| {
+                        let line_start = line_starts?.get(i).copied()?;
+                        let indent = ln.len().saturating_sub(tln.len());
+                        Some(TaskState {
+                            checked,
+                            box_byte: line_start + indent + me,
+                        })
+                    });
+                    let inline_src = if task.is_some() { &rest[4..] } else { rest };
+                    items.push(ListItem {
+                        inlines: parse_inlines(inline_src),
+                        task,
+                    });
                     i += 1;
                 } else if ln.trim().is_empty() {
                     // tolerate one blank line between items
@@ -357,6 +406,22 @@ fn list_marker(s: &str) -> Option<(bool, usize)> {
         return Some((true, i + 2));
     }
     None
+}
+
+/// Returns `Some(checked)` if `s` starts with a GFM task-list marker
+/// (`[ ]`, `[x]`, or `[X]` followed by at least one space). `None`
+/// otherwise.
+fn parse_task_prefix(s: &str) -> Option<bool> {
+    let b = s.as_bytes();
+    if b.len() >= 4 && b[0] == b'[' && b[2] == b']' && b[3] == b' ' {
+        match b[1] {
+            b' ' => Some(false),
+            b'x' | b'X' => Some(true),
+            _ => None,
+        }
+    } else {
+        None
+    }
 }
 
 // ───── inline parser ─────────────────────────────────────────────────────────

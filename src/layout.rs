@@ -110,6 +110,10 @@ pub enum HitAction {
     /// Change the sidebar tree's root directory. Emitted by the ".."
     /// row and by a double-click on any directory.
     SetRoot(PathBuf),
+    /// Flip a GFM task-list checkbox. Carries the byte offset of the
+    /// `[` in the source, so the click handler can patch the file by
+    /// rewriting just `box_byte + 1`.
+    ToggleTask { box_byte: usize, now_checked: bool },
 }
 
 /// A heading captured during content layout, used to build the sidebar
@@ -645,30 +649,78 @@ impl<'a> Ctx<'a> {
                 let size = self.theme.body_size;
                 let lh = size * self.theme.line_height_mult;
                 for (idx, item) in items.iter().enumerate() {
-                    let marker = if *ordered {
-                        format!("{}.", idx + 1)
-                    } else {
-                        "•".to_string()
-                    };
                     let marker_x = self.content_left + indent;
                     let baseline = self.y + size;
-                    let mut mx = marker_x;
-                    for ch in marker.chars() {
-                        let m = self.fonts.body.metrics(ch, size);
-                        self.items.push(Placed::Glyph {
-                            ch,
-                            font: FontId::Body,
-                            size,
-                            x: mx,
-                            baseline,
-                            color: self.theme.muted,
-                            selectable: true,
+                    if let Some(task) = item.task {
+                        // Draw a small checkbox in place of the bullet.
+                        let box_size = size * 0.75;
+                        let box_x = marker_x;
+                        let box_y = baseline - box_size * 0.88;
+                        let stroke = self.theme.muted;
+                        let fill = if task.checked { self.theme.accent } else { self.theme.bg };
+                        // Filled box (accent or page bg) + 1.5px border
+                        self.items.push(Placed::Rect {
+                            x: box_x, y: box_y,
+                            w: box_size, h: box_size,
+                            color: fill,
                         });
-                        mx += m.advance_width;
+                        let t = 1.5;
+                        self.items.push(Placed::Rect { x: box_x, y: box_y, w: box_size, h: t, color: stroke });
+                        self.items.push(Placed::Rect { x: box_x, y: box_y + box_size - t, w: box_size, h: t, color: stroke });
+                        self.items.push(Placed::Rect { x: box_x, y: box_y, w: t, h: box_size, color: stroke });
+                        self.items.push(Placed::Rect { x: box_x + box_size - t, y: box_y, w: t, h: box_size, color: stroke });
+                        if task.checked {
+                            // A hand-drawn tick: two line segments.
+                            let ct = 1.8;
+                            let check_color = self.theme.bg;
+                            let p1 = (box_x + box_size * 0.2, box_y + box_size * 0.52);
+                            let p2 = (box_x + box_size * 0.44, box_y + box_size * 0.74);
+                            let p3 = (box_x + box_size * 0.82, box_y + box_size * 0.28);
+                            self.items.push(Placed::Line {
+                                x1: p1.0, y1: p1.1, x2: p2.0, y2: p2.1,
+                                thickness: ct, color: check_color,
+                            });
+                            self.items.push(Placed::Line {
+                                x1: p2.0, y1: p2.1, x2: p3.0, y2: p3.1,
+                                thickness: ct, color: check_color,
+                            });
+                        }
+                        // Clickable zone: the checkbox plus a small pad.
+                        let pad = 3.0;
+                        self.content_hits.push(HitTarget {
+                            x: box_x - pad,
+                            y: box_y - pad,
+                            w: box_size + pad * 2.0,
+                            h: box_size + pad * 2.0,
+                            action: HitAction::ToggleTask {
+                                box_byte: task.box_byte,
+                                now_checked: !task.checked,
+                            },
+                        });
+                    } else {
+                        let marker = if *ordered {
+                            format!("{}.", idx + 1)
+                        } else {
+                            "•".to_string()
+                        };
+                        let mut mx = marker_x;
+                        for ch in marker.chars() {
+                            let m = self.fonts.body.metrics(ch, size);
+                            self.items.push(Placed::Glyph {
+                                ch,
+                                font: FontId::Body,
+                                size,
+                                x: mx,
+                                baseline,
+                                color: self.theme.muted,
+                                selectable: true,
+                            });
+                            mx += m.advance_width;
+                        }
                     }
                     let style = body_style(self.theme);
                     let before_y = self.y;
-                    self.paragraph(item, style, indent + indent_step);
+                    self.paragraph(&item.inlines, style, indent + indent_step);
                     if self.y <= before_y {
                         self.y = before_y + lh;
                     }
@@ -678,15 +730,24 @@ impl<'a> Ctx<'a> {
             }
             Block::BlockQuote(inner) => {
                 let start_y = self.y;
+                let start_items = self.items.len();
                 for b in inner {
                     self.block(b, indent + 20.0);
                 }
-                let end_y = self.y;
+                // Stop the quote bar at the actual bottom of the inner
+                // content — not at self.y, which includes the trailing
+                // paragraph margin and leaves the bar dangling below the
+                // last line.
+                let mut content_bottom = start_y;
+                for item in &self.items[start_items..] {
+                    let b = placed_bottom(item);
+                    if b > content_bottom { content_bottom = b; }
+                }
                 self.items.push(Placed::Rect {
                     x: self.content_left + indent + 4.0,
                     y: start_y,
                     w: 3.0,
-                    h: (end_y - start_y).max(1.0),
+                    h: (content_bottom - start_y).max(1.0),
                     color: self.theme.muted,
                 });
             }
@@ -1372,6 +1433,22 @@ fn single_image(inlines: &[Inline]) -> Option<(&str, &str)> {
         }
     }
     found
+}
+
+/// The y-coordinate of the bottom edge of a placed item. Used to measure
+/// where laid-out content actually ends, without being thrown off by
+/// trailing paragraph margins stored in `Ctx::y`.
+fn placed_bottom(p: &Placed) -> f32 {
+    match p {
+        Placed::Glyph { baseline, size, .. } => baseline + size * 0.2,
+        Placed::Rect { y, h, .. } => y + h,
+        Placed::Underline { y, .. } => y + 1.0,
+        Placed::Image { y, h, .. } => y + h,
+        Placed::Line { y1, y2, thickness, .. } => y1.max(*y2) + thickness * 0.5,
+        Placed::Triangle { p1, p2, p3, .. } => p1.1.max(p2.1).max(p3.1),
+        Placed::Ellipse { cy, ry, .. } => cy + ry,
+        Placed::RoundRect { y, h, .. } => y + h,
+    }
 }
 
 fn shift_placed(p: Placed, dx: f32, dy: f32) -> Placed {
