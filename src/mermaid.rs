@@ -14,10 +14,42 @@ use crate::font::Fonts;
 use crate::layout::{pick_font, FontId, Placed};
 use crate::theme::{Rgba, Theme};
 
-#[derive(Copy, Clone, Debug)]
-enum Direction {
-    TopDown,
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Direction {
+    /// Top → bottom. `graph TD` / `graph TB` / no header suffix.
+    TopBottom,
+    /// Bottom → top. `graph BT`.
+    BottomTop,
+    /// Left → right. `graph LR`.
     LeftRight,
+    /// Right → left. `graph RL`.
+    RightLeft,
+    /// Diagonal matrix. Nodes sit on the main diagonal of an N×N grid;
+    /// forward edges route through the upper-right triangle (right then
+    /// down), back edges through the lower-left triangle (left then up).
+    /// Not part of mermaid's grammar — an mdrdr extension.
+    Diagonal,
+}
+
+impl Direction {
+    /// Is this direction laid out top-to-bottom (TB / BT)? The layout code
+    /// only distinguishes two fundamental axes; the BT/RL variants flip
+    /// coordinates at the end.
+    fn is_vertical(self) -> bool {
+        matches!(self, Direction::TopBottom | Direction::BottomTop)
+    }
+    fn is_flipped(self) -> bool {
+        matches!(self, Direction::BottomTop | Direction::RightLeft)
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Direction::TopBottom => "TB",
+            Direction::BottomTop => "BT",
+            Direction::LeftRight => "LR",
+            Direction::RightLeft => "RL",
+            Direction::Diagonal => "DG",
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -42,7 +74,13 @@ struct Node {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum EdgeKind {
+    /// a --> b        — head on the `to` side
     Arrow,
+    /// a <-- b        — head on the `from` side
+    ReverseArrow,
+    /// a <--> b       — heads on both ends
+    BiArrow,
+    /// a --- b        — plain line
     Line,
 }
 
@@ -68,14 +106,30 @@ pub struct MermaidRender {
 }
 
 pub fn render(src: &str, max_width: f32, theme: &Theme, fonts: &Fonts) -> Option<MermaidRender> {
-    let graph = parse(src)?;
+    render_with(src, max_width, theme, fonts, None)
+}
+
+/// Same as `render`, but lets the caller replace the direction declared
+/// by the source's `flowchart ...` header. Used by the per-diagram layout
+/// override the right-click context menu offers.
+pub fn render_with(
+    src: &str,
+    max_width: f32,
+    theme: &Theme,
+    fonts: &Fonts,
+    override_dir: Option<Direction>,
+) -> Option<MermaidRender> {
+    let mut graph = parse(src)?;
+    if let Some(d) = override_dir {
+        graph.direction = d;
+    }
     Some(layout(graph, max_width, theme, fonts))
 }
 
 // ───── parse ────────────────────────────────────────────────────────────────
 
 fn parse(src: &str) -> Option<Graph> {
-    let mut direction = Direction::TopDown;
+    let mut direction = Direction::TopBottom;
     let mut nodes: HashMap<String, Node> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
@@ -111,9 +165,12 @@ fn parse_header(line: &str) -> Option<Direction> {
         if let Some(rest) = lower.strip_prefix(kw) {
             let r = rest.trim();
             return Some(match r {
-                "td" | "tb" | "" => Direction::TopDown,
-                "lr" | "rl" => Direction::LeftRight,
-                _ => Direction::TopDown,
+                "td" | "tb" | "" => Direction::TopBottom,
+                "bt" => Direction::BottomTop,
+                "lr" => Direction::LeftRight,
+                "rl" => Direction::RightLeft,
+                "dg" | "diagonal" | "diag" => Direction::Diagonal,
+                _ => Direction::TopBottom,
             });
         }
     }
@@ -148,7 +205,7 @@ fn parse_line(
                 j += 1;
                 let start = j;
                 while j < bytes.len() && bytes[j] != b'|' { j += 1; }
-                label = Some(line[start..j].to_string());
+                label = Some(normalise_label(&line[start..j]));
                 if j < bytes.len() { j += 1; }
             }
             pending_arrow = Some((kind, label));
@@ -192,14 +249,19 @@ fn parse_line(
 }
 
 fn read_arrow(b: &[u8], i: usize) -> Option<(EdgeKind, usize)> {
-    // --> or -->
+    // Longest first so `<-->` isn't shortened to `-->`.
+    if b.len() >= i + 4 && &b[i..i + 4] == b"<-->" {
+        return Some((EdgeKind::BiArrow, i + 4));
+    }
+    if b.len() >= i + 3 && &b[i..i + 3] == b"<--" {
+        return Some((EdgeKind::ReverseArrow, i + 3));
+    }
     if b.len() >= i + 3 && &b[i..i + 3] == b"-->" {
         return Some((EdgeKind::Arrow, i + 3));
     }
     if b.len() >= i + 3 && &b[i..i + 3] == b"---" {
         return Some((EdgeKind::Line, i + 3));
     }
-    // -- ... --> (longer link form) — for M7 we only support --- and -->.
     None
 }
 
@@ -219,28 +281,28 @@ fn read_node(b: &[u8], i: usize) -> Option<(String, (Shape, Option<String>), usi
                 let lab_start = j + 1;
                 let mut k = lab_start;
                 while k < b.len() && b[k] != b']' { k += 1; }
-                let label = std::str::from_utf8(&b[lab_start..k]).ok()?.to_string();
+                let label = normalise_label(std::str::from_utf8(&b[lab_start..k]).ok()?);
                 return Some((id, (Shape::Rect, Some(label)), (k + 1).min(b.len())));
             }
             b'{' => {
                 let lab_start = j + 1;
                 let mut k = lab_start;
                 while k < b.len() && b[k] != b'}' { k += 1; }
-                let label = std::str::from_utf8(&b[lab_start..k]).ok()?.to_string();
+                let label = normalise_label(std::str::from_utf8(&b[lab_start..k]).ok()?);
                 return Some((id, (Shape::Diamond, Some(label)), (k + 1).min(b.len())));
             }
             b'(' if j + 1 < b.len() && b[j + 1] == b'(' => {
                 let lab_start = j + 2;
                 let mut k = lab_start;
                 while k + 1 < b.len() && !(b[k] == b')' && b[k + 1] == b')') { k += 1; }
-                let label = std::str::from_utf8(&b[lab_start..k]).ok()?.to_string();
+                let label = normalise_label(std::str::from_utf8(&b[lab_start..k]).ok()?);
                 return Some((id, (Shape::Circle, Some(label)), (k + 2).min(b.len())));
             }
             b'(' => {
                 let lab_start = j + 1;
                 let mut k = lab_start;
                 while k < b.len() && b[k] != b')' { k += 1; }
-                let label = std::str::from_utf8(&b[lab_start..k]).ok()?.to_string();
+                let label = normalise_label(std::str::from_utf8(&b[lab_start..k]).ok()?);
                 return Some((id, (Shape::Rounded, Some(label)), (k + 1).min(b.len())));
             }
             _ => {}
@@ -253,15 +315,54 @@ fn is_id_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
 }
 
+/// Mermaid labels can contain `<br>` / `<br/>` / `<br />` as line breaks.
+/// Normalise all three to `\n` so downstream layout can just split().
+fn normalise_label(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Case-insensitive <br ...> match ending at the next `>`.
+        if bytes[i] == b'<'
+            && i + 3 <= bytes.len()
+            && bytes[i + 1].eq_ignore_ascii_case(&b'b')
+            && bytes[i + 2].eq_ignore_ascii_case(&b'r')
+        {
+            // Find the closing `>` within a short window (`<br/>` or `<br />`).
+            let mut j = i + 3;
+            let limit = (i + 8).min(bytes.len());
+            while j < limit && bytes[j] != b'>' {
+                j += 1;
+            }
+            if j < limit && bytes[j] == b'>' {
+                out.push('\n');
+                i = j + 1;
+                continue;
+            }
+        }
+        // Safe because we advance exactly one byte and `raw` is UTF-8 —
+        // but only push a char boundary. Find the next char boundary.
+        let ch_end = (i + 1..=raw.len()).find(|e| raw.is_char_boundary(*e)).unwrap_or(raw.len());
+        out.push_str(&raw[i..ch_end]);
+        i = ch_end;
+    }
+    out
+}
+
 // ───── layout ───────────────────────────────────────────────────────────────
 
 fn measure_label(text: &str, size: f32, font: &Font) -> (f32, f32) {
-    let mut w = 0.0;
-    for ch in text.chars() {
-        w += font.metrics(ch, size).advance_width;
+    // Multi-line labels (mermaid's `<br/>` normalised to `\n`): width =
+    // widest line, height = line-count * line-height.
+    let mut max_w = 0.0f32;
+    let mut lines = 0;
+    for line in text.split('\n') {
+        let w: f32 = line.chars().map(|c| font.metrics(c, size).advance_width).sum();
+        if w > max_w { max_w = w; }
+        lines += 1;
     }
-    let h = size * 1.25;
-    (w, h)
+    let h = (lines.max(1) as f32) * size * 1.25;
+    (max_w, h)
 }
 
 fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> MermaidRender {
@@ -308,7 +409,7 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
 
     let (mut total_w, mut total_h) = (0.0f32, 0.0f32);
     match graph.direction {
-        Direction::TopDown => {
+        Direction::TopBottom | Direction::BottomTop => {
             // Each layer is a row. Compute each row's total width and row height.
             let row_heights: Vec<f32> = per_layer
                 .iter()
@@ -331,6 +432,28 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
                 .collect();
             let max_w = row_widths.iter().fold(0.0f32, |a, &b| a.max(b));
             total_w = max_w.max(1.0);
+
+            // Inter-row gaps: widen to fit the tallest label (multi-line
+            // labels can exceed the default v_gap) plus breathing room so
+            // the chip doesn't butt against the arrowhead or node.
+            let gap_n = per_layer.len().saturating_sub(1);
+            let mut gap_h: Vec<f32> = vec![v_gap; gap_n];
+            let lbl_size = label_size * 0.75;
+            let chip_pad = 4.0;
+            let breathing = 28.0;
+            for e in &graph.edges {
+                let Some(lab) = e.label.as_deref() else { continue };
+                let (_lw, lh) = measure_label(lab, lbl_size, font);
+                let from_layer = *layers.get(&e.from).unwrap_or(&0);
+                let to_layer = *layers.get(&e.to).unwrap_or(&0);
+                if to_layer > from_layer && from_layer < gap_h.len() {
+                    let need = lh + chip_pad * 2.0 + breathing * 2.0;
+                    if need > gap_h[from_layer] {
+                        gap_h[from_layer] = need;
+                    }
+                }
+            }
+
             let mut y = 0.0;
             for (i, row) in per_layer.iter().enumerate() {
                 let row_w = row_widths[i];
@@ -345,12 +468,12 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
                 }
                 y += row_h;
                 if i + 1 < per_layer.len() {
-                    y += v_gap;
+                    y += gap_h[i];
                 }
             }
             total_h = y;
         }
-        Direction::LeftRight => {
+        Direction::LeftRight | Direction::RightLeft => {
             let col_widths: Vec<f32> = per_layer
                 .iter()
                 .map(|col| col.iter().map(|id| graph.nodes.get(id).map(|n| n.w).unwrap_or(0.0)).fold(0.0f32, f32::max))
@@ -372,7 +495,7 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
             // next node. Unlabelled edges keep the default gap.
             let gap_n = per_layer.len().saturating_sub(1);
             let mut gap_w: Vec<f32> = vec![h_gap; gap_n];
-            let lbl_size = label_size * 0.85;
+            let lbl_size = label_size * 0.75;
             let chip_pad = 4.0;
             // Arrow has to span: node edge → chip start → chip → chip end →
             // arrowhead + node. We want generous breathing room on both sides
@@ -411,6 +534,41 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
             }
             total_w = x;
         }
+        Direction::Diagonal => {
+            // N nodes in declaration order sit on the main diagonal of an
+            // N×N grid. Each cell is a uniform max-of-all-nodes box so
+            // forward (upper-right) and back (lower-left) edges route
+            // cleanly through the triangles without crossing.
+            let cell_w = graph.nodes.values().map(|n| n.w).fold(0.0f32, f32::max);
+            let cell_h = graph.nodes.values().map(|n| n.h).fold(0.0f32, f32::max);
+            let n = graph.order.len().max(1);
+            let step_x = cell_w + h_gap;
+            let step_y = cell_h + v_gap;
+            for (i, id) in graph.order.iter().enumerate() {
+                if let Some(node) = graph.nodes.get_mut(id) {
+                    node.x = i as f32 * step_x + (cell_w - node.w) / 2.0;
+                    node.y = i as f32 * step_y + (cell_h - node.h) / 2.0;
+                }
+            }
+            total_w = n as f32 * step_x - h_gap;
+            total_h = n as f32 * step_y - v_gap;
+        }
+    }
+
+    // BT / RL are just TB / LR with the long axis mirrored. Mirroring the
+    // *node positions* here (not the emitted primitives later) keeps labels
+    // readable — each node's internal text still stacks top-to-bottom and
+    // fits inside its rect.
+    if graph.direction.is_flipped() {
+        if graph.direction.is_vertical() {
+            for (_, n) in graph.nodes.iter_mut() {
+                n.y = total_h - n.y - n.h;
+            }
+        } else {
+            for (_, n) in graph.nodes.iter_mut() {
+                n.x = total_w - n.x - n.w;
+            }
+        }
     }
 
     // Fit the diagram to the available width.
@@ -434,7 +592,220 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
     let fill: Rgba = theme.code_bg;
     let mut items: Vec<Placed> = Vec::new();
 
-    // Rects / circles for nodes.
+    // Back edges (source layer > target layer) route around the node row
+    // through a lane on the far side, so they don't cut through intermediate
+    // nodes. Multiple back edges stack in lanes 1, 2, 3… so they don't
+    // overlap each other.
+    let lane_gap = 18.0 * scale;
+    let mut back_edges: Vec<(usize, f32)> = Vec::new(); // (edge_index, lane_y_or_x)
+    {
+        let mut lane_idx = 0usize;
+        for (ei, e) in graph.edges.iter().enumerate() {
+            let from_layer = *layers.get(&e.from).unwrap_or(&0);
+            let to_layer = *layers.get(&e.to).unwrap_or(&0);
+            if from_layer > to_layer {
+                back_edges.push((ei, lane_idx as f32));
+                lane_idx += 1;
+            }
+        }
+    }
+    let back_lane_depth = back_edges.len() as f32 * lane_gap
+        + if back_edges.is_empty() { 0.0 } else { lane_gap * 2.0 };
+    let content_h = total_h * scale;
+    let content_w = total_w * scale;
+    let total_render_h = content_h + match graph.direction {
+        Direction::LeftRight | Direction::RightLeft | Direction::TopBottom | Direction::BottomTop => back_lane_depth,
+        // Diagonal routes back edges through the lower-left triangle
+        // itself, so no extra lane height is needed.
+        Direction::Diagonal => 0.0,
+    };
+
+    // Pass 1: edge lines + arrowheads. Forward edges draw straight;
+    // back edges take a polyline around the node row.
+    for (ei, e) in graph.edges.iter().enumerate() {
+        let (Some(a), Some(b)) = (graph.nodes.get(&e.from), graph.nodes.get(&e.to)) else { continue };
+        let from_layer = *layers.get(&e.from).unwrap_or(&0);
+        let to_layer = *layers.get(&e.to).unwrap_or(&0);
+        let is_back = from_layer > to_layer;
+        let head_at_end = matches!(e.kind, EdgeKind::Arrow | EdgeKind::BiArrow);
+        let head_at_start = matches!(e.kind, EdgeKind::ReverseArrow | EdgeKind::BiArrow);
+        let thick = 1.5 * scale;
+
+        // Diagonal: L-shaped edges through the appropriate triangle. Forward
+        // edges exit the source's right, run rightward to the target's
+        // column, then drop down into the target's top. Back edges exit
+        // left, run to the target's column, then rise into the target's
+        // bottom. Zero crossings, arrows always land on a node face.
+        if matches!(graph.direction, Direction::Diagonal) {
+            let ah = 9.0 * scale;
+            let aw = 6.0 * scale;
+            if !is_back {
+                let sx = (a.x + a.w) * scale;
+                let sy = (a.y + a.h / 2.0) * scale;
+                let tx = (b.x + b.w / 2.0) * scale;
+                let ty = b.y * scale;
+                items.push(Placed::Line { x1: sx, y1: sy, x2: tx, y2: sy, thickness: thick, color: stroke });
+                items.push(Placed::Line { x1: tx, y1: sy, x2: tx, y2: ty, thickness: thick, color: stroke });
+                if head_at_end {
+                    let tip = (tx, ty);
+                    let base = (tx, ty - ah);
+                    items.push(Placed::Triangle {
+                        p1: tip, p2: (base.0 + aw, base.1), p3: (base.0 - aw, base.1),
+                        color: stroke,
+                    });
+                }
+                if head_at_start {
+                    let tip = (sx, sy);
+                    let base = (sx - ah, sy);
+                    items.push(Placed::Triangle {
+                        p1: tip, p2: (base.0, base.1 + aw), p3: (base.0, base.1 - aw),
+                        color: stroke,
+                    });
+                }
+            } else {
+                let sx = a.x * scale;
+                let sy = (a.y + a.h / 2.0) * scale;
+                let tx = (b.x + b.w / 2.0) * scale;
+                let ty = (b.y + b.h) * scale;
+                items.push(Placed::Line { x1: sx, y1: sy, x2: tx, y2: sy, thickness: thick, color: stroke });
+                items.push(Placed::Line { x1: tx, y1: sy, x2: tx, y2: ty, thickness: thick, color: stroke });
+                if head_at_end {
+                    let tip = (tx, ty);
+                    let base = (tx, ty + ah);
+                    items.push(Placed::Triangle {
+                        p1: tip, p2: (base.0 + aw, base.1), p3: (base.0 - aw, base.1),
+                        color: stroke,
+                    });
+                }
+                if head_at_start {
+                    let tip = (sx, sy);
+                    let base = (sx + ah, sy);
+                    items.push(Placed::Triangle {
+                        p1: tip, p2: (base.0, base.1 + aw), p3: (base.0, base.1 - aw),
+                        color: stroke,
+                    });
+                }
+            }
+            continue;
+        }
+
+        if is_back {
+            let lane_n = back_edges
+                .iter()
+                .find(|(i, _)| *i == ei)
+                .map(|(_, n)| *n)
+                .unwrap_or(0.0);
+            let lane_off = lane_gap * (lane_n + 1.5);
+            match graph.direction {
+                Direction::LeftRight | Direction::RightLeft => {
+                    // Exit bottom of source, run left along a lane below all
+                    // nodes, come up into bottom of target.
+                    let sx = (a.x + a.w / 2.0) * scale;
+                    let sy = (a.y + a.h) * scale;
+                    let tx = (b.x + b.w / 2.0) * scale;
+                    let ty = (b.y + b.h) * scale;
+                    let lane_y = content_h + lane_off;
+                    items.push(Placed::Line { x1: sx, y1: sy, x2: sx, y2: lane_y, thickness: thick, color: stroke });
+                    items.push(Placed::Line { x1: sx, y1: lane_y, x2: tx, y2: lane_y, thickness: thick, color: stroke });
+                    items.push(Placed::Line { x1: tx, y1: lane_y, x2: tx, y2: ty, thickness: thick, color: stroke });
+                    if head_at_end {
+                        // arrowhead pointing up into target's bottom edge
+                        let ah = 9.0 * scale;
+                        let aw = 6.0 * scale;
+                        let tip = (tx, ty);
+                        let base = (tx, ty + ah);
+                        items.push(Placed::Triangle {
+                            p1: tip,
+                            p2: (base.0 + aw, base.1),
+                            p3: (base.0 - aw, base.1),
+                            color: stroke,
+                        });
+                    }
+                    if head_at_start {
+                        let ah = 9.0 * scale;
+                        let aw = 6.0 * scale;
+                        let tip = (sx, sy);
+                        let base = (sx, sy + ah);
+                        items.push(Placed::Triangle {
+                            p1: tip,
+                            p2: (base.0 + aw, base.1),
+                            p3: (base.0 - aw, base.1),
+                            color: stroke,
+                        });
+                    }
+                }
+                Direction::Diagonal => unreachable!("diagonal back-edges handled above"),
+                Direction::TopBottom | Direction::BottomTop => {
+                    // Mirror for TD: route around the right side.
+                    let sx = (a.x + a.w) * scale;
+                    let sy = (a.y + a.h / 2.0) * scale;
+                    let tx = (b.x + b.w) * scale;
+                    let ty = (b.y + b.h / 2.0) * scale;
+                    let lane_x = content_w + lane_off;
+                    items.push(Placed::Line { x1: sx, y1: sy, x2: lane_x, y2: sy, thickness: thick, color: stroke });
+                    items.push(Placed::Line { x1: lane_x, y1: sy, x2: lane_x, y2: ty, thickness: thick, color: stroke });
+                    items.push(Placed::Line { x1: lane_x, y1: ty, x2: tx, y2: ty, thickness: thick, color: stroke });
+                    if head_at_end {
+                        let ah = 9.0 * scale;
+                        let aw = 6.0 * scale;
+                        let tip = (tx, ty);
+                        let base = (tx + ah, ty);
+                        items.push(Placed::Triangle {
+                            p1: tip,
+                            p2: (base.0, base.1 + aw),
+                            p3: (base.0, base.1 - aw),
+                            color: stroke,
+                        });
+                    }
+                }
+            }
+        } else {
+            let start = anchor_out(a, &graph.direction, scale);
+            let end = anchor_in(b, &graph.direction, scale);
+            items.push(Placed::Line {
+                x1: start.0, y1: start.1,
+                x2: end.0, y2: end.1,
+                thickness: thick,
+                color: stroke,
+            });
+            if head_at_end || head_at_start {
+                let ah = 9.0 * scale;
+                let aw = 6.0 * scale;
+                let dx = end.0 - start.0;
+                let dy = end.1 - start.1;
+                let len = (dx * dx + dy * dy).sqrt().max(0.001);
+                let ux = dx / len;
+                let uy = dy / len;
+                let px = -uy;
+                let py = ux;
+                if head_at_end {
+                    let tip = (end.0, end.1);
+                    let base_cx = end.0 - ux * ah;
+                    let base_cy = end.1 - uy * ah;
+                    items.push(Placed::Triangle {
+                        p1: tip,
+                        p2: (base_cx + px * aw, base_cy + py * aw),
+                        p3: (base_cx - px * aw, base_cy - py * aw),
+                        color: stroke,
+                    });
+                }
+                if head_at_start {
+                    let tip = (start.0, start.1);
+                    let base_cx = start.0 + ux * ah;
+                    let base_cy = start.1 + uy * ah;
+                    items.push(Placed::Triangle {
+                        p1: tip,
+                        p2: (base_cx + px * aw, base_cy + py * aw),
+                        p3: (base_cx - px * aw, base_cy - py * aw),
+                        color: stroke,
+                    });
+                }
+            }
+        }
+    }
+
+    // Pass 2: node boxes + their labels. Drawn after edge lines so any
+    // back-edge polyline stub that touches a node is covered cleanly.
     for id in &graph.order {
         if let Some(n) = graph.nodes.get(id) {
             let (nx, ny, nw, nh) = (n.x * scale, n.y * scale, n.w * scale, n.h * scale);
@@ -448,9 +819,6 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
                     items.push(Placed::Rect { x: nx + nw - t, y: ny, w: t, h: nh, color: stroke });
                 }
                 Shape::Rounded => {
-                    // Fill + smaller fill inset by the stroke thickness =
-                    // a bordered rounded rect without needing a dedicated
-                    // stroke primitive.
                     let t = 1.5 * scale;
                     let radius = nh.min(nw) * 0.22;
                     items.push(Placed::RoundRect {
@@ -464,8 +832,6 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
                     });
                 }
                 Shape::Circle => {
-                    // True ellipse (circle when w == h). Outer = stroke,
-                    // inner = fill inset by the stroke thickness.
                     let t = 1.5 * scale;
                     let cx = nx + nw / 2.0;
                     let cy = ny + nh / 2.0;
@@ -495,99 +861,144 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
                     items.push(Placed::Line { x1: left.0, y1: left.1, x2: top.0, y2: top.1, thickness: t, color: stroke });
                 }
             }
-            // Label centered.
-            let (lw, _lh) = measure_label(&n.label, label_size * scale, font);
-            let mut lx = nx + (nw - lw) / 2.0;
-            let ly = ny + nh / 2.0 + label_size * scale * 0.35;
-            for ch in n.label.chars() {
-                let m = font.metrics(ch, label_size * scale);
-                items.push(Placed::Glyph {
-                    ch,
-                    font: FontId::Body,
-                    size: label_size * scale,
-                    x: lx,
-                    baseline: ly,
-                    color: stroke,
-                    selectable: true,
-                });
-                lx += m.advance_width;
-            }
+            emit_label_lines(
+                &mut items, &n.label, font,
+                label_size * scale,
+                nx + nw / 2.0, ny + nh / 2.0,
+                stroke,
+            );
         }
     }
 
-    // Edges.
-    for e in &graph.edges {
+    // Pass 3: edge labels — drawn last so they always sit on top of both
+    // edge lines and any stray crossings. Forward labels go on the line
+    // midpoint; back-edge labels sit on the lane.
+    for (ei, e) in graph.edges.iter().enumerate() {
+        let Some(lab) = &e.label else { continue };
         let (Some(a), Some(b)) = (graph.nodes.get(&e.from), graph.nodes.get(&e.to)) else { continue };
-        let start = anchor_out(a, &graph.direction, scale);
-        let end = anchor_in(b, &graph.direction, scale);
-        items.push(Placed::Line {
-            x1: start.0, y1: start.1,
-            x2: end.0, y2: end.1,
-            thickness: 1.5 * scale,
-            color: stroke,
-        });
-        if e.kind == EdgeKind::Arrow {
-            let ah = 9.0 * scale;
-            let aw = 6.0 * scale;
-            let dx = end.0 - start.0;
-            let dy = end.1 - start.1;
-            let len = (dx * dx + dy * dy).sqrt().max(0.001);
-            let ux = dx / len;
-            let uy = dy / len;
-            let px = -uy;
-            let py = ux;
-            let tip = (end.0, end.1);
-            let base_cx = end.0 - ux * ah;
-            let base_cy = end.1 - uy * ah;
-            let p2 = (base_cx + px * aw, base_cy + py * aw);
-            let p3 = (base_cx - px * aw, base_cy - py * aw);
-            items.push(Placed::Triangle { p1: tip, p2, p3, color: stroke });
-        }
+        let from_layer = *layers.get(&e.from).unwrap_or(&0);
+        let to_layer = *layers.get(&e.to).unwrap_or(&0);
+        let is_back = from_layer > to_layer;
+        let lsize = label_size * 0.75 * scale;
+        let (lw, _lh) = measure_label(lab, lsize, font);
+        let pad = 4.0 * scale;
 
-        // Edge label midway.
-        if let Some(lab) = &e.label {
-            let mid_x = (start.0 + end.0) / 2.0;
-            let mid_y = (start.1 + end.1) / 2.0;
-            let (lw, lh) = measure_label(lab, label_size * 0.85 * scale, font);
-            // background chip
-            let pad = 4.0 * scale;
-            let bx = mid_x - lw / 2.0 - pad;
-            let by = mid_y - lh / 2.0 - pad;
-            items.push(Placed::Rect {
-                x: bx, y: by, w: lw + pad * 2.0, h: lh + pad * 2.0,
-                color: theme.bg,
-            });
-            let mut lx = mid_x - lw / 2.0;
-            let ly = mid_y + label_size * 0.85 * scale * 0.3;
-            for ch in lab.chars() {
-                let m = font.metrics(ch, label_size * 0.85 * scale);
-                items.push(Placed::Glyph {
-                    ch,
-                    font: FontId::Body,
-                    size: label_size * 0.85 * scale,
-                    x: lx,
-                    baseline: ly,
-                    color: theme.muted,
-                    selectable: true,
-                });
-                lx += m.advance_width;
+        let (mid_x, mid_y) = if matches!(graph.direction, Direction::Diagonal) {
+            // Diagonal labels sit on the horizontal segment of the L, hugging
+            // the 90° bend. The bend is where edges cluster together (each L
+            // turns at its target's column), so anchoring the chip there
+            // keeps multiple edges' labels visually tied to their own corner
+            // instead of piling up at segment midpoints.
+            let sy_mid = (a.y + a.h / 2.0) * scale;
+            let (sx, tx_mid) = if !is_back {
+                ((a.x + a.w) * scale, (b.x + b.w / 2.0) * scale)
+            } else {
+                (a.x * scale, (b.x + b.w / 2.0) * scale)
+            };
+            let bend_clear = 10.0 * scale;
+            let half = lw / 2.0 + pad;
+            let cx = if !is_back {
+                // horizontal runs sx → tx_mid (left-to-right); bend at tx_mid.
+                let want = tx_mid - half - bend_clear;
+                want.max(sx + half + bend_clear)
+            } else {
+                // horizontal runs sx → tx_mid (right-to-left); bend at tx_mid.
+                let want = tx_mid + half + bend_clear;
+                want.min(sx - half - bend_clear)
+            };
+            (cx, sy_mid)
+        } else if is_back {
+            let lane_n = back_edges
+                .iter()
+                .find(|(i, _)| *i == ei)
+                .map(|(_, n)| *n)
+                .unwrap_or(0.0);
+            let lane_off = lane_gap * (lane_n + 1.5);
+            match graph.direction {
+                Direction::LeftRight | Direction::RightLeft => {
+                    let sx = (a.x + a.w / 2.0) * scale;
+                    let tx = (b.x + b.w / 2.0) * scale;
+                    ((sx + tx) / 2.0, content_h + lane_off)
+                }
+                Direction::TopBottom | Direction::BottomTop => {
+                    let sy = (a.y + a.h / 2.0) * scale;
+                    let ty = (b.y + b.h / 2.0) * scale;
+                    (content_w + lane_off, (sy + ty) / 2.0)
+                }
+                Direction::Diagonal => unreachable!(),
             }
-        }
+        } else {
+            let start = anchor_out(a, &graph.direction, scale);
+            let end = anchor_in(b, &graph.direction, scale);
+            ((start.0 + end.0) / 2.0, (start.1 + end.1) / 2.0)
+        };
+        emit_label_lines(&mut items, lab, font, lsize, mid_x, mid_y, theme.muted);
     }
 
-    let render_w = total_w * scale;
-    let render_h = total_h * scale;
+    let render_w = match graph.direction {
+        Direction::LeftRight | Direction::RightLeft => content_w,
+        Direction::TopBottom | Direction::BottomTop => content_w + back_lane_depth,
+        Direction::Diagonal => content_w,
+    };
+    let render_h = total_render_h;
     MermaidRender { items, width: render_w, height: render_h }
 }
 
+/// Emit glyph items for a possibly multi-line label, centered on
+/// `(cx, cy)`. Each `\n`-separated line is horizontally centered
+/// independently; lines stack with a fixed 1.25-em line height.
+fn emit_label_lines(
+    items: &mut Vec<Placed>,
+    text: &str,
+    font: &Font,
+    size: f32,
+    cx: f32,
+    cy: f32,
+    color: Rgba,
+) {
+    let line_h = size * 1.25;
+    let lines: Vec<&str> = text.split('\n').collect();
+    let total_h = lines.len() as f32 * line_h;
+    let first_baseline = cy - total_h / 2.0 + line_h * 0.75;
+    for (li, line) in lines.iter().enumerate() {
+        let line_w: f32 = line.chars().map(|c| font.metrics(c, size).advance_width).sum();
+        let mut lx = cx - line_w / 2.0;
+        let ly = first_baseline + li as f32 * line_h;
+        for ch in line.chars() {
+            let m = font.metrics(ch, size);
+            items.push(Placed::Glyph {
+                ch,
+                font: FontId::Body,
+                size,
+                x: lx,
+                baseline: ly,
+                color,
+                selectable: true,
+            });
+            lx += m.advance_width;
+        }
+    }
+}
+
 fn assign_layers(graph: &Graph) -> HashMap<String, usize> {
+    let mut idx_of: HashMap<&str, usize> = HashMap::new();
+    for (i, id) in graph.order.iter().enumerate() {
+        idx_of.insert(id.as_str(), i);
+    }
     let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
     for id in &graph.order {
         preds.insert(id.as_str(), Vec::new());
     }
+    // Only forward edges (by declaration order) contribute to layering. Back
+    // edges still render, but are ignored here so cycles don't push layers
+    // to runaway values.
     for e in &graph.edges {
         if graph.nodes.contains_key(&e.from) && graph.nodes.contains_key(&e.to) {
-            preds.entry(e.to.as_str()).or_default().push(e.from.as_str());
+            let fi = idx_of.get(e.from.as_str()).copied().unwrap_or(0);
+            let ti = idx_of.get(e.to.as_str()).copied().unwrap_or(0);
+            if fi < ti {
+                preds.entry(e.to.as_str()).or_default().push(e.from.as_str());
+            }
         }
     }
     let mut layer: HashMap<String, usize> = HashMap::new();
@@ -617,15 +1028,25 @@ fn assign_layers(graph: &Graph) -> HashMap<String, usize> {
 }
 
 fn anchor_out(n: &Node, dir: &Direction, scale: f32) -> (f32, f32) {
+    // Outgoing side = the edge that faces the *next* layer in visual flow.
+    // For flipped directions (BT / RL), the flow reverses so the outgoing
+    // side flips with it. Diagonal is unused by this helper (edges route
+    // via their own L-path) but included so the match stays exhaustive.
     match dir {
-        Direction::TopDown => ((n.x + n.w / 2.0) * scale, (n.y + n.h) * scale),
+        Direction::TopBottom => ((n.x + n.w / 2.0) * scale, (n.y + n.h) * scale),
+        Direction::BottomTop => ((n.x + n.w / 2.0) * scale, n.y * scale),
         Direction::LeftRight => ((n.x + n.w) * scale, (n.y + n.h / 2.0) * scale),
+        Direction::RightLeft => (n.x * scale, (n.y + n.h / 2.0) * scale),
+        Direction::Diagonal => ((n.x + n.w / 2.0) * scale, (n.y + n.h / 2.0) * scale),
     }
 }
 
 fn anchor_in(n: &Node, dir: &Direction, scale: f32) -> (f32, f32) {
     match dir {
-        Direction::TopDown => ((n.x + n.w / 2.0) * scale, n.y * scale),
+        Direction::TopBottom => ((n.x + n.w / 2.0) * scale, n.y * scale),
+        Direction::BottomTop => ((n.x + n.w / 2.0) * scale, (n.y + n.h) * scale),
         Direction::LeftRight => (n.x * scale, (n.y + n.h / 2.0) * scale),
+        Direction::RightLeft => ((n.x + n.w) * scale, (n.y + n.h / 2.0) * scale),
+        Direction::Diagonal => ((n.x + n.w / 2.0) * scale, (n.y + n.h / 2.0) * scale),
     }
 }

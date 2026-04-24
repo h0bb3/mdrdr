@@ -186,6 +186,7 @@ fn screenshot(
             selection: snap.selection,
             hover_pos,
             search: None,
+            mermaid_overrides: None,
         },
         &mut images,
     );
@@ -424,6 +425,7 @@ fn do_hits(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> 
                 selection: None,
                 hover_pos: None,
                 search: None,
+                mermaid_overrides: None,
             },
             &mut images,
         )
@@ -536,6 +538,7 @@ fn do_copy(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> 
                 selection: snap.selection,
                 hover_pos: None,
                 search: None,
+                mermaid_overrides: None,
             },
             &mut images,
         )

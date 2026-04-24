@@ -43,6 +43,7 @@ pub fn render_to_png(
             selection: None,
             hover_pos: None,
             search: None,
+            mermaid_overrides: None,
         },
         &mut images,
     );

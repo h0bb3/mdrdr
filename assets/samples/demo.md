@@ -24,6 +24,14 @@ Ordered:
 2. steep for four minutes
 3. drink before it gets cold
 
+Tasks — click a checkbox to toggle it and the change is written back to the file:
+
+- [ ] design the render core as a pure function
+- [ ] ship milestone 2 with verifiable output
+- [ ] write the M3 JSON AST dump
+- [ ] add syntax highlighting for fenced code
+- [ ] reconsider shaping once Arabic / Devanagari land
+
 ## Code
 
 Inline commands like `cargo run --release` flow with the surrounding text. Fenced blocks get their own background and the accent colour:

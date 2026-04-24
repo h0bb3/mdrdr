@@ -239,6 +239,9 @@ pub struct RenderInput<'a> {
     /// Active in-document search. When set, every match is drawn with a
     /// muted highlight and the current match gets the accent colour.
     pub search: Option<SearchHighlights<'a>>,
+    /// Per-mermaid-block layout overrides, keyed by the block's 0-based
+    /// index in document order. View-only.
+    pub mermaid_overrides: Option<&'a std::collections::HashMap<usize, crate::mermaid::Direction>>,
 }
 
 /// What the renderer needs to paint search highlights. Computed by the
@@ -264,6 +267,7 @@ pub fn render(input: &RenderInput, images: &mut ImageCache) -> Framebuffer {
             sidebar_scroll: input.sidebar_scroll,
             content_zoom: input.content_zoom,
             sidebar_zoom: input.sidebar_zoom,
+            mermaid_overrides: input.mermaid_overrides,
         },
         images,
     );
@@ -306,6 +310,7 @@ pub fn measure(
             sidebar_scroll: 0.0,
             content_zoom,
             sidebar_zoom: 1.0,
+            mermaid_overrides: None,
         },
         images,
     );
@@ -446,6 +451,7 @@ pub fn compute_all_hit_targets(
             sidebar_scroll: input.sidebar_scroll,
             content_zoom: input.content_zoom,
             sidebar_zoom: input.sidebar_zoom,
+            mermaid_overrides: input.mermaid_overrides,
         },
         images,
     );
@@ -471,6 +477,7 @@ pub fn compute_copy_zones(input: &RenderInput, images: &mut ImageCache) -> Vec<C
             sidebar_scroll: input.sidebar_scroll,
             content_zoom: input.content_zoom,
             sidebar_zoom: input.sidebar_zoom,
+            mermaid_overrides: input.mermaid_overrides,
         },
         images,
     );
@@ -496,6 +503,7 @@ pub fn compute_outline(input: &RenderInput, images: &mut ImageCache) -> Vec<Outl
             sidebar_scroll: input.sidebar_scroll,
             content_zoom: input.content_zoom,
             sidebar_zoom: input.sidebar_zoom,
+            mermaid_overrides: input.mermaid_overrides,
         },
         images,
     );
@@ -689,6 +697,7 @@ pub fn extract_selection(
             sidebar_scroll: input.sidebar_scroll,
             content_zoom: input.content_zoom,
             sidebar_zoom: input.sidebar_zoom,
+            mermaid_overrides: input.mermaid_overrides,
         },
         images,
     );

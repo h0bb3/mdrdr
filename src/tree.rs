@@ -136,3 +136,37 @@ fn is_md(p: &Path) -> bool {
         .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
         .unwrap_or(false)
 }
+
+/// Recursively collect every markdown file under `root`, ignoring hidden
+/// entries. Depth-capped so a misdirected run on a huge tree can't stall
+/// the UI. Used by the Ctrl+P quick-open panel.
+pub fn walk_md_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    walk_rec(root, 0, &mut out);
+    out.sort();
+    out
+}
+
+fn walk_rec(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
+    // Cap — matches common editor defaults and keeps enumeration snappy
+    // on deeply-nested node_modules-style piles even if they slip past
+    // the hidden-file filter.
+    if depth > 12 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') {
+            continue;
+        }
+        let p = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            walk_rec(&p, depth + 1, out);
+        } else if ft.is_file() && is_md(&p) {
+            out.push(p);
+        }
+    }
+}

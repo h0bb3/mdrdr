@@ -147,6 +147,10 @@ pub struct CopyZone {
     pub h: f32,
     /// (menu label, clipboard text) pairs, rendered in insertion order.
     pub actions: Vec<(String, String)>,
+    /// `Some` when the zone is a mermaid diagram. Carries the block's
+    /// document-order index so the context menu can offer a "Layout ▸"
+    /// submenu keyed to the right override entry.
+    pub mermaid_block: Option<usize>,
 }
 
 pub struct Layout {
@@ -226,6 +230,10 @@ pub struct LayoutInput<'a> {
     pub content_zoom: f32,
     /// Font zoom for the sidebar tree panel (multiplier; 1.0 = default).
     pub sidebar_zoom: f32,
+    /// Per-mermaid-block layout overrides (view-only). Key = block's
+    /// 0-based position in document order. Absent = use whatever the
+    /// source header says.
+    pub mermaid_overrides: Option<&'a std::collections::HashMap<usize, crate::mermaid::Direction>>,
 }
 
 pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
@@ -270,6 +278,8 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
             fonts: input.fonts,
             base_dir: input.base_dir,
             images,
+            mermaid_idx: 0,
+            mermaid_overrides: input.mermaid_overrides,
         };
         for b in input.blocks {
             ctx.block(b, 0.0);
@@ -558,6 +568,11 @@ struct Ctx<'a> {
     fonts: &'a Fonts,
     base_dir: Option<&'a Path>,
     images: &'a mut ImageCache,
+    /// Running counter of mermaid blocks processed so far. Increments
+    /// every time `Block::CodeBlock { lang: Some("mermaid"), .. }` is
+    /// handled. Used to key per-block layout overrides.
+    mermaid_idx: usize,
+    mermaid_overrides: Option<&'a std::collections::HashMap<usize, crate::mermaid::Direction>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -614,10 +629,31 @@ impl<'a> Ctx<'a> {
                     color: self.theme.code_bg,
                 });
                 let mut baseline = start_y + pad + size;
+                // Right edge available for glyphs. When a line is longer
+                // than this, we truncate with a `…` so code doesn't bleed
+                // past the block's background.
+                let right_limit = rect_x + rect_w - pad;
+                let ell_w = self.fonts.mono.metrics('…', size).advance_width;
                 for line in &lines {
+                    let chars: Vec<char> = line.chars().collect();
+                    let advances: Vec<f32> = chars.iter().map(|&c| self.fonts.mono.metrics(c, size).advance_width).collect();
+                    let line_w: f32 = advances.iter().sum();
+                    let fits = rect_x + pad + line_w <= right_limit;
                     let mut x = rect_x + pad;
-                    for ch in line.chars() {
-                        let m = self.fonts.mono.metrics(ch, size);
+                    for (i, &ch) in chars.iter().enumerate() {
+                        let advance = advances[i];
+                        if !fits && x + advance + ell_w > right_limit {
+                            self.items.push(Placed::Glyph {
+                                ch: '…',
+                                font: FontId::Mono,
+                                size,
+                                x,
+                                baseline,
+                                color: self.theme.muted,
+                                selectable: false,
+                            });
+                            break;
+                        }
                         self.items.push(Placed::Glyph {
                             ch,
                             font: FontId::Mono,
@@ -627,7 +663,7 @@ impl<'a> Ctx<'a> {
                             color: self.theme.accent,
                             selectable: true,
                         });
-                        x += m.advance_width;
+                        x += advance;
                     }
                     baseline += lh;
                 }
@@ -640,6 +676,7 @@ impl<'a> Ctx<'a> {
                     w: rect_w,
                     h: rect_h,
                     actions: vec![("Copy code".to_string(), text.clone())],
+                    mermaid_block: None,
                 });
 
                 self.y = start_y + rect_h + self.theme.body_size * 0.5;
@@ -652,10 +689,12 @@ impl<'a> Ctx<'a> {
                     let marker_x = self.content_left + indent;
                     let baseline = self.y + size;
                     if let Some(task) = item.task {
-                        // Draw a small checkbox in place of the bullet.
-                        let box_size = size * 0.75;
+                        // Draw a checkbox in place of the bullet. Sized to
+                        // roughly match the glyph cap-height so it reads as
+                        // part of the text run rather than a tiny decoration.
+                        let box_size = size * 1.0;
                         let box_x = marker_x;
-                        let box_y = baseline - box_size * 0.88;
+                        let box_y = baseline - box_size * 0.82;
                         let stroke = self.theme.muted;
                         let fill = if task.checked { self.theme.accent } else { self.theme.bg };
                         // Filled box (accent or page bg) + 1.5px border
@@ -756,7 +795,12 @@ impl<'a> Ctx<'a> {
             }
             Block::Mermaid(src) => {
                 let avail = (self.content_right - self.content_left - indent).max(1.0);
-                let Some(mut r) = crate::mermaid::render(src, avail, self.theme, self.fonts) else {
+                let block_idx = self.mermaid_idx;
+                self.mermaid_idx += 1;
+                let override_dir = self.mermaid_overrides.and_then(|m| m.get(&block_idx).copied());
+                let Some(mut r) = crate::mermaid::render_with(
+                    src, avail, self.theme, self.fonts, override_dir,
+                ) else {
                     // parse failed — fall back to a plain code block.
                     self.block(
                         &Block::CodeBlock { lang: Some("mermaid".into()), text: src.clone() },
@@ -782,13 +826,15 @@ impl<'a> Ctx<'a> {
                 for item in r.items.drain(..) {
                     self.items.push(shift_placed(item, x0 + pad, y0));
                 }
-                // Right-click anywhere over the diagram to copy its source.
+                // Right-click anywhere over the diagram to copy its source,
+                // or change its view-only layout direction.
                 self.copy_zones.push(CopyZone {
                     x: x0,
                     y: start_y,
                     w: outer_w_clipped,
                     h: outer_h,
                     actions: vec![("Copy mermaid source".to_string(), src.clone())],
+                    mermaid_block: Some(block_idx),
                 });
                 self.y = y0 + r.height + pad + self.theme.body_size * 0.5;
             }
@@ -939,6 +985,7 @@ impl<'a> Ctx<'a> {
                 ("Copy table as CSV".to_string(), table_to_csv(header, rows)),
                 ("Copy table as Markdown".to_string(), table_to_markdown(header, align, rows)),
             ],
+            mermaid_block: None,
         });
 
         self.y = y + self.theme.body_size * 0.4;

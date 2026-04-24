@@ -42,6 +42,8 @@ pub enum MenuAction {
     /// Marker row: hovering it opens the Outline submenu. Not directly
     /// executable — clicking does nothing by itself.
     Outline,
+    /// Marker row: hovering it opens the mermaid "Layout ▸" submenu.
+    MermaidMenu,
     /// Scroll the document to this doc-y. Used by outline submenu entries.
     ScrollTo(f32),
     /// Put this text on the clipboard. Used by "Copy text" (selection),
@@ -49,6 +51,14 @@ pub enum MenuAction {
     CopyText(String),
     /// Open the in-document search overlay.
     Find,
+    /// Open the Ctrl+P quick-open panel.
+    QuickOpen,
+    /// Set the view-only layout direction for a specific mermaid block
+    /// (by its document-order index).
+    SetMermaidLayout(usize, crate::mermaid::Direction),
+    /// Clear the per-block layout override so the diagram renders with
+    /// whatever direction its source header declares.
+    ResetMermaidLayout(usize),
 }
 
 /// A context menu floating near the cursor. Coordinates are the top-left in
@@ -59,8 +69,26 @@ pub struct ContextMenu {
     pub y: f32,
     pub items: Vec<(String, MenuAction)>,
     /// Entries for the "Outline ▸" submenu. Empty → outline row is hidden.
-    /// Each entry is (indented_label, doc_y).
-    pub outline_items: Vec<(String, f32)>,
+    /// Each entry is (indented_label, action) — the action scrolls to that
+    /// heading's doc-y.
+    pub outline_items: Vec<(String, MenuAction)>,
+    /// Entries for the "Layout ▸" submenu on mermaid diagrams. Empty →
+    /// the layout row is hidden.
+    pub mermaid_items: Vec<(String, MenuAction)>,
+    /// Which submenu is currently open. Sticky — once set by hovering a
+    /// trigger row, stays open while the cursor is inside either the
+    /// trigger row or the submenu panel. Prevents two submenus with
+    /// overlapping panel rects (outline + mermaid layout both anchor at
+    /// `m.x + main_w - 2`) from fighting each other.
+    pub active_submenu: Option<SubmenuKind>,
+}
+
+/// The two kinds of submenu sharing the same layout machinery, distinguished
+/// only by their trigger row and item source.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SubmenuKind {
+    Outline,
+    Mermaid,
 }
 
 /// In-document find bar. A small draggable overlay with a text input,
@@ -78,6 +106,22 @@ pub struct SearchUi {
     /// When Some, mouse delta from panel top-left at the moment the drag
     /// started. Kept across CursorMoved events.
     pub drag_grip: Option<(f32, f32)>,
+}
+
+/// Ctrl+P quick-open panel. Lists every markdown file under the tree root,
+/// filtered live by `query`. Arrow keys move `selected`, Enter opens.
+#[derive(Debug, Clone)]
+pub struct QuickOpenUi {
+    pub query: String,
+    /// Full file list snapshotted when the panel opened — avoids a disk
+    /// walk on every keystroke.
+    pub files: Vec<PathBuf>,
+    /// Common prefix stripped when displaying entries (the tree root).
+    pub base: PathBuf,
+    /// Index into the filtered list.
+    pub selected: usize,
+    /// Scroll offset (rows) into the filtered list.
+    pub scroll: usize,
 }
 
 pub struct AppState {
@@ -130,6 +174,16 @@ pub struct AppState {
 
     /// Active in-document search overlay. `None` when closed.
     pub search: Option<SearchUi>,
+
+    /// Active Ctrl+P quick-open panel. `None` when closed.
+    pub quick_open: Option<QuickOpenUi>,
+
+    /// Per-diagram mermaid layout overrides, keyed by
+    /// `(file path, mermaid block index within the document)`. The
+    /// override is view-only — never written back to the source file.
+    /// Cleared on file-swap is unnecessary: stale entries key on an old
+    /// path and simply aren't consulted.
+    pub mermaid_overrides: std::collections::HashMap<(Option<PathBuf>, usize), crate::mermaid::Direction>,
 }
 
 pub struct Shared {
@@ -169,6 +223,16 @@ impl Shared {
             hover_pos,
             context_menu: s.context_menu.clone(),
             search: s.search.clone(),
+            quick_open: s.quick_open.clone(),
+            mermaid_overrides: {
+                let cur = s.source_path.clone();
+                s.mermaid_overrides
+                    .iter()
+                    .filter_map(|((path, idx), dir)| {
+                        if *path == cur { Some((*idx, *dir)) } else { None }
+                    })
+                    .collect()
+            },
         }
     }
 }
@@ -191,6 +255,11 @@ pub struct Snapshot {
     pub hover_pos: Option<(f32, f32)>,
     pub context_menu: Option<ContextMenu>,
     pub search: Option<SearchUi>,
+    pub quick_open: Option<QuickOpenUi>,
+    /// Mermaid-block-index → direction overrides for the current file only.
+    /// Pre-filtered at snapshot time so the render path doesn't need to know
+    /// the current file path.
+    pub mermaid_overrides: std::collections::HashMap<usize, crate::mermaid::Direction>,
 }
 
 struct App {
@@ -251,6 +320,21 @@ impl ApplicationHandler<UserEvent> for App {
                         (dy, (pos.y as f32) / 40.0)
                     }
                 };
+                // Quick-open owns the wheel while open — scrolls the result list.
+                let qo_open = self.shared.state.lock().unwrap().quick_open.is_some();
+                if qo_open {
+                    let step = (dy / 24.0).round() as i32;
+                    let mut s = self.shared.state.lock().unwrap();
+                    if let Some(qo) = &mut s.quick_open {
+                        let ms_len = Self::quick_open_matches(qo).len();
+                        let max_scroll = ms_len.saturating_sub(QUICK_OPEN_ROWS);
+                        let new_scroll = (qo.scroll as i32 + step).clamp(0, max_scroll as i32) as usize;
+                        qo.scroll = new_scroll;
+                    }
+                    drop(s);
+                    self.request_redraw();
+                    return;
+                }
                 let ctrl = self.shortcut_mod();
                 let over_sidebar = {
                     let s = self.shared.state.lock().unwrap();
@@ -306,6 +390,24 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 if menu_open {
                     // Repaint so the hovered-row tint follows the cursor.
+                    // Also update the sticky active submenu so the correct
+                    // panel renders when the cursor enters a trigger or
+                    // stays inside a panel.
+                    let (mx, my) = (position.x as f32, position.y as f32);
+                    let fonts = &self.shared.fonts;
+                    let new_active = {
+                        let s = self.shared.state.lock().unwrap();
+                        s.context_menu.as_ref().and_then(|m| active_submenu(m, mx, my, fonts))
+                    };
+                    let mut s = self.shared.state.lock().unwrap();
+                    if let Some(m) = s.context_menu.as_mut() {
+                        m.active_submenu = new_active;
+                    }
+                    drop(s);
+                    self.request_redraw();
+                }
+                if self.shared.state.lock().unwrap().quick_open.is_some() {
+                    // Hover highlight in the quick-open list tracks the cursor.
                     self.request_redraw();
                 }
                 // Search panel drag: move the overlay with the cursor
@@ -406,6 +508,32 @@ impl ApplicationHandler<UserEvent> for App {
                 let x = pos.x as f32;
                 let y = pos.y as f32;
 
+                // 0-. Quick-open — fully modal. Click on a row opens that
+                //     file; click outside the panel closes.
+                let quick_open = self.shared.state.lock().unwrap().quick_open.clone();
+                if let Some(qo) = quick_open {
+                    let g = quick_open_geom(viewport);
+                    if !point_in(g.panel, x, y) {
+                        self.close_quick_open();
+                        self.request_redraw();
+                        return;
+                    }
+                    if let Some(row) = quick_open_row_hit(&g, x, y) {
+                        let matches = Self::quick_open_matches(&qo);
+                        let abs = qo.scroll + row;
+                        if let Some(&m_idx) = matches.get(abs) {
+                            if let Some(p) = qo.files.get(m_idx).cloned() {
+                                self.close_quick_open();
+                                self.open_path(&p, event_loop);
+                                self.request_redraw();
+                                return;
+                            }
+                        }
+                    }
+                    // Click elsewhere on the panel (input, status) → absorbed.
+                    return;
+                }
+
                 // 0a. Search overlay — if open and hit, handle buttons / drag
                 //     and short-circuit before anything else.
                 let search_ui = self.shared.state.lock().unwrap().search.clone();
@@ -453,8 +581,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(m) = menu.as_ref() {
                     let hit = menu_item_hit(m, x, y, &self.shared.fonts);
                     match hit {
-                        Some(MenuAction::Outline) => {
-                            // keep menu open
+                        Some(MenuAction::Outline) | Some(MenuAction::MermaidMenu) => {
+                            // keep menu open — these rows only exist to host
+                            // their submenu and don't execute on click.
                             self.request_redraw();
                         }
                         Some(action) => {
@@ -593,6 +722,10 @@ impl ApplicationHandler<UserEvent> for App {
                     .cloned();
                 let copy_selection = self.current_selection_text();
                 let outline_items = outline_to_menu_items(&self.current_outline());
+                let mermaid_items = zone_hit
+                    .as_ref()
+                    .and_then(|z| z.mermaid_block.map(mermaid_layout_items))
+                    .unwrap_or_default();
                 let items = build_context_menu_items(
                     dark,
                     copy_path,
@@ -612,7 +745,10 @@ impl ApplicationHandler<UserEvent> for App {
                     // rubber-band, but keep a completed selection alive so the
                     // user can right-click → "Copy text".
                     s.is_selecting = false;
-                    s.context_menu = Some(ContextMenu { x: mx, y: my, items, outline_items });
+                    s.context_menu = Some(ContextMenu {
+                        x: mx, y: my, items, outline_items, mermaid_items,
+                        active_submenu: None,
+                    });
                 }
                 self.request_redraw();
             }
@@ -663,6 +799,13 @@ impl ApplicationHandler<UserEvent> for App {
                 event: KeyEvent { logical_key, state: ElementState::Pressed, .. },
                 ..
             } => {
+                // Quick-open overlay is modal for keyboard when open.
+                let quick_open_active = self.shared.state.lock().unwrap().quick_open.is_some();
+                if quick_open_active {
+                    self.handle_quick_open_key(&logical_key, event_loop);
+                    self.request_redraw();
+                    return;
+                }
                 // Search overlay is modal for keyboard — when it's open,
                 // Enter / Shift+Enter cycles matches, Esc closes, other
                 // keys go into the query.
@@ -673,9 +816,15 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 // Ctrl+F / Cmd+F opens the search overlay.
+                // Ctrl+P / Cmd+P opens the quick-open panel.
                 if self.shortcut_mod() {
                     if matches!(logical_key.as_ref(), Key::Character(c) if c == "f") {
                         self.open_search();
+                        self.request_redraw();
+                        return;
+                    }
+                    if matches!(logical_key.as_ref(), Key::Character(c) if c == "p") {
+                        self.open_quick_open();
                         self.request_redraw();
                         return;
                     }
@@ -946,6 +1095,7 @@ impl App {
                 sidebar_scroll: snap.sidebar_scroll,
                 content_zoom: snap.content_zoom,
                 sidebar_zoom: snap.sidebar_zoom,
+                mermaid_overrides: Some(&snap.mermaid_overrides),
             },
             &mut images,
         );
@@ -982,6 +1132,232 @@ impl App {
     fn request_redraw(&self) {
         if let Some(w) = &self.window {
             w.request_redraw();
+        }
+    }
+
+    fn open_quick_open(&self) {
+        let mut s = self.shared.state.lock().unwrap();
+        if s.quick_open.is_some() {
+            return;
+        }
+        // Walk the tree root once on open — cheap for typical repo sizes,
+        // and avoids re-scanning on every keystroke while the user types.
+        let (root, base) = if let Some(t) = &s.tree {
+            (t.root.clone(), t.root.clone())
+        } else {
+            (std::env::current_dir().unwrap_or_default(), std::env::current_dir().unwrap_or_default())
+        };
+        let files = crate::tree::walk_md_files(&root);
+        s.quick_open = Some(QuickOpenUi {
+            query: String::new(),
+            files,
+            base,
+            selected: 0,
+            scroll: 0,
+        });
+    }
+
+    fn close_quick_open(&self) {
+        let mut s = self.shared.state.lock().unwrap();
+        s.quick_open = None;
+    }
+
+    /// Compute filtered list (indices into `files`) given the current query.
+    /// Empty query shows everything in tree order. Otherwise we run a
+    /// subsequence-match ("fuzzy") scorer and return matches ordered by
+    /// score (best first). Ties broken by path length so shorter paths win.
+    fn quick_open_matches(qo: &QuickOpenUi) -> Vec<usize> {
+        if qo.query.is_empty() {
+            return (0..qo.files.len()).collect();
+        }
+        let q_lower: Vec<char> = qo.query.chars().flat_map(|c| c.to_lowercase()).collect();
+        let mut scored: Vec<(i32, usize, usize)> = Vec::new(); // (score, path_len, idx)
+        for (i, p) in qo.files.iter().enumerate() {
+            let rel = p.strip_prefix(&qo.base).unwrap_or(p.as_path());
+            let rel_str = rel.to_string_lossy();
+            if let Some(score) = fuzzy_score(&q_lower, &rel_str) {
+                scored.push((score, rel_str.len(), i));
+            }
+        }
+        // Higher score first; shorter path breaks ties.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.into_iter().map(|(_, _, i)| i).collect()
+    }
+
+    fn handle_quick_open_key(
+        &self,
+        key: &winit::keyboard::Key,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+    ) {
+        use winit::keyboard::Key;
+        match key.as_ref() {
+            Key::Named(NamedKey::Escape) => {
+                self.close_quick_open();
+            }
+            Key::Named(NamedKey::Enter) => {
+                let to_open: Option<PathBuf> = {
+                    let s = self.shared.state.lock().unwrap();
+                    s.quick_open.as_ref().and_then(|qo| {
+                        let ms = Self::quick_open_matches(qo);
+                        ms.get(qo.selected).and_then(|i| qo.files.get(*i)).cloned()
+                    })
+                };
+                if let Some(p) = to_open {
+                    self.close_quick_open();
+                    self.open_path(&p, event_loop);
+                }
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(qo) = &mut s.quick_open {
+                    let ms = Self::quick_open_matches(qo);
+                    if !ms.is_empty() {
+                        qo.selected = (qo.selected + 1).min(ms.len() - 1);
+                    }
+                    Self::clamp_quick_open_scroll(qo);
+                }
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(qo) = &mut s.quick_open {
+                    if qo.selected > 0 {
+                        qo.selected -= 1;
+                    }
+                    Self::clamp_quick_open_scroll(qo);
+                }
+            }
+            Key::Named(NamedKey::PageDown) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(qo) = &mut s.quick_open {
+                    let ms = Self::quick_open_matches(qo);
+                    if !ms.is_empty() {
+                        qo.selected = (qo.selected + QUICK_OPEN_ROWS).min(ms.len() - 1);
+                    }
+                    Self::clamp_quick_open_scroll(qo);
+                }
+            }
+            Key::Named(NamedKey::PageUp) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(qo) = &mut s.quick_open {
+                    qo.selected = qo.selected.saturating_sub(QUICK_OPEN_ROWS);
+                    Self::clamp_quick_open_scroll(qo);
+                }
+            }
+            Key::Named(NamedKey::Home) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(qo) = &mut s.quick_open {
+                    qo.selected = 0;
+                    qo.scroll = 0;
+                }
+            }
+            Key::Named(NamedKey::End) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(qo) = &mut s.quick_open {
+                    let ms = Self::quick_open_matches(qo);
+                    qo.selected = ms.len().saturating_sub(1);
+                    Self::clamp_quick_open_scroll(qo);
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(qo) = &mut s.quick_open {
+                    qo.query.pop();
+                    qo.selected = 0;
+                    qo.scroll = 0;
+                }
+            }
+            Key::Named(NamedKey::Space) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(qo) = &mut s.quick_open {
+                    qo.query.push(' ');
+                    qo.selected = 0;
+                    qo.scroll = 0;
+                }
+            }
+            Key::Character(txt) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(qo) = &mut s.quick_open {
+                    for c in txt.chars() {
+                        if !c.is_control() {
+                            qo.query.push(c);
+                        }
+                    }
+                    qo.selected = 0;
+                    qo.scroll = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Keep the selected row visible inside the result viewport.
+    fn clamp_quick_open_scroll(qo: &mut QuickOpenUi) {
+        if qo.selected < qo.scroll {
+            qo.scroll = qo.selected;
+        } else if qo.selected >= qo.scroll + QUICK_OPEN_ROWS {
+            qo.scroll = qo.selected + 1 - QUICK_OPEN_ROWS;
+        }
+    }
+
+    /// Open the given file in the main view, re-rooting the tree and
+    /// updating scroll / path state. Shared between quick-open and sidebar
+    /// clicks.
+    fn open_path(&self, p: &Path, _event_loop: &winit::event_loop::ActiveEventLoop) {
+        let Ok(content) = std::fs::read_to_string(p) else { return };
+        let mut s = self.shared.state.lock().unwrap();
+        s.source = content;
+        s.source_path = Some(p.to_path_buf());
+        s.scroll = 0.0;
+        s.sel_anchor = None;
+        s.sel_head = None;
+        // Expand every ancestor folder up to the tree root so the newly
+        // active file is visible (and marked) in the sidebar.
+        if let Some(tree) = &mut s.tree {
+            let root = tree.root.clone();
+            let mut cur = p.parent();
+            while let Some(dir) = cur {
+                tree.expanded.insert(dir.to_path_buf());
+                if dir == root {
+                    break;
+                }
+                cur = dir.parent();
+            }
+        }
+        drop(s);
+        self.scroll_sidebar_to_active();
+    }
+
+    /// Scroll the sidebar so the row for `source_path` is visible. No-op if
+    /// there's no active path or no tree.
+    fn scroll_sidebar_to_active(&self) {
+        let (flat, active, sidebar_h, sidebar_scroll, sidebar_zoom, theme) = {
+            let s = self.shared.state.lock().unwrap();
+            let Some(tree) = &s.tree else { return };
+            (
+                tree.flatten(),
+                s.source_path.clone(),
+                s.viewport.height as f32,
+                s.sidebar_scroll,
+                s.sidebar_zoom,
+                if s.dark { Theme::dark() } else { Theme::light() },
+            )
+        };
+        let Some(active) = active else { return };
+        let Some(row) = flat.iter().position(|e| e.path == active) else { return };
+        // Matches the row height used in render::sidebar_content_height.
+        let row_h = theme.body_size * 0.82 * sidebar_zoom * 1.5;
+        let top_pad = theme.margin_y * 0.5;
+        let row_top = top_pad + row as f32 * row_h;
+        let row_bot = row_top + row_h;
+        let mut new_scroll = sidebar_scroll;
+        if row_top < sidebar_scroll {
+            new_scroll = row_top;
+        } else if row_bot > sidebar_scroll + sidebar_h {
+            new_scroll = (row_bot - sidebar_h).max(0.0);
+        }
+        if (new_scroll - sidebar_scroll).abs() > 0.5 {
+            let mut s = self.shared.state.lock().unwrap();
+            s.sidebar_scroll = new_scroll;
         }
     }
 
@@ -1122,6 +1498,7 @@ impl App {
                 selection: None,
                 hover_pos: None,
                 search: None,
+                mermaid_overrides: Some(&snap.mermaid_overrides),
             },
             &mut images,
         )
@@ -1149,6 +1526,7 @@ impl App {
                 selection: snap.selection,
                 hover_pos: None,
                 search: None,
+                mermaid_overrides: Some(&snap.mermaid_overrides),
             },
             &mut images,
         )?;
@@ -1179,6 +1557,7 @@ impl App {
                 selection: None,
                 hover_pos: None,
                 search: None,
+                mermaid_overrides: Some(&snap.mermaid_overrides),
             },
             &mut images,
         )
@@ -1205,6 +1584,7 @@ impl App {
                 selection: None,
                 hover_pos: None,
                 search: None,
+                mermaid_overrides: Some(&snap.mermaid_overrides),
             },
             &mut images,
         )
@@ -1307,6 +1687,7 @@ impl App {
                     selection: snap.selection,
                     hover_pos: None,
                     search: None,
+                    mermaid_overrides: Some(&snap.mermaid_overrides),
                 },
                 &mut images,
             )
@@ -1354,6 +1735,7 @@ impl App {
                         current: if s.match_count > 0 { Some(s.current) } else { None },
                     }
                 }),
+                mermaid_overrides: Some(&snap.mermaid_overrides),
             },
             &mut images,
         );
@@ -1365,6 +1747,14 @@ impl App {
                 Some((s.last_mouse.x as f32, s.last_mouse.y as f32))
             };
             draw_search_ui(&mut fb, &snap.theme, &self.shared.fonts, su, hover);
+        }
+
+        if let Some(qo) = &snap.quick_open {
+            let hover = {
+                let s = self.shared.state.lock().unwrap();
+                Some((s.last_mouse.x as f32, s.last_mouse.y as f32))
+            };
+            draw_quick_open_ui(&mut fb, &snap.theme, &self.shared.fonts, qo, snap.viewport, hover);
         }
 
         if let Some(m) = &snap.context_menu {
@@ -1410,6 +1800,7 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
                 selection: None,
                 hover_pos: None,
                 search: None,
+                mermaid_overrides: Some(&snap.mermaid_overrides),
             },
             &mut images,
         )
@@ -1596,6 +1987,8 @@ pub fn run(opts: WindowOptions) -> ExitCode {
             dark: false,
             context_menu: None,
             search: None,
+            quick_open: None,
+            mermaid_overrides: std::collections::HashMap::new(),
         }),
     });
 
@@ -1638,6 +2031,15 @@ const SEARCH_PANEL_W: f32 = 360.0;
 const SEARCH_PANEL_H: f32 = 40.0;
 const SEARCH_DRAG_W: f32 = 18.0;      // left strip that grabs drags
 const SEARCH_FONT_SIZE: f32 = 14.0;
+
+// ───── quick-open overlay (Ctrl+P) ─────────────────────────────────────────
+
+const QUICK_OPEN_W: f32 = 560.0;
+const QUICK_OPEN_INPUT_H: f32 = 36.0;
+const QUICK_OPEN_ROW_H: f32 = 24.0;
+const QUICK_OPEN_ROWS: usize = 12;
+const QUICK_OPEN_FONT_SIZE: f32 = 14.0;
+const QUICK_OPEN_ROW_FONT_SIZE: f32 = 13.0;
 
 /// Geometry for each interactive part of the search panel — shared by
 /// drawing and hit-testing so they can't drift out of sync.
@@ -1806,6 +2208,205 @@ fn draw_search_ui(
     }
 }
 
+/// Geometry for the quick-open panel, shared by draw and hit-test.
+#[derive(Debug, Clone, Copy)]
+struct QuickOpenGeom {
+    panel: (f32, f32, f32, f32),
+    input: (f32, f32, f32, f32),
+    list: (f32, f32, f32, f32),
+    row_h: f32,
+}
+
+fn quick_open_geom(viewport: crate::render::Viewport) -> QuickOpenGeom {
+    let vw = viewport.width as f32;
+    let vh = viewport.height as f32;
+    let w = QUICK_OPEN_W.min(vw - 40.0).max(200.0);
+    let rows_h = QUICK_OPEN_ROW_H * QUICK_OPEN_ROWS as f32;
+    let status_h = 18.0;
+    let h = QUICK_OPEN_INPUT_H + rows_h + status_h;
+    let x = ((vw - w) * 0.5).max(0.0);
+    let y = (vh * 0.12).min((vh - h - 10.0).max(0.0));
+    let input = (x + 8.0, y + 6.0, w - 16.0, QUICK_OPEN_INPUT_H - 12.0);
+    let list = (x + 4.0, y + QUICK_OPEN_INPUT_H, w - 8.0, rows_h);
+    QuickOpenGeom { panel: (x, y, w, h), input, list, row_h: QUICK_OPEN_ROW_H }
+}
+
+/// `Some(row_index_in_view)` if the cursor is over a result row, else None.
+fn quick_open_row_hit(geom: &QuickOpenGeom, x: f32, y: f32) -> Option<usize> {
+    let (lx, ly, lw, lh) = geom.list;
+    if x < lx || x >= lx + lw || y < ly || y >= ly + lh {
+        return None;
+    }
+    let row = ((y - ly) / geom.row_h) as usize;
+    if row < QUICK_OPEN_ROWS { Some(row) } else { None }
+}
+
+fn draw_quick_open_ui(
+    fb: &mut crate::render::Framebuffer,
+    theme: &Theme,
+    fonts: &Fonts,
+    qo: &QuickOpenUi,
+    viewport: crate::render::Viewport,
+    hover: Option<(f32, f32)>,
+) {
+    let g = quick_open_geom(viewport);
+    let (px, py, pw, ph) = g.panel;
+
+    // Backdrop dimmer across the window.
+    let vw = viewport.width as i32;
+    let vh = viewport.height as i32;
+    fb.fill_rect(0, 0, vw, vh, [0, 0, 0, 80]);
+
+    // Shadow + panel + border.
+    fb.fill_rect(px as i32 + 4, py as i32 + 6, pw as i32, ph as i32, [0, 0, 0, 90]);
+    fb.fill_rect(px as i32, py as i32, pw as i32, ph as i32, theme.sidebar_bg);
+    let border = theme.muted;
+    fb.fill_rect(px as i32, py as i32, pw as i32, 1, border);
+    fb.fill_rect(px as i32, py as i32 + ph as i32 - 1, pw as i32, 1, border);
+    fb.fill_rect(px as i32, py as i32, 1, ph as i32, border);
+    fb.fill_rect(px as i32 + pw as i32 - 1, py as i32, 1, ph as i32, border);
+
+    // Input box.
+    let (ix, iy, iw, ih) = g.input;
+    fb.fill_rect(ix as i32, iy as i32, iw as i32, ih as i32, theme.bg);
+    fb.fill_rect(ix as i32, iy as i32, iw as i32, 1, theme.muted);
+    fb.fill_rect(ix as i32, iy as i32 + ih as i32 - 1, iw as i32, 1, theme.muted);
+    fb.fill_rect(ix as i32, iy as i32, 1, ih as i32, theme.muted);
+    fb.fill_rect(ix as i32 + iw as i32 - 1, iy as i32, 1, ih as i32, theme.muted);
+
+    // Query + caret. Same scroll-the-tail trick as the search panel.
+    let baseline = iy + ih * 0.5 + QUICK_OPEN_FONT_SIZE * 0.35;
+    let text_left = ix + 8.0;
+    let text_right = ix + iw - 8.0;
+    let avail_w = (text_right - text_left).max(0.0);
+    let chars: Vec<char> = qo.query.chars().collect();
+    let mut widths: Vec<f32> = Vec::with_capacity(chars.len());
+    let mut total = 0.0;
+    for ch in chars.iter().rev() {
+        let font = if crate::font::is_emoji(*ch) { &fonts.emoji } else { &fonts.body };
+        let w = font.metrics(*ch, QUICK_OPEN_FONT_SIZE).advance_width;
+        total += w;
+        widths.push(w);
+    }
+    let mut start_idx = 0;
+    if total > avail_w && !chars.is_empty() {
+        let mut acc = 0.0;
+        for (k, w) in widths.iter().enumerate() {
+            acc += w;
+            if acc > avail_w {
+                start_idx = chars.len() - k;
+                break;
+            }
+        }
+    }
+    if chars.is_empty() {
+        // Placeholder hint — muted.
+        let hint = "Type to filter files…";
+        let mut hx = text_left;
+        for ch in hint.chars() {
+            fb.draw_glyph(&fonts.body, ch, QUICK_OPEN_FONT_SIZE, hx, baseline, theme.muted);
+            hx += fonts.body.metrics(ch, QUICK_OPEN_FONT_SIZE).advance_width;
+        }
+    }
+    let mut cx = text_left;
+    for &ch in &chars[start_idx..] {
+        let font = if crate::font::is_emoji(ch) { &fonts.emoji } else { &fonts.body };
+        fb.draw_glyph(font, ch, QUICK_OPEN_FONT_SIZE, cx, baseline, theme.fg);
+        cx += font.metrics(ch, QUICK_OPEN_FONT_SIZE).advance_width;
+    }
+    let caret_x = cx.min(text_right);
+    fb.fill_rect(
+        caret_x as i32,
+        (baseline - QUICK_OPEN_FONT_SIZE * 0.85) as i32,
+        1,
+        QUICK_OPEN_FONT_SIZE as i32,
+        theme.fg,
+    );
+
+    // Results list.
+    let matches = App::quick_open_matches(qo);
+    let (lx, ly, lw, lh) = g.list;
+    fb.fill_rect(lx as i32, ly as i32, lw as i32, lh as i32, theme.sidebar_bg);
+
+    let hover_row = hover.and_then(|(hx, hy)| quick_open_row_hit(&g, hx, hy));
+
+    let start = qo.scroll;
+    let visible = matches.len().saturating_sub(start).min(QUICK_OPEN_ROWS);
+    for row in 0..visible {
+        let m_idx = matches[start + row];
+        let p = &qo.files[m_idx];
+        let rel = p.strip_prefix(&qo.base).unwrap_or(p.as_path());
+        let rel_str = rel.to_string_lossy();
+
+        let rx = lx;
+        let ry = ly + row as f32 * QUICK_OPEN_ROW_H;
+        let selected_in_view = qo.selected.checked_sub(start) == Some(row);
+        let hovered = hover_row == Some(row);
+        if selected_in_view {
+            fb.fill_rect(rx as i32, ry as i32, lw as i32, QUICK_OPEN_ROW_H as i32, theme.sidebar_active_bg);
+            // Left accent bar makes the selection stand out from hover.
+            fb.fill_rect(rx as i32, ry as i32, 3, QUICK_OPEN_ROW_H as i32, theme.accent);
+        } else if hovered {
+            // Hover tint — muted with low alpha. `sidebar_active_bg` works
+            // as a subtle wash on both themes.
+            let mut tint = theme.sidebar_active_bg;
+            tint[3] = 100;
+            fb.fill_rect(rx as i32, ry as i32, lw as i32, QUICK_OPEN_ROW_H as i32, tint);
+        }
+
+        // Split filename / directory; draw filename in fg, directory muted.
+        let (dir_part, file_part) = match rel.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                let d = parent.to_string_lossy().to_string();
+                let f = rel.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                (d, f)
+            }
+            _ => (String::new(), rel_str.to_string()),
+        };
+
+        let bl = ry + QUICK_OPEN_ROW_H * 0.5 + QUICK_OPEN_ROW_FONT_SIZE * 0.35;
+        let mut tx = rx + 10.0;
+        // filename — bold-ish via fg colour
+        for ch in file_part.chars() {
+            let f = if crate::font::is_emoji(ch) { &fonts.emoji } else { &fonts.body };
+            fb.draw_glyph(f, ch, QUICK_OPEN_ROW_FONT_SIZE, tx, bl, theme.fg);
+            tx += f.metrics(ch, QUICK_OPEN_ROW_FONT_SIZE).advance_width;
+        }
+        if !dir_part.is_empty() {
+            tx += 8.0;
+            for ch in dir_part.chars() {
+                let f = if crate::font::is_emoji(ch) { &fonts.emoji } else { &fonts.body };
+                // Stop drawing the directory hint once we'd run past the
+                // row's right edge — keeps long paths from bleeding.
+                if tx + f.metrics(ch, QUICK_OPEN_ROW_FONT_SIZE).advance_width > rx + lw - 8.0 {
+                    break;
+                }
+                fb.draw_glyph(f, ch, QUICK_OPEN_ROW_FONT_SIZE, tx, bl, theme.muted);
+                tx += f.metrics(ch, QUICK_OPEN_ROW_FONT_SIZE).advance_width;
+            }
+        }
+    }
+
+    // Status line: N files, or "no matches".
+    let status = if matches.is_empty() {
+        if qo.files.is_empty() {
+            "No markdown files under root".to_string()
+        } else {
+            "No matches".to_string()
+        }
+    } else if qo.query.is_empty() {
+        format!("{} files", matches.len())
+    } else {
+        format!("{} / {} files", matches.len(), qo.files.len())
+    };
+    let sbl = py + ph - 8.0;
+    let mut sx = px + 10.0;
+    for ch in status.chars() {
+        fb.draw_glyph(&fonts.body, ch, 11.0, sx, sbl, theme.muted);
+        sx += fonts.body.metrics(ch, 11.0).advance_width;
+    }
+}
+
 // ───── context menu ────────────────────────────────────────────────────────
 
 const MENU_ITEM_H: f32 = 28.0;
@@ -1830,6 +2431,13 @@ fn build_context_menu_items(
         for (label, text) in &z.actions {
             items.push((label.clone(), MenuAction::CopyText(text.clone())));
         }
+        // Mermaid zones additionally offer a view-only layout override as a
+        // submenu — the inline list got long. The actual entries are
+        // attached to the ContextMenu.mermaid_items field; here we only
+        // push the trigger row.
+        if z.mermaid_block.is_some() {
+            items.push(("Layout  ▸".to_string(), MenuAction::MermaidMenu));
+        }
     }
     if let Some(p) = copy_path {
         items.push(("Copy path".to_string(), MenuAction::CopyPath(p)));
@@ -1838,6 +2446,7 @@ fn build_context_menu_items(
         items.push(("Outline  ▸".to_string(), MenuAction::Outline));
     }
     items.push(("Find…  (Ctrl+F)".to_string(), MenuAction::Find));
+    items.push(("Open file…  (Ctrl+P)".to_string(), MenuAction::QuickOpen));
     // Label names the theme the click will *switch to*, not the current one.
     let label = if dark { "Light Theme" } else { "Dark Theme" };
     items.push((label.to_string(), MenuAction::ToggleTheme));
@@ -1846,11 +2455,67 @@ fn build_context_menu_items(
 
 /// Turn the heading outline into submenu rows. The leading indent visually
 /// nests subsections under their parent heading.
-fn outline_to_menu_items(outline: &[crate::layout::OutlineEntry]) -> Vec<(String, f32)> {
+fn outline_to_menu_items(outline: &[crate::layout::OutlineEntry]) -> Vec<(String, MenuAction)> {
     outline.iter().map(|o| {
         let indent: String = "  ".repeat(o.level.saturating_sub(1) as usize);
-        (format!("{}{}", indent, o.text), o.doc_y)
+        (format!("{}{}", indent, o.text), MenuAction::ScrollTo(o.doc_y))
     }).collect()
+}
+
+/// Layout-direction rows for the mermaid "Layout ▸" submenu.
+/// Subsequence-match score of `query` (already lower-cased) against `path`.
+/// Returns `None` if the characters of `query` don't appear in order in
+/// `path`. Higher score = better match.
+///
+/// Scoring:
+///   +25 per matched char (baseline — presence is the main thing).
+///   +40 when the match lands at the start of a path segment (after `/`
+///       or at position 0). Rewards `s/d` → `src/demo.md` over
+///       mid-word hits.
+///   +15 for consecutive matches (no gap since the last hit). Rewards
+///       whole-word typing like `demo` finding `demo.md`.
+///   −1 per skipped char between matches (small penalty — keeps the
+///       scorer sensitive to tighter matches).
+fn fuzzy_score(query: &[char], path: &str) -> Option<i32> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let chars: Vec<char> = path.chars().flat_map(|c| c.to_lowercase()).collect();
+    let mut qi = 0usize;
+    let mut score: i32 = 0;
+    let mut last_match: Option<usize> = None;
+    let mut at_seg_start = true; // path[0] is the start of the first segment
+    for (ci, &ch) in chars.iter().enumerate() {
+        if qi < query.len() && ch == query[qi] {
+            score += 25;
+            if at_seg_start {
+                score += 40;
+            }
+            if last_match == Some(ci.wrapping_sub(1)) {
+                score += 15;
+            }
+            if let Some(lm) = last_match {
+                let gap = ci.saturating_sub(lm + 1);
+                score -= gap as i32;
+            }
+            last_match = Some(ci);
+            qi += 1;
+        }
+        at_seg_start = ch == '/' || ch == std::path::MAIN_SEPARATOR;
+    }
+    if qi == query.len() { Some(score) } else { None }
+}
+
+fn mermaid_layout_items(idx: usize) -> Vec<(String, MenuAction)> {
+    use crate::mermaid::Direction::*;
+    vec![
+        ("Top → Bottom".to_string(), MenuAction::SetMermaidLayout(idx, TopBottom)),
+        ("Bottom → Top".to_string(), MenuAction::SetMermaidLayout(idx, BottomTop)),
+        ("Left → Right".to_string(), MenuAction::SetMermaidLayout(idx, LeftRight)),
+        ("Right → Left".to_string(), MenuAction::SetMermaidLayout(idx, RightLeft)),
+        ("Diagonal".to_string(), MenuAction::SetMermaidLayout(idx, Diagonal)),
+        ("Reset to source".to_string(), MenuAction::ResetMermaidLayout(idx)),
+    ]
 }
 
 fn context_menu_width(items: &[(String, MenuAction)], fonts: &Fonts) -> f32 {
@@ -1871,8 +2536,8 @@ fn context_menu_height(items: &[(String, MenuAction)]) -> f32 {
 /// Return the MenuAction at (x, y) or None if outside the menu box.
 /// Submenu hits take precedence over main-menu hits.
 fn menu_item_hit(m: &ContextMenu, x: f32, y: f32, fonts: &Fonts) -> Option<MenuAction> {
-    if submenu_open(m, x, y, fonts) {
-        if let Some(a) = submenu_item_hit(m, x, y, fonts) {
+    if let Some(active) = active_submenu(m, x, y, fonts) {
+        if let Some(a) = active.item_hit(m, x, y, fonts) {
             return Some(a);
         }
     }
@@ -1886,27 +2551,101 @@ fn menu_item_hit(m: &ContextMenu, x: f32, y: f32, fonts: &Fonts) -> Option<MenuA
     m.items.get(idx).map(|(_, a)| a.clone())
 }
 
-/// Index of the "Outline ▸" row in the main menu, if present.
-fn outline_row_index(m: &ContextMenu) -> Option<usize> {
-    m.items.iter().position(|(_, a)| matches!(a, MenuAction::Outline))
-}
-
-fn submenu_anchor(m: &ContextMenu, fonts: &Fonts) -> Option<(f32, f32, f32, f32)> {
-    let idx = outline_row_index(m)?;
-    if m.outline_items.is_empty() {
-        return None;
+impl SubmenuKind {
+    fn trigger(self) -> MenuAction {
+        match self {
+            SubmenuKind::Outline => MenuAction::Outline,
+            SubmenuKind::Mermaid => MenuAction::MermaidMenu,
+        }
     }
-    let main_w = context_menu_width(&m.items, fonts);
-    let sw = submenu_width(&m.outline_items, fonts);
-    let sh = submenu_height(&m.outline_items);
-    // Right side of the main menu. (Assumes enough room — if off-screen
-    // we'd flip to the left; keep it simple for now.)
-    let sx = m.x + main_w - 2.0;
-    let sy = m.y + MENU_PAD_Y + idx as f32 * MENU_ITEM_H - MENU_PAD_Y;
-    Some((sx, sy, sw, sh))
+    fn items<'a>(self, m: &'a ContextMenu) -> &'a [(String, MenuAction)] {
+        match self {
+            SubmenuKind::Outline => &m.outline_items,
+            SubmenuKind::Mermaid => &m.mermaid_items,
+        }
+    }
+    fn trigger_row(self, m: &ContextMenu) -> Option<usize> {
+        let want = self.trigger();
+        m.items.iter().position(|(_, a)| std::mem::discriminant(a) == std::mem::discriminant(&want))
+    }
+    fn anchor(self, m: &ContextMenu, fonts: &Fonts) -> Option<(f32, f32, f32, f32)> {
+        let items = self.items(m);
+        if items.is_empty() { return None; }
+        let row = self.trigger_row(m)?;
+        let main_w = context_menu_width(&m.items, fonts);
+        let sw = submenu_width(items, fonts);
+        let sh = submenu_height(items);
+        let sx = m.x + main_w - 2.0;
+        let sy = m.y + MENU_PAD_Y + row as f32 * MENU_ITEM_H - MENU_PAD_Y;
+        Some((sx, sy, sw, sh))
+    }
+    fn is_hovered(self, m: &ContextMenu, x: f32, y: f32, fonts: &Fonts) -> bool {
+        // Active when the cursor is on this kind's trigger row OR inside
+        // its submenu panel. `active_submenu` uses this to pick exactly
+        // one submenu at a time.
+        if let Some((sx, sy, sw, sh)) = self.anchor(m, fonts) {
+            if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
+                return true;
+            }
+        }
+        if let Some(row) = self.trigger_row(m) {
+            let main_w = context_menu_width(&m.items, fonts);
+            let ry = m.y + MENU_PAD_Y + row as f32 * MENU_ITEM_H;
+            if x >= m.x && x < m.x + main_w && y >= ry && y < ry + MENU_ITEM_H {
+                return true;
+            }
+        }
+        false
+    }
+    fn item_hit(self, m: &ContextMenu, x: f32, y: f32, fonts: &Fonts) -> Option<MenuAction> {
+        let (sx, sy, sw, sh) = self.anchor(m, fonts)?;
+        if x < sx || x >= sx + sw || y < sy || y >= sy + sh {
+            return None;
+        }
+        let local_y = y - sy - MENU_PAD_Y;
+        if local_y < 0.0 { return None; }
+        let idx = (local_y / MENU_ITEM_H) as usize;
+        self.items(m).get(idx).map(|(_, a)| a.clone())
+    }
 }
 
-fn submenu_width(items: &[(String, f32)], fonts: &Fonts) -> f32 {
+/// Decide which submenu (if any) should be visible given the cursor
+/// position. Sticky: once a trigger row has been hovered, that submenu
+/// stays open while the cursor is still inside *its* trigger row or
+/// panel — even if the cursor is also inside another submenu's panel
+/// rect. A trigger hover on the other kind switches.
+fn active_submenu(m: &ContextMenu, x: f32, y: f32, fonts: &Fonts) -> Option<SubmenuKind> {
+    // Priority 1: cursor on a trigger row → that submenu wins outright.
+    for k in [SubmenuKind::Outline, SubmenuKind::Mermaid] {
+        if let Some(row) = k.trigger_row(m) {
+            let main_w = context_menu_width(&m.items, fonts);
+            let ry = m.y + MENU_PAD_Y + row as f32 * MENU_ITEM_H;
+            if x >= m.x && x < m.x + main_w && y >= ry && y < ry + MENU_ITEM_H {
+                return Some(k);
+            }
+        }
+    }
+    // Priority 2: stay with the previously-active submenu while the
+    // cursor is still inside its panel rect.
+    if let Some(current) = m.active_submenu {
+        if let Some((sx, sy, sw, sh)) = current.anchor(m, fonts) {
+            if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
+                return Some(current);
+            }
+        }
+    }
+    // Priority 3: fall back to whichever panel the cursor is in (first match).
+    for k in [SubmenuKind::Outline, SubmenuKind::Mermaid] {
+        if let Some((sx, sy, sw, sh)) = k.anchor(m, fonts) {
+            if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
+                return Some(k);
+            }
+        }
+    }
+    None
+}
+
+fn submenu_width(items: &[(String, MenuAction)], fonts: &Fonts) -> f32 {
     let mut w = 0.0f32;
     for (label, _) in items {
         let lw = measure_text_width(&fonts.body, label, MENU_FONT_SIZE);
@@ -1915,36 +2654,8 @@ fn submenu_width(items: &[(String, f32)], fonts: &Fonts) -> f32 {
     (w + MENU_PAD_X * 2.0).max(160.0)
 }
 
-fn submenu_height(items: &[(String, f32)]) -> f32 {
+fn submenu_height(items: &[(String, MenuAction)]) -> f32 {
     MENU_PAD_Y * 2.0 + MENU_ITEM_H * items.len() as f32
-}
-
-/// True when the outline row is hovered, OR the submenu box is hovered.
-fn submenu_open(m: &ContextMenu, x: f32, y: f32, fonts: &Fonts) -> bool {
-    let Some((sx, sy, sw, sh)) = submenu_anchor(m, fonts) else { return false };
-    if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
-        return true;
-    }
-    // Or over the main-menu "Outline" row.
-    if let Some(idx) = outline_row_index(m) {
-        let main_w = context_menu_width(&m.items, fonts);
-        let row_y = m.y + MENU_PAD_Y + idx as f32 * MENU_ITEM_H;
-        if x >= m.x && x < m.x + main_w && y >= row_y && y < row_y + MENU_ITEM_H {
-            return true;
-        }
-    }
-    false
-}
-
-fn submenu_item_hit(m: &ContextMenu, x: f32, y: f32, fonts: &Fonts) -> Option<MenuAction> {
-    let (sx, sy, sw, sh) = submenu_anchor(m, fonts)?;
-    if x < sx || x >= sx + sw || y < sy || y >= sy + sh {
-        return None;
-    }
-    let local_y = y - sy - MENU_PAD_Y;
-    if local_y < 0.0 { return None; }
-    let idx = (local_y / MENU_ITEM_H) as usize;
-    m.outline_items.get(idx).map(|(_, doc_y)| MenuAction::ScrollTo(*doc_y))
 }
 
 fn apply_menu_action(shared: &Arc<Shared>, action: &MenuAction) {
@@ -1959,7 +2670,7 @@ fn apply_menu_action(shared: &Arc<Shared>, action: &MenuAction) {
         MenuAction::CopyText(text) => {
             clipboard::copy(text);
         }
-        MenuAction::Outline => { /* submenu trigger only — handled at hit-test */ }
+        MenuAction::Outline | MenuAction::MermaidMenu => { /* submenu trigger only — handled at hit-test */ }
         MenuAction::Find => {
             // Open the search overlay at the mouse position, mirroring
             // what Ctrl+F does.
@@ -1980,6 +2691,37 @@ fn apply_menu_action(shared: &Arc<Shared>, action: &MenuAction) {
                     drag_grip: None,
                 });
             }
+        }
+        MenuAction::QuickOpen => {
+            // Mirror Ctrl+P: open the quick-open panel. Safe from a menu
+            // callback because we don't touch the tree walk in parallel.
+            let mut s = shared.state.lock().unwrap();
+            if s.quick_open.is_none() {
+                let (root, base) = if let Some(t) = &s.tree {
+                    (t.root.clone(), t.root.clone())
+                } else {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    (cwd.clone(), cwd)
+                };
+                let files = crate::tree::walk_md_files(&root);
+                s.quick_open = Some(QuickOpenUi {
+                    query: String::new(),
+                    files,
+                    base,
+                    selected: 0,
+                    scroll: 0,
+                });
+            }
+        }
+        MenuAction::SetMermaidLayout(idx, dir) => {
+            let mut s = shared.state.lock().unwrap();
+            let key = (s.source_path.clone(), *idx);
+            s.mermaid_overrides.insert(key, *dir);
+        }
+        MenuAction::ResetMermaidLayout(idx) => {
+            let mut s = shared.state.lock().unwrap();
+            let key = (s.source_path.clone(), *idx);
+            s.mermaid_overrides.remove(&key);
         }
         MenuAction::ScrollTo(doc_y) => {
             // Mirror the HitAction::ScrollTo flow in click_at so clamping
@@ -2022,11 +2764,12 @@ fn draw_context_menu(
 ) {
     draw_menu_panel(fb, theme, fonts, m.x, m.y, &m.items, hover);
 
-    // Submenu, if the hover falls on the trigger row or inside the panel.
+    // At most one submenu is active at a time — whichever trigger row or
+    // panel the cursor is over.
     if let Some((hx, hy)) = hover {
-        if !m.outline_items.is_empty() && submenu_open(m, hx, hy, fonts) {
-            if let Some((sx, sy, _sw, _sh)) = submenu_anchor(m, fonts) {
-                draw_submenu_panel(fb, theme, fonts, sx, sy, &m.outline_items, hover);
+        if let Some(kind) = active_submenu(m, hx, hy, fonts) {
+            if let Some((sx, sy, _sw, _sh)) = kind.anchor(m, fonts) {
+                draw_submenu_panel(fb, theme, fonts, sx, sy, kind.items(m), hover);
             }
         }
     }
@@ -2093,7 +2836,7 @@ fn draw_submenu_panel(
     fonts: &Fonts,
     sx: f32,
     sy: f32,
-    items: &[(String, f32)],
+    items: &[(String, MenuAction)],
     hover: Option<(f32, f32)>,
 ) {
     let w = submenu_width(items, fonts);
