@@ -3,6 +3,10 @@
 //! Subcommands:
 //!   mdrdr render [FILE] [--tree DIR] [--out PATH] [--width W] [--height H] [--scroll Y]
 //!   mdrdr open   [FILE_OR_DIR]
+//!
+//! A bare path is shorthand for `open`, so `mdrdr .` and `mdrdr foo.md`
+//! both work — handy for shell use and for registering the binary as an
+//! OS-level .md handler.
 
 mod api;
 mod clipboard;
@@ -25,15 +29,21 @@ use std::process::ExitCode;
 fn usage() -> ExitCode {
     eprintln!(
         "usage:\n  \
-         mdrdr render [FILE] [--tree DIR] [--out PATH] [--width W] [--height H] [--scroll Y]\n  \
-         mdrdr open   [FILE_OR_DIR]"
+         mdrdr                       (same as `mdrdr open`)\n  \
+         mdrdr <FILE_OR_DIR>         shorthand for `mdrdr open <FILE_OR_DIR>`\n  \
+         mdrdr open   [FILE_OR_DIR]\n  \
+         mdrdr render [FILE] [--tree DIR] [--out PATH] [--width W] [--height H] [--scroll Y]"
     );
     ExitCode::from(2)
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let Some(cmd) = args.first() else { return usage() };
+
+    // No args → open the window in the current directory.
+    let Some(cmd) = args.first() else {
+        return window::run(None);
+    };
 
     match cmd.as_str() {
         "render" => cmd_render(&args[1..]),
@@ -42,6 +52,10 @@ fn main() -> ExitCode {
             usage();
             ExitCode::SUCCESS
         }
+        // Bare path (e.g. `mdrdr .` or `mdrdr foo.md`) — shorthand for
+        // `open`. Lets the OS use `mdrdr` directly as a MIME handler
+        // and makes the CLI feel like less | bat | etc.
+        other if !other.starts_with('-') => cmd_open(&args),
         _ => usage(),
     }
 }
