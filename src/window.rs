@@ -1202,7 +1202,18 @@ fn open_url(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
-pub fn run(arg: Option<PathBuf>) -> ExitCode {
+/// Runtime options for the window shell.
+pub struct WindowOptions {
+    /// Initial file or directory to open; `None` → open the current dir.
+    pub path: Option<PathBuf>,
+    /// When `Some(port)`, spawn the HTTP control API bound to that port
+    /// (`0` = ephemeral). `None` → don't spawn the API at all. Most
+    /// human-facing invocations want `None`.
+    pub api_port: Option<u16>,
+}
+
+pub fn run(opts: WindowOptions) -> ExitCode {
+    let arg = opts.path;
     let fonts = Fonts::load();
     let viewport = Viewport { width: 1200, height: 900 };
 
@@ -1240,8 +1251,14 @@ pub fn run(arg: Option<PathBuf>) -> ExitCode {
     let event_loop: EventLoop<UserEvent> = EventLoop::with_user_event().build().unwrap();
     let proxy: EventLoopProxy<UserEvent> = event_loop.create_proxy();
 
-    let port = api::spawn(shared.clone(), proxy.clone());
-    println!("mdrdr api listening on http://127.0.0.1:{port}");
+    if let Some(requested) = opts.api_port {
+        match api::spawn(shared.clone(), proxy.clone(), requested) {
+            Ok(bound) => println!("mdrdr api listening on http://127.0.0.1:{bound}"),
+            Err(e) => eprintln!(
+                "mdrdr api disabled: could not bind 127.0.0.1:{requested} ({e})"
+            ),
+        }
+    }
 
     crate::watch::spawn(shared.clone(), proxy.clone());
 

@@ -85,13 +85,18 @@ To undo: `xdg-mime default <previous>.desktop text/markdown` and `rm ~/.local/sh
 mdrdr                         # open the window rooted at the current directory
 mdrdr .                       # same
 mdrdr FILE_OR_DIR             # open the file / directory (OS MIME handler uses this form)
-mdrdr open FILE_OR_DIR        # explicit form
+mdrdr open FILE_OR_DIR [--api] [--port N]
 mdrdr render FILE.md [--tree DIR] [--out preview.png] [--width W] [--height H] [--scroll Y]
 ```
 
-`mdrdr render` is headless — writes a PNG and exits. This is the main iteration loop during development and during Claude agent runs.
+`mdrdr render` is headless — writes a PNG and exits. The main iteration loop during development and during Claude agent runs.
 
-`mdrdr open` (or a bare path) brings up a native window and prints `mdrdr api listening on http://127.0.0.1:<port>` to stdout.
+`mdrdr open` (or a bare path) brings up a native window. By default the HTTP control API is **off** — humans don't need it. Opt in with:
+
+- `--api` — spawn the API on a random ephemeral port.
+- `--port N` — spawn the API on port N (implies `--api`). If the port is already in use, the window still opens; only the API is skipped.
+
+Either way, the bound port is printed to stdout as `mdrdr api listening on http://127.0.0.1:<port>`.
 
 ### Keyboard / mouse
 

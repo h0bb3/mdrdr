@@ -31,31 +31,30 @@ fn usage() -> ExitCode {
         "usage:\n  \
          mdrdr                       (same as `mdrdr open`)\n  \
          mdrdr <FILE_OR_DIR>         shorthand for `mdrdr open <FILE_OR_DIR>`\n  \
-         mdrdr open   [FILE_OR_DIR]\n  \
-         mdrdr render [FILE] [--tree DIR] [--out PATH] [--width W] [--height H] [--scroll Y]"
+         mdrdr open   [FILE_OR_DIR] [--api] [--port N]\n  \
+         mdrdr render [FILE] [--tree DIR] [--out PATH] [--width W] [--height H] [--scroll Y]\n\n\
+         --api         enable the HTTP control API on a random port\n  \
+         --port N      bind the API on port N (implies --api)"
     );
     ExitCode::from(2)
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let cmd = args.first().map(String::as_str);
 
-    // No args → open the window in the current directory.
-    let Some(cmd) = args.first() else {
-        return window::run(None);
-    };
-
-    match cmd.as_str() {
-        "render" => cmd_render(&args[1..]),
-        "open" => cmd_open(&args[1..]),
-        "-h" | "--help" | "help" => {
+    match cmd {
+        Some("render") => cmd_render(&args[1..]),
+        Some("open") => cmd_open(&args[1..]),
+        Some("-h") | Some("--help") | Some("help") => {
             usage();
             ExitCode::SUCCESS
         }
-        // Bare path (e.g. `mdrdr .` or `mdrdr foo.md`) — shorthand for
-        // `open`. Lets the OS use `mdrdr` directly as a MIME handler
-        // and makes the CLI feel like less | bat | etc.
-        other if !other.starts_with('-') => cmd_open(&args),
+        // No args, or a bare path (`mdrdr .`, `mdrdr foo.md`) — run the
+        // `open` path. Lets the OS use `mdrdr` directly as a MIME handler
+        // and makes the CLI feel like `less` / `bat`.
+        None => cmd_open(&[]),
+        Some(other) if !other.starts_with('-') => cmd_open(&args),
         _ => usage(),
     }
 }
@@ -131,6 +130,42 @@ fn cmd_render(args: &[String]) -> ExitCode {
 }
 
 fn cmd_open(args: &[String]) -> ExitCode {
-    let arg = args.iter().find(|a| !a.starts_with("--")).cloned().map(PathBuf::from);
-    window::run(arg)
+    let mut path: Option<PathBuf> = None;
+    let mut api_enabled = false;
+    let mut api_port: u16 = 0;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--api" => {
+                api_enabled = true;
+            }
+            "--port" => {
+                i += 1;
+                match args.get(i).and_then(|s| s.parse::<u16>().ok()) {
+                    Some(p) => {
+                        api_port = p;
+                        api_enabled = true;
+                    }
+                    None => {
+                        eprintln!("--port expects a number 0..=65535");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            other if !other.starts_with('-') && path.is_none() => {
+                path = Some(PathBuf::from(other));
+            }
+            _ => {
+                eprintln!("unknown arg: {}", args[i]);
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+
+    window::run(window::WindowOptions {
+        path,
+        api_port: api_enabled.then_some(api_port),
+    })
 }

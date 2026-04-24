@@ -22,8 +22,16 @@ use crate::render::{measure, render, RenderInput, Viewport};
 use crate::tree::{TreeEntry, TreeKind};
 use crate::window::{click_at, Shared, UserEvent};
 
-pub fn spawn(shared: Arc<Shared>, proxy: EventLoopProxy<UserEvent>) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind localhost");
+/// Spawn the HTTP control API on `127.0.0.1:port`. Port `0` picks an
+/// ephemeral one. Returns the actually-bound port, or an `io::Error` if
+/// the port is taken — callers typically log-and-continue rather than
+/// crash the window.
+pub fn spawn(
+    shared: Arc<Shared>,
+    proxy: EventLoopProxy<UserEvent>,
+    port: u16,
+) -> std::io::Result<u16> {
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
     let port = listener.local_addr().unwrap().port();
 
     std::thread::Builder::new()
@@ -39,7 +47,7 @@ pub fn spawn(shared: Arc<Shared>, proxy: EventLoopProxy<UserEvent>) -> u16 {
         })
         .expect("spawn api thread");
 
-    port
+    Ok(port)
 }
 
 fn handle(
