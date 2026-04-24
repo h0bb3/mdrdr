@@ -522,10 +522,9 @@ impl ApplicationHandler<UserEvent> for App {
                 my = my.min(viewport.height as f32 - menu_h - 4.0).max(4.0);
                 {
                     let mut s = self.shared.state.lock().unwrap();
-                    // Cancel any in-progress selection — user asked for a menu,
-                    // not a text-selection rectangle.
-                    s.sel_anchor = None;
-                    s.sel_head = None;
+                    // Cancel an in-progress drag so the menu doesn't open mid-
+                    // rubber-band, but keep a completed selection alive so the
+                    // user can right-click → "Copy text".
                     s.is_selecting = false;
                     s.context_menu = Some(ContextMenu { x: mx, y: my, items, outline_items });
                 }
