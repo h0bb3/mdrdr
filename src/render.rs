@@ -45,7 +45,7 @@ impl Framebuffer {
         dst[3] = 255;
     }
 
-    fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: Rgba) {
+    pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: Rgba) {
         let x0 = x.max(0);
         let y0 = y.max(0);
         let x1 = (x + w).min(self.width as i32);
@@ -56,6 +56,42 @@ impl Framebuffer {
             }
         }
     }
+
+    /// Rasterize one glyph into the framebuffer. `baseline` is the text
+    /// baseline y; we use fontdue's `ymin` to place the bitmap above it.
+    pub fn draw_glyph(
+        &mut self,
+        f: &fontdue::Font,
+        ch: char,
+        size: f32,
+        x: f32,
+        baseline: f32,
+        color: Rgba,
+    ) {
+        let (metrics, bitmap) = f.rasterize(ch, size);
+        if metrics.width == 0 || metrics.height == 0 {
+            return;
+        }
+        let left = x as i32 + metrics.xmin;
+        let top = baseline as i32 - (metrics.height as i32 + metrics.ymin);
+        for gy in 0..metrics.height {
+            for gx in 0..metrics.width {
+                let a = bitmap[gy * metrics.width + gx];
+                if a > 0 {
+                    self.blend(left + gx as i32, top + gy as i32, color, a);
+                }
+            }
+        }
+    }
+}
+
+/// Sum of glyph advance widths for `text` at `size`, in the given font.
+pub fn measure_text_width(f: &fontdue::Font, text: &str, size: f32) -> f32 {
+    let mut w = 0.0;
+    for ch in text.chars() {
+        w += f.metrics(ch, size).advance_width;
+    }
+    w
 }
 
 pub struct RenderInput<'a> {

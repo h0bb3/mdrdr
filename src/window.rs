@@ -21,8 +21,8 @@ use crate::images::ImageCache;
 use crate::layout::HitAction;
 use crate::render::{
     compute_all_hit_targets, extract_selection, hit_test, in_scrollbar_strip,
-    in_sidebar_scrollbar_strip, measure, render, scrollbar_geom, sidebar_content_height,
-    sidebar_scrollbar_geom, RenderInput, SbGeom, Viewport,
+    in_sidebar_scrollbar_strip, measure, measure_text_width, render, scrollbar_geom,
+    sidebar_content_height, sidebar_scrollbar_geom, RenderInput, SbGeom, Viewport,
 };
 use crate::theme::Theme;
 use crate::tree::FileTree;
@@ -31,6 +31,22 @@ use crate::tree::FileTree;
 pub enum UserEvent {
     Redraw,
     Quit,
+}
+
+/// One row of the right-click context menu. Kept tiny: a label and the
+/// intent. New items extend `MenuAction`, not the struct.
+#[derive(Debug, Clone)]
+pub enum MenuAction {
+    ToggleTheme,
+}
+
+/// A context menu floating near the cursor. Coordinates are the top-left in
+/// screen space. Items are laid out top-to-bottom in insertion order.
+#[derive(Debug, Clone)]
+pub struct ContextMenu {
+    pub x: f32,
+    pub y: f32,
+    pub items: Vec<(String, MenuAction)>,
 }
 
 pub struct AppState {
@@ -77,6 +93,9 @@ pub struct AppState {
 
     /// When true, Theme::dark() is used for rendering instead of light.
     pub dark: bool,
+
+    /// Active right-click context menu. `None` when closed.
+    pub context_menu: Option<ContextMenu>,
 }
 
 pub struct Shared {
@@ -114,6 +133,7 @@ impl Shared {
             sidebar_zoom: s.sidebar_zoom,
             selection,
             hover_pos,
+            context_menu: s.context_menu.clone(),
         }
     }
 }
@@ -134,6 +154,7 @@ pub struct Snapshot {
     /// "quiet" state — not dragging, not selecting. Drawn hover highlights
     /// flicker if left on during active interaction.
     pub hover_pos: Option<(f32, f32)>,
+    pub context_menu: Option<ContextMenu>,
 }
 
 struct App {
@@ -230,7 +251,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                let (dragging_sidebar, dragging_scrollbar, dragging_sb_sidebar, selecting, scroll, grip, sb_sidebar_grip, sidebar_w, tree_visible, viewport) = {
+                let (dragging_sidebar, dragging_scrollbar, dragging_sb_sidebar, selecting, scroll, grip, sb_sidebar_grip, sidebar_w, tree_visible, viewport, menu_open) = {
                     let mut s = self.shared.state.lock().unwrap();
                     s.last_mouse = position;
                     (
@@ -244,8 +265,13 @@ impl ApplicationHandler<UserEvent> for App {
                         s.sidebar_width,
                         s.tree.is_some(),
                         s.viewport,
+                        s.context_menu.is_some(),
                     )
                 };
+                if menu_open {
+                    // Repaint so the hovered-row tint follows the cursor.
+                    self.request_redraw();
+                }
                 let cursor_changed = self.update_cursor(
                     position.x as f32,
                     position.y as f32,
@@ -315,12 +341,27 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                let (pos, sidebar_w, tree_visible, scroll, viewport) = {
+                let (pos, sidebar_w, tree_visible, scroll, viewport, menu) = {
                     let s = self.shared.state.lock().unwrap();
-                    (s.last_mouse, s.sidebar_width, s.tree.is_some(), s.scroll, s.viewport)
+                    (s.last_mouse, s.sidebar_width, s.tree.is_some(), s.scroll, s.viewport, s.context_menu.clone())
                 };
                 let x = pos.x as f32;
                 let y = pos.y as f32;
+
+                // 0. Context menu — if one is open, it captures this click.
+                //    Hit inside → execute item. Hit outside → just close.
+                if let Some(m) = menu.as_ref() {
+                    let hit = menu_item_hit(m, x, y, &self.shared.fonts);
+                    {
+                        let mut s = self.shared.state.lock().unwrap();
+                        s.context_menu = None;
+                    }
+                    if let Some(action) = hit {
+                        apply_menu_action(&self.shared, &action);
+                    }
+                    self.request_redraw();
+                    return;
+                }
 
                 // 1. Scrollbar (highest priority — it sits on top of content).
                 if let Some(g) = self.current_scrollbar_geom() {
@@ -395,6 +436,32 @@ impl ApplicationHandler<UserEvent> for App {
                     s.is_selecting = true;
                 }
                 self.clamp_scroll();
+                self.request_redraw();
+            }
+
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                // Open (or reposition) the context menu at the cursor. The
+                // menu is small and position-clamped to stay on-screen.
+                let (pos, viewport, dark) = {
+                    let s = self.shared.state.lock().unwrap();
+                    (s.last_mouse, s.viewport, s.dark)
+                };
+                let items = build_context_menu_items(dark);
+                let menu_w = context_menu_width(&items, &self.shared.fonts);
+                let menu_h = context_menu_height(&items);
+                let mut mx = pos.x as f32;
+                let mut my = pos.y as f32;
+                mx = mx.min(viewport.width as f32 - menu_w - 4.0).max(4.0);
+                my = my.min(viewport.height as f32 - menu_h - 4.0).max(4.0);
+                {
+                    let mut s = self.shared.state.lock().unwrap();
+                    // Cancel any in-progress selection — user asked for a menu,
+                    // not a text-selection rectangle.
+                    s.sel_anchor = None;
+                    s.sel_head = None;
+                    s.is_selecting = false;
+                    s.context_menu = Some(ContextMenu { x: mx, y: my, items });
+                }
                 self.request_redraw();
             }
 
@@ -485,6 +552,16 @@ impl ApplicationHandler<UserEvent> for App {
                         None
                     }
                     Key::Named(NamedKey::Escape) => {
+                        let had_menu = {
+                            let mut s = self.shared.state.lock().unwrap();
+                            let had = s.context_menu.is_some();
+                            s.context_menu = None;
+                            had
+                        };
+                        if had_menu {
+                            self.request_redraw();
+                            return;
+                        }
                         event_loop.exit();
                         return;
                     }
@@ -595,6 +672,21 @@ impl App {
         tree_visible: bool,
         _viewport: Viewport,
     ) -> bool {
+        // If the context menu is open and the cursor is over an item, show
+        // a pointer so users know the row is clickable.
+        let menu = self.shared.state.lock().unwrap().context_menu.clone();
+        if let Some(m) = menu {
+            let over_item = menu_item_hit(&m, x, y, &self.shared.fonts).is_some();
+            let icon = if over_item { CursorIcon::Pointer } else { CursorIcon::Default };
+            let changed = icon != self.cursor;
+            if changed {
+                if let Some(w) = &self.window {
+                    w.set_cursor(icon);
+                }
+                self.cursor = icon;
+            }
+            return changed;
+        }
         // Compute hover rect once so we can both pick the cursor and
         // notice when the hovered target changes between equal-cursor rects
         // (e.g., two adjacent tree rows both want CursorIcon::Pointer).
@@ -791,7 +883,7 @@ impl App {
         let snap = self.shared.snapshot();
         let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
         let mut images = self.shared.images.lock().unwrap();
-        let fb = render(
+        let mut fb = render(
             &RenderInput {
                 source: &snap.source,
                 viewport: Viewport { width: w, height: h },
@@ -811,6 +903,14 @@ impl App {
             &mut images,
         );
         drop(images);
+
+        if let Some(m) = &snap.context_menu {
+            let hover = {
+                let s = self.shared.state.lock().unwrap();
+                Some((s.last_mouse.x as f32, s.last_mouse.y as f32))
+            };
+            draw_context_menu(&mut fb, &snap.theme, &self.shared.fonts, m, hover);
+        }
 
         let mut buffer = surface.buffer_mut().unwrap();
         for (i, px) in fb.pixels.chunks_exact(4).enumerate() {
@@ -987,6 +1087,7 @@ pub fn run(arg: Option<PathBuf>) -> ExitCode {
             sidebar_zoom: 1.0,
             last_folder_click: None,
             dark: false,
+            context_menu: None,
         }),
     });
 
@@ -1013,6 +1114,114 @@ pub fn run(arg: Option<PathBuf>) -> ExitCode {
         Err(e) => {
             eprintln!("event loop error: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+// ───── context menu ────────────────────────────────────────────────────────
+
+const MENU_ITEM_H: f32 = 28.0;
+const MENU_FONT_SIZE: f32 = 14.0;
+const MENU_PAD_X: f32 = 14.0;
+const MENU_PAD_Y: f32 = 4.0;
+
+fn build_context_menu_items(dark: bool) -> Vec<(String, MenuAction)> {
+    // Label names the theme the click will *switch to*, not the current one.
+    let label = if dark { "Light Theme" } else { "Dark Theme" };
+    vec![(label.to_string(), MenuAction::ToggleTheme)]
+}
+
+fn context_menu_width(items: &[(String, MenuAction)], fonts: &Fonts) -> f32 {
+    let mut w = 0.0f32;
+    for (label, _) in items {
+        let lw = measure_text_width(&fonts.body, label, MENU_FONT_SIZE);
+        if lw > w {
+            w = lw;
+        }
+    }
+    (w + MENU_PAD_X * 2.0).max(140.0)
+}
+
+fn context_menu_height(items: &[(String, MenuAction)]) -> f32 {
+    MENU_PAD_Y * 2.0 + MENU_ITEM_H * items.len() as f32
+}
+
+/// Return the MenuAction at (x, y) or None if outside the menu box.
+fn menu_item_hit(m: &ContextMenu, x: f32, y: f32, fonts: &Fonts) -> Option<MenuAction> {
+    let w = context_menu_width(&m.items, fonts);
+    let h = context_menu_height(&m.items);
+    if x < m.x || x >= m.x + w || y < m.y || y >= m.y + h {
+        return None;
+    }
+    let local_y = y - m.y - MENU_PAD_Y;
+    let idx = (local_y / MENU_ITEM_H) as usize;
+    m.items.get(idx).map(|(_, a)| a.clone())
+}
+
+fn apply_menu_action(shared: &Arc<Shared>, action: &MenuAction) {
+    match action {
+        MenuAction::ToggleTheme => {
+            let mut s = shared.state.lock().unwrap();
+            s.dark = !s.dark;
+        }
+    }
+}
+
+/// Paint the menu (background panel + border + items) on top of the
+/// framebuffer. Highlights the hovered row so the selection is visible
+/// before committing a click.
+fn draw_context_menu(
+    fb: &mut crate::render::Framebuffer,
+    theme: &Theme,
+    fonts: &Fonts,
+    m: &ContextMenu,
+    hover: Option<(f32, f32)>,
+) {
+    let w = context_menu_width(&m.items, fonts);
+    let h = context_menu_height(&m.items);
+    let x0 = m.x as i32;
+    let y0 = m.y as i32;
+    let wi = w.ceil() as i32;
+    let hi = h.ceil() as i32;
+
+    // Drop shadow — a soft offset rect underneath.
+    let shadow: crate::theme::Rgba = [0, 0, 0, 60];
+    fb.fill_rect(x0 + 2, y0 + 3, wi, hi, shadow);
+    // Panel.
+    fb.fill_rect(x0, y0, wi, hi, theme.sidebar_bg);
+    // Border (1px on each edge, using muted color).
+    let border = theme.muted;
+    fb.fill_rect(x0, y0, wi, 1, border);
+    fb.fill_rect(x0, y0 + hi - 1, wi, 1, border);
+    fb.fill_rect(x0, y0, 1, hi, border);
+    fb.fill_rect(x0 + wi - 1, y0, 1, hi, border);
+
+    // Hover row.
+    let hover_idx = hover.and_then(|(hx, hy)| {
+        if hx < m.x || hx >= m.x + w || hy < m.y || hy >= m.y + h {
+            return None;
+        }
+        let local_y = hy - m.y - MENU_PAD_Y;
+        let idx = (local_y / MENU_ITEM_H) as usize;
+        if idx < m.items.len() { Some(idx) } else { None }
+    });
+
+    for (i, (label, _)) in m.items.iter().enumerate() {
+        let iy = m.y + MENU_PAD_Y + MENU_ITEM_H * i as f32;
+        if Some(i) == hover_idx {
+            fb.fill_rect(
+                (m.x + 1.0) as i32,
+                iy as i32,
+                (w - 2.0) as i32,
+                MENU_ITEM_H as i32,
+                theme.sidebar_active_bg,
+            );
+        }
+        let baseline = iy + MENU_ITEM_H * 0.5 + MENU_FONT_SIZE * 0.35;
+        let mut cx = m.x + MENU_PAD_X;
+        for ch in label.chars() {
+            fb.draw_glyph(&fonts.body, ch, MENU_FONT_SIZE, cx, baseline, theme.fg);
+            cx += fonts.body.metrics(ch, MENU_FONT_SIZE).advance_width;
         }
     }
 }

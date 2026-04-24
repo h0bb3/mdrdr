@@ -373,14 +373,19 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
             let gap_n = per_layer.len().saturating_sub(1);
             let mut gap_w: Vec<f32> = vec![h_gap; gap_n];
             let lbl_size = label_size * 0.85;
-            let pad = 4.0;
+            let chip_pad = 4.0;
+            // Arrow has to span: node edge → chip start → chip → chip end →
+            // arrowhead + node. We want generous breathing room on both sides
+            // of the chip so the arrowhead and source node don't crowd the
+            // label.
+            let breathing = 28.0;
             for e in &graph.edges {
                 let Some(lab) = e.label.as_deref() else { continue };
                 let (lw, _lh) = measure_label(lab, lbl_size, font);
                 let from_layer = *layers.get(&e.from).unwrap_or(&0);
                 let to_layer = *layers.get(&e.to).unwrap_or(&0);
                 if to_layer > from_layer && from_layer < gap_w.len() {
-                    let need = lw + pad * 2.0 + 20.0;
+                    let need = lw + chip_pad * 2.0 + breathing * 2.0;
                     if need > gap_w[from_layer] {
                         gap_w[from_layer] = need;
                     }
