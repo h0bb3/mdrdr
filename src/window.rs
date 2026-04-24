@@ -849,6 +849,18 @@ impl App {
                 }
                 self.after_search_query_change();
             }
+            Key::Named(NamedKey::Space) => {
+                // winit reports Space as a Named key, not Character(" "),
+                // so it has its own arm.
+                {
+                    let mut s = self.shared.state.lock().unwrap();
+                    if let Some(su) = &mut s.search {
+                        su.query.push(' ');
+                        su.current = 0;
+                    }
+                }
+                self.after_search_query_change();
+            }
             Key::Character(txt) => {
                 // Skip control chars. Append the string (usually one char).
                 let mut changed = false;
@@ -1712,16 +1724,50 @@ fn draw_search_ui(
     fb.fill_rect(ix as i32, iy as i32, 1, ih as i32, theme.muted);
     fb.fill_rect(ix as i32 + iw as i32 - 1, iy as i32, 1, ih as i32, theme.muted);
 
-    // Query text + blinking-less cursor caret at the end.
+    // Query text + blinking-less cursor caret at the end. When the query
+    // outgrows the input, drop leading chars so the tail (and caret)
+    // remain visible — standard text-input behaviour.
     let baseline = iy + ih * 0.5 + SEARCH_FONT_SIZE * 0.35;
-    let mut cx = ix + 6.0;
-    for ch in su.query.chars() {
+    let text_left = ix + 6.0;
+    let text_right = ix + iw - 8.0;  // reserve ~2px before the right border + 6px caret room
+    let avail_w = (text_right - text_left).max(0.0);
+    let chars: Vec<char> = su.query.chars().collect();
+    // Scan right-to-left and keep every char that still fits.
+    let mut widths: Vec<f32> = Vec::with_capacity(chars.len());
+    let mut total = 0.0;
+    for ch in chars.iter().rev() {
+        let font = if crate::font::is_emoji(*ch) { &fonts.emoji } else { &fonts.body };
+        let w = font.metrics(*ch, SEARCH_FONT_SIZE).advance_width;
+        total += w;
+        widths.push(w);
+    }
+    let mut start_idx = 0;
+    if total > avail_w && !chars.is_empty() {
+        let mut acc = 0.0;
+        for (k, w) in widths.iter().enumerate() {
+            acc += w;
+            if acc > avail_w {
+                // Drop this char and everything before it — it no longer fits.
+                start_idx = chars.len() - k;
+                break;
+            }
+        }
+    }
+    let mut cx = text_left;
+    for &ch in &chars[start_idx..] {
         let font = if crate::font::is_emoji(ch) { &fonts.emoji } else { &fonts.body };
         fb.draw_glyph(font, ch, SEARCH_FONT_SIZE, cx, baseline, theme.fg);
         cx += font.metrics(ch, SEARCH_FONT_SIZE).advance_width;
     }
-    // Cursor at end.
-    fb.fill_rect(cx as i32, (baseline - SEARCH_FONT_SIZE * 0.85) as i32, 1, SEARCH_FONT_SIZE as i32, theme.fg);
+    // Caret right after the last drawn char; clamp inside the input.
+    let caret_x = cx.min(text_right);
+    fb.fill_rect(
+        caret_x as i32,
+        (baseline - SEARCH_FONT_SIZE * 0.85) as i32,
+        1,
+        SEARCH_FONT_SIZE as i32,
+        theme.fg,
+    );
 
     // Match count "n / N" right of the input. `0 / 0` when there are none
     // rather than a wordy "no matches" — keeps the width stable while
