@@ -78,6 +78,24 @@ pub enum Placed {
         p3: (f32, f32),
         color: Rgba,
     },
+    /// Filled ellipse. Border is done by stacking two — outer in stroke
+    /// color, inner inset by the stroke thickness in fill color.
+    Ellipse {
+        cx: f32,
+        cy: f32,
+        rx: f32,
+        ry: f32,
+        color: Rgba,
+    },
+    /// Filled rounded rectangle. Same stacking trick for borders.
+    RoundRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radius: f32,
+        color: Rgba,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1378,6 +1396,12 @@ fn shift_placed(p: Placed, dx: f32, dy: f32) -> Placed {
             p2: (p2.0 + dx, p2.1 + dy),
             p3: (p3.0 + dx, p3.1 + dy),
             color,
+        },
+        Placed::Ellipse { cx, cy, rx, ry, color } => Placed::Ellipse {
+            cx: cx + dx, cy: cy + dy, rx, ry, color,
+        },
+        Placed::RoundRect { x, y, w, h, radius, color } => Placed::RoundRect {
+            x: x + dx, y: y + dy, w, h, radius, color,
         },
     }
 }

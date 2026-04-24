@@ -439,7 +439,7 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
         if let Some(n) = graph.nodes.get(id) {
             let (nx, ny, nw, nh) = (n.x * scale, n.y * scale, n.w * scale, n.h * scale);
             match n.shape {
-                Shape::Rect | Shape::Rounded => {
+                Shape::Rect => {
                     items.push(Placed::Rect { x: nx, y: ny, w: nw, h: nh, color: fill });
                     let t = 1.5 * scale;
                     items.push(Placed::Rect { x: nx, y: ny, w: nw, h: t, color: stroke });
@@ -447,15 +447,37 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
                     items.push(Placed::Rect { x: nx, y: ny, w: t, h: nh, color: stroke });
                     items.push(Placed::Rect { x: nx + nw - t, y: ny, w: t, h: nh, color: stroke });
                 }
+                Shape::Rounded => {
+                    // Fill + smaller fill inset by the stroke thickness =
+                    // a bordered rounded rect without needing a dedicated
+                    // stroke primitive.
+                    let t = 1.5 * scale;
+                    let radius = nh.min(nw) * 0.22;
+                    items.push(Placed::RoundRect {
+                        x: nx, y: ny, w: nw, h: nh, radius, color: stroke,
+                    });
+                    items.push(Placed::RoundRect {
+                        x: nx + t, y: ny + t,
+                        w: (nw - 2.0 * t).max(0.0), h: (nh - 2.0 * t).max(0.0),
+                        radius: (radius - t).max(0.0),
+                        color: fill,
+                    });
+                }
                 Shape::Circle => {
-                    // Render as rect with thicker border — a proper disc needs
-                    // a primitive we don't have yet. Still reads as distinct.
-                    items.push(Placed::Rect { x: nx, y: ny, w: nw, h: nh, color: fill });
-                    let t = 2.5 * scale;
-                    items.push(Placed::Rect { x: nx, y: ny, w: nw, h: t, color: stroke });
-                    items.push(Placed::Rect { x: nx, y: ny + nh - t, w: nw, h: t, color: stroke });
-                    items.push(Placed::Rect { x: nx, y: ny, w: t, h: nh, color: stroke });
-                    items.push(Placed::Rect { x: nx + nw - t, y: ny, w: t, h: nh, color: stroke });
+                    // True ellipse (circle when w == h). Outer = stroke,
+                    // inner = fill inset by the stroke thickness.
+                    let t = 1.5 * scale;
+                    let cx = nx + nw / 2.0;
+                    let cy = ny + nh / 2.0;
+                    items.push(Placed::Ellipse {
+                        cx, cy, rx: nw / 2.0, ry: nh / 2.0, color: stroke,
+                    });
+                    items.push(Placed::Ellipse {
+                        cx, cy,
+                        rx: (nw / 2.0 - t).max(0.0),
+                        ry: (nh / 2.0 - t).max(0.0),
+                        color: fill,
+                    });
                 }
                 Shape::Diamond => {
                     let cx = nx + nw / 2.0;

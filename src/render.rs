@@ -678,8 +678,108 @@ fn draw_items(
                 let p3s = (p3.0, p3.1 - scroll);
                 fill_triangle(fb, p1s, p2s, p3s, *color);
             }
+            Placed::Ellipse { cx, cy, rx, ry, color } => {
+                let screen_cy = *cy - scroll;
+                if screen_cy + *ry < 0.0 || screen_cy - *ry > vh {
+                    continue;
+                }
+                fill_ellipse(fb, *cx, screen_cy, *rx, *ry, *color);
+            }
+            Placed::RoundRect { x, y, w, h, radius, color } => {
+                let screen_y = *y - scroll;
+                if screen_y + *h < 0.0 || screen_y > vh {
+                    continue;
+                }
+                fill_round_rect(fb, *x, screen_y, *w, *h, *radius, *color);
+            }
         }
     }
+}
+
+/// Filled ellipse with 4× subpixel AA on the edge pixels.
+fn fill_ellipse(fb: &mut Framebuffer, cx: f32, cy: f32, rx: f32, ry: f32, color: Rgba) {
+    let rx = rx.max(0.001);
+    let ry = ry.max(0.001);
+    let x0 = (cx - rx).floor() as i32;
+    let x1 = (cx + rx).ceil() as i32;
+    let y0 = (cy - ry).floor() as i32;
+    let y1 = (cy + ry).ceil() as i32;
+    for py in y0..=y1 {
+        for px in x0..=x1 {
+            let mut hits = 0u16;
+            for sy in 0..2 {
+                for sx in 0..2 {
+                    let x = px as f32 + 0.25 + 0.5 * sx as f32;
+                    let y = py as f32 + 0.25 + 0.5 * sy as f32;
+                    let dx = (x - cx) / rx;
+                    let dy = (y - cy) / ry;
+                    if dx * dx + dy * dy <= 1.0 {
+                        hits += 1;
+                    }
+                }
+            }
+            if hits > 0 {
+                let a = (hits * 255 / 4) as u8;
+                fb.blend(px, py, color, a);
+            }
+        }
+    }
+}
+
+/// Filled rounded rectangle. Radius is clamped to min(w, h) / 2 so a
+/// radius of w/2 yields a proper capsule. 4× subpixel AA on corners.
+fn fill_round_rect(fb: &mut Framebuffer, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Rgba) {
+    let r = radius.clamp(0.0, w.min(h) * 0.5);
+    let x0 = x.floor() as i32;
+    let x1 = (x + w).ceil() as i32;
+    let y0 = y.floor() as i32;
+    let y1 = (y + h).ceil() as i32;
+    // Fast path: interior band — no corner work needed.
+    let inner_top = (y + r).ceil() as i32;
+    let inner_bot = (y + h - r).floor() as i32;
+    for py in y0..=y1 {
+        let in_inner_band = py >= inner_top && py < inner_bot;
+        for px in x0..=x1 {
+            if in_inner_band {
+                // Fully inside the body; only the left/right straight edges
+                // need clipping against the outer rect.
+                if (px as f32) + 1.0 > x && (px as f32) < x + w {
+                    fb.blend(px, py, color, 255);
+                }
+                continue;
+            }
+            let mut hits = 0u16;
+            for sy in 0..2 {
+                for sx in 0..2 {
+                    let sxf = px as f32 + 0.25 + 0.5 * sx as f32;
+                    let syf = py as f32 + 0.25 + 0.5 * sy as f32;
+                    if point_in_round_rect(sxf, syf, x, y, w, h, r) {
+                        hits += 1;
+                    }
+                }
+            }
+            if hits > 0 {
+                let a = (hits * 255 / 4) as u8;
+                fb.blend(px, py, color, a);
+            }
+        }
+    }
+}
+
+fn point_in_round_rect(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32, r: f32) -> bool {
+    if px < x || px > x + w || py < y || py > y + h {
+        return false;
+    }
+    // Inside main body (one of the straight bands)?
+    if (px >= x + r && px <= x + w - r) || (py >= y + r && py <= y + h - r) {
+        return true;
+    }
+    // In a corner — test distance to the corner circle's centre.
+    let cx = if px < x + r { x + r } else { x + w - r };
+    let cy = if py < y + r { y + r } else { y + h - r };
+    let dx = px - cx;
+    let dy = py - cy;
+    dx * dx + dy * dy <= r * r
 }
 
 fn draw_line(fb: &mut Framebuffer, x1: f32, y1: f32, x2: f32, y2: f32, thickness: f32, color: Rgba) {
