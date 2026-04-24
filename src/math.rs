@@ -537,25 +537,45 @@ fn layout_delim(
         x: r.x + l_w, y: r.y, w: r.w, h: r.h,
     }).collect();
 
-    // Delim glyphs: render at their natural baseline (y = 0). fontdue will
-    // place the larger paren bitmap relative to that, which gives an
-    // approximately centered result — good enough for our notes.
-    if let Some((ch, _)) = l_glyph {
-        glyphs.insert(0, MathGlyph { ch, x: 0.0, y: 0.0, size: delim_size, font: font_id });
-    }
-    if let Some((ch, _)) = r_glyph {
-        glyphs.push(MathGlyph { ch, x: l_w + b.width, y: 0.0, size: delim_size, font: font_id });
+    // Centre each delim on the content's vertical midline. A paren glyph's
+    // natural visual centre (drawn at y=0) sits at math-y = -(ymin+height/2)
+    // — i.e. well above the baseline. For a tall fraction whose content is
+    // symmetric about the baseline, drawing the paren at y=0 leaves the
+    // inner equation visibly low inside the delim. Shifting the paren
+    // baseline down by (ymin + height/2 + axis_y) lines the paren's centre
+    // up with the content's centre.
+    let axis_y = (b.descent - b.ascent) * 0.5;
+
+    fn centre_y(m: &fontdue::Metrics, axis_y: f32) -> f32 {
+        axis_y + m.ymin as f32 + m.height as f32 * 0.5
     }
 
-    // The scaled delim may stick above/below the inner — widen the box.
-    let delim_asc = delim_size * 0.75;
-    let delim_desc = delim_size * 0.25;
+    let mut asc = b.ascent;
+    let mut desc = b.descent;
+    if let Some((ch, ref m)) = l_glyph {
+        let cy = centre_y(m, axis_y);
+        // Glyph extents in math-y terms (negative = above baseline).
+        let top_math_y = cy - (m.ymin as f32 + m.height as f32);
+        let bot_math_y = cy - m.ymin as f32;
+        asc = asc.max(-top_math_y);
+        desc = desc.max(bot_math_y);
+        glyphs.insert(0, MathGlyph { ch, x: 0.0, y: cy, size: delim_size, font: font_id });
+    }
+    if let Some((ch, ref m)) = r_glyph {
+        let cy = centre_y(m, axis_y);
+        let top_math_y = cy - (m.ymin as f32 + m.height as f32);
+        let bot_math_y = cy - m.ymin as f32;
+        asc = asc.max(-top_math_y);
+        desc = desc.max(bot_math_y);
+        glyphs.push(MathGlyph { ch, x: l_w + b.width, y: cy, size: delim_size, font: font_id });
+    }
+
     MathBox {
         glyphs,
         rules,
         width: l_w + b.width + r_w,
-        ascent: b.ascent.max(delim_asc),
-        descent: b.descent.max(delim_desc),
+        ascent: asc,
+        descent: desc,
         italic_tail: false,
     }
 }
