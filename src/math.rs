@@ -29,6 +29,10 @@ pub struct MathBox {
     pub width: f32,
     pub ascent: f32,   // positive, distance from baseline up to top
     pub descent: f32,  // positive, distance from baseline down to bottom
+    /// True if the rightmost baseline-resident glyph is italic. Lets a
+    /// following superscript apply italic correction — even when the ink
+    /// order has an accent glyph (ˆ, ¯, …) appended after the italic base.
+    pub italic_tail: bool,
 }
 
 pub struct MathGlyph {
@@ -406,6 +410,7 @@ fn layout_node(node: &Node, size: f32, fonts: &Fonts) -> MathBox {
         }
         Node::Space(em) => MathBox {
             glyphs: vec![], rules: vec![], width: em * size, ascent: 0.0, descent: 0.0,
+            italic_tail: false,
         },
         Node::Delim { left, right, inner } => layout_delim(*left, *right, inner, size, fonts),
         Node::BigDelim { ch, scale } => layout_big_delim(*ch, *scale, size, fonts),
@@ -431,7 +436,7 @@ fn layout_upright_run(s: &str, size: f32, fonts: &Fonts) -> MathBox {
         asc = asc.max(glyph_top).max(line_asc * 0.6);
         desc = desc.max(glyph_bot).max(line_desc * 0.2);
     }
-    MathBox { glyphs, rules: vec![], width: x, ascent: asc, descent: desc }
+    MathBox { glyphs, rules: vec![], width: x, ascent: asc, descent: desc, italic_tail: false }
 }
 
 fn layout_accent(kind: AccentKind, base: &Node, size: f32, fonts: &Fonts) -> MathBox {
@@ -439,38 +444,54 @@ fn layout_accent(kind: AccentKind, base: &Node, size: f32, fonts: &Fonts) -> Mat
     let mut glyphs = b.glyphs;
     let rules = b.rules;
 
-    // Pick a spacing-mark character that lives mostly above its baseline.
-    // Size is slightly smaller than the base so it reads as a mark, not a digit.
-    let asize = size * 0.85;
-    let ch = match kind {
-        AccentKind::Hat   => 'ˆ',
-        AccentKind::Tilde => '˜',
-        AccentKind::Bar   => '¯',
-        AccentKind::Vec   => '→',
-        AccentKind::Dot   => '˙',
-        AccentKind::Ddot  => '¨',
+    // Two families of mark glyph:
+    //
+    //  * modifier letters (ˆ ˜ ¯ ˙ ¨) — their bitmap already sits above their
+    //    own baseline (ymin > 0). Rendering them at y=0 lands them roughly at
+    //    cap-height. We only shift upward when a *tall* base (P, f, ℓ…) would
+    //    otherwise collide with the mark's bitmap bottom.
+    //
+    //  * the arrow → for \vec — a normal-body glyph that sits on its baseline,
+    //    so we lift it explicitly above the base's ascent.
+    let (ch, asize, is_modifier) = match kind {
+        AccentKind::Hat   => ('ˆ', size * 1.0, true),
+        AccentKind::Tilde => ('˜', size * 1.0, true),
+        AccentKind::Bar   => ('¯', size * 1.0, true),
+        AccentKind::Dot   => ('˙', size * 1.1, true),
+        AccentKind::Ddot  => ('¨', size * 1.1, true),
+        AccentKind::Vec   => ('→', size * 0.7,  false),
     };
     let font_id = FontId::Body;
     let f = pick_font(fonts, font_id);
     let m = f.metrics(ch, asize);
 
-    // Centre the mark horizontally on the base's advance width.
+    // Centre the mark on the base's advance width. (For modifier letters the
+    // advance width tracks the ink extent reasonably well.)
     let cx = (b.width - m.advance_width) / 2.0;
-    // Place the mark's baseline just above the base's ascent so the glyph
-    // sits in the gap. Small gap so wide accents (like → for \vec) don't
-    // visually collide with tall base glyphs.
-    let gap = size * 0.04;
-    let cy = -(b.ascent + gap);
 
-    let glyph_ascent = (m.ymin as f32 + m.height as f32).max(0.0);
+    let gap = size * 0.05;
+    let cy = if is_modifier {
+        // Modifier's bitmap bottom sits at (−ymin) in math coords at cy=0.
+        // Lift only if base pokes above that line; otherwise the mark is
+        // already comfortably seated above cap-height.
+        let bitmap_bottom_at_zero = -(m.ymin as f32);
+        let target_bottom = -(b.ascent + gap);
+        (target_bottom - bitmap_bottom_at_zero).min(0.0)
+    } else {
+        -(b.ascent + gap)
+    };
+
+    // Glyph bitmap top in math coords (negative = up). Used for ascent.
+    let glyph_top_math_y = cy - (m.ymin as f32 + m.height as f32);
     glyphs.push(MathGlyph { ch, x: cx, y: cy, size: asize, font: font_id });
 
     MathBox {
         glyphs,
         rules,
         width: b.width,
-        ascent: b.ascent + gap + glyph_ascent,
+        ascent: b.ascent.max(-glyph_top_math_y),
         descent: b.descent,
+        italic_tail: b.italic_tail,
     }
 }
 
@@ -535,6 +556,7 @@ fn layout_delim(
         width: l_w + b.width + r_w,
         ascent: b.ascent.max(delim_asc),
         descent: b.descent.max(delim_desc),
+        italic_tail: false,
     }
 }
 
@@ -550,6 +572,7 @@ fn layout_big_delim(ch: char, scale: f32, size: f32, fonts: &Fonts) -> MathBox {
         width: m.advance_width,
         ascent: dsize * 0.75,
         descent: dsize * 0.25,
+        italic_tail: false,
     }
 }
 
@@ -592,6 +615,7 @@ fn layout_atom(ch: char, italic: bool, size: f32, fonts: &Fonts) -> MathBox {
         width: m.advance_width,
         ascent: a,
         descent: d,
+        italic_tail: italic,
     }
 }
 
@@ -601,6 +625,7 @@ fn layout_row_items(items: &[Node], size: f32, fonts: &Fonts) -> MathBox {
     let mut x = 0.0;
     let mut asc: f32 = 0.0;
     let mut desc: f32 = 0.0;
+    let mut italic_tail = false;
     for (i, node) in items.iter().enumerate() {
         let mut b = layout_node(node, size, fonts);
         // Optional spacing between ops and operands — skip for now; LaTeX's mu-spacing is intricate.
@@ -618,8 +643,9 @@ fn layout_row_items(items: &[Node], size: f32, fonts: &Fonts) -> MathBox {
         x += b.width;
         asc = asc.max(b.ascent);
         desc = desc.max(b.descent);
+        italic_tail = b.italic_tail;  // only the last item matters
     }
-    MathBox { glyphs, rules, width: x, ascent: asc, descent: desc }
+    MathBox { glyphs, rules, width: x, ascent: asc, descent: desc, italic_tail }
 }
 
 fn needs_kern(prev: &Node, cur: &Node) -> bool {
@@ -677,7 +703,7 @@ fn layout_frac(n: &Node, d: &Node, size: f32, fonts: &Fonts) -> MathBox {
 
     let ascent = -num_baseline + num.ascent;
     let descent = den_baseline + den.descent;
-    MathBox { glyphs, rules, width, ascent, descent }
+    MathBox { glyphs, rules, width, ascent, descent, italic_tail: false }
 }
 
 fn layout_sqrt(inner: &Node, size: f32, fonts: &Fonts) -> MathBox {
@@ -713,34 +739,55 @@ fn layout_sqrt(inner: &Node, size: f32, fonts: &Fonts) -> MathBox {
         width,
         ascent: i_box.ascent + overline_h * 1.8,
         descent: i_box.descent,
+        italic_tail: false,
     }
+}
+
+// Script size vs base size — LaTeX's `scriptstyle` is ~0.7; bumping it down
+// a notch makes sub/sup feel like exponents instead of crowding the base.
+const SCRIPT_SCALE: f32 = 0.66;
+// Vertical shifts. Chosen so a sup with descenders (p, g, y) clears a sub
+// with ascenders (h, l, b, d) by ~0.15em — no more touching.
+const SUP_SHIFT: f32 = 0.55;
+const SUB_SHIFT: f32 = 0.26;
+
+/// Italic letters (f, q, y, …) slant to the right at the top, so a
+/// superscript glued to the right edge of the advance box runs into the
+/// base's slant. LaTeX solves this with an "italic correction" kern before
+/// the superscript. We apply the same nudge whenever the base's italic_tail
+/// flag is set — which survives through accents like \hat{f} (where the
+/// *drawn* last glyph is the accent mark, not the italic base).
+fn italic_correction(b: &MathBox, size: f32) -> f32 {
+    if b.italic_tail { size * 0.14 } else { 0.0 }
 }
 
 fn layout_sup(base: &Node, exp: &Node, size: f32, fonts: &Fonts) -> MathBox {
     let b = layout_node(base, size, fonts);
-    let e = layout_node(exp, size * 0.7, fonts);
-    let shift_up = size * 0.45;
+    let e = layout_node(exp, size * SCRIPT_SCALE, fonts);
+    let shift_up = size * SUP_SHIFT;
+    let ic = italic_correction(&b, size);
     let mut glyphs = b.glyphs;
     let mut rules = b.rules;
     for g in &e.glyphs {
-        glyphs.push(MathGlyph { ch: g.ch, x: g.x + b.width, y: g.y - shift_up, size: g.size, font: g.font });
+        glyphs.push(MathGlyph { ch: g.ch, x: g.x + b.width + ic, y: g.y - shift_up, size: g.size, font: g.font });
     }
     for r in &e.rules {
-        rules.push(MathRule { x: r.x + b.width, y: r.y - shift_up, w: r.w, h: r.h });
+        rules.push(MathRule { x: r.x + b.width + ic, y: r.y - shift_up, w: r.w, h: r.h });
     }
     MathBox {
         glyphs,
         rules,
-        width: b.width + e.width,
+        width: b.width + ic + e.width,
         ascent: b.ascent.max(e.ascent + shift_up),
         descent: b.descent,
+        italic_tail: false,
     }
 }
 
 fn layout_sub(base: &Node, sub: &Node, size: f32, fonts: &Fonts) -> MathBox {
     let b = layout_node(base, size, fonts);
-    let s = layout_node(sub, size * 0.7, fonts);
-    let shift_down = size * 0.18;
+    let s = layout_node(sub, size * SCRIPT_SCALE, fonts);
+    let shift_down = size * SUB_SHIFT;
     let mut glyphs = b.glyphs;
     let mut rules = b.rules;
     for g in &s.glyphs {
@@ -755,23 +802,27 @@ fn layout_sub(base: &Node, sub: &Node, size: f32, fonts: &Fonts) -> MathBox {
         width: b.width + s.width,
         ascent: b.ascent,
         descent: b.descent.max(s.descent + shift_down),
+        italic_tail: false,
     }
 }
 
 fn layout_subsup(base: &Node, sub: &Node, sup: &Node, size: f32, fonts: &Fonts) -> MathBox {
     let b = layout_node(base, size, fonts);
-    let sp = layout_node(sup, size * 0.7, fonts);
-    let sb = layout_node(sub, size * 0.7, fonts);
-    let shift_up = size * 0.45;
-    let shift_down = size * 0.18;
-    let sx_w = sp.width.max(sb.width);
+    let sp = layout_node(sup, size * SCRIPT_SCALE, fonts);
+    let sb = layout_node(sub, size * SCRIPT_SCALE, fonts);
+    let shift_up = size * SUP_SHIFT;
+    let shift_down = size * SUB_SHIFT;
+    // Italic correction only applies to the sup (which climbs into the
+    // italic slant); the sub sits below the baseline, out of the way.
+    let ic = italic_correction(&b, size);
+    let sx_w = (sp.width + ic).max(sb.width);
     let mut glyphs = b.glyphs;
     let mut rules = b.rules;
     for g in &sp.glyphs {
-        glyphs.push(MathGlyph { ch: g.ch, x: g.x + b.width, y: g.y - shift_up, size: g.size, font: g.font });
+        glyphs.push(MathGlyph { ch: g.ch, x: g.x + b.width + ic, y: g.y - shift_up, size: g.size, font: g.font });
     }
     for r in &sp.rules {
-        rules.push(MathRule { x: r.x + b.width, y: r.y - shift_up, w: r.w, h: r.h });
+        rules.push(MathRule { x: r.x + b.width + ic, y: r.y - shift_up, w: r.w, h: r.h });
     }
     for g in &sb.glyphs {
         glyphs.push(MathGlyph { ch: g.ch, x: g.x + b.width, y: g.y + shift_down, size: g.size, font: g.font });
@@ -785,5 +836,6 @@ fn layout_subsup(base: &Node, sub: &Node, sup: &Node, size: f32, fonts: &Fonts) 
         width: b.width + sx_w,
         ascent: b.ascent.max(sp.ascent + shift_up),
         descent: b.descent.max(sb.descent + shift_down),
+        italic_tail: false,
     }
 }
