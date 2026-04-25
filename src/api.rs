@@ -117,7 +117,7 @@ fn state_json(shared: &Arc<Shared>) -> String {
         .map(|t| format!("\"{}\"", json_escape(&t.root.display().to_string())))
         .unwrap_or_else(|| "null".to_string());
     format!(
-        "{{\"source_path\":{path_json},\"scroll\":{:.3},\"viewport\":{{\"w\":{},\"h\":{}}},\"source_len\":{},\"tree_root\":{root_json},\"sidebar_width\":{:.1},\"sidebar_scroll\":{:.3},\"content_zoom\":{:.3},\"sidebar_zoom\":{:.3},\"dark\":{}}}",
+        "{{\"source_path\":{path_json},\"scroll\":{:.3},\"viewport\":{{\"w\":{},\"h\":{}}},\"source_len\":{},\"tree_root\":{root_json},\"sidebar_width\":{:.1},\"sidebar_scroll\":{:.3},\"content_zoom\":{:.3},\"sidebar_zoom\":{:.3},\"text_column_width\":{:.1},\"text_column_offset_x\":{:.1},\"dark\":{}}}",
         s.scroll,
         s.viewport.width,
         s.viewport.height,
@@ -126,6 +126,8 @@ fn state_json(shared: &Arc<Shared>) -> String {
         s.sidebar_scroll,
         s.content_zoom,
         s.sidebar_zoom,
+        s.text_column_width,
+        s.text_column_offset_x,
         s.dark,
     )
 }
@@ -201,6 +203,8 @@ fn screenshot(
                 current: if s.match_count > 0 { Some(s.current) } else { None },
             }),
             mermaid_overrides: Some(&snap.mermaid_overrides),
+            text_column_width: snap.text_column_width,
+            text_column_offset_x: snap.text_column_offset_x,
         },
         &mut images,
     );
@@ -449,6 +453,8 @@ fn do_hits(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> 
                 hover_pos: None,
                 search: None,
                 mermaid_overrides: None,
+            text_column_width: f32::INFINITY,
+            text_column_offset_x: 0.0,
             },
             &mut images,
         )
@@ -562,6 +568,8 @@ fn do_copy(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> 
                 hover_pos: None,
                 search: None,
                 mermaid_overrides: None,
+            text_column_width: f32::INFINITY,
+            text_column_offset_x: 0.0,
             },
             &mut images,
         )

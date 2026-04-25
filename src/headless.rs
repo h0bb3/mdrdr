@@ -44,6 +44,8 @@ pub fn render_to_png(
             hover_pos: None,
             search: None,
             mermaid_overrides: None,
+            text_column_width: f32::INFINITY,
+            text_column_offset_x: 0.0,
         },
         &mut images,
     );

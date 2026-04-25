@@ -234,6 +234,16 @@ pub struct LayoutInput<'a> {
     /// 0-based position in document order. Absent = use whatever the
     /// source header says.
     pub mermaid_overrides: Option<&'a std::collections::HashMap<usize, crate::mermaid::Direction>>,
+    /// Maximum width of the *text* column (paragraphs, headings, lists,
+    /// blockquotes, thematic rules). Code blocks, tables, images and
+    /// diagrams stay at the full content width regardless. `f32::INFINITY`
+    /// (or any value ≥ content width) means no narrowing.
+    pub text_column_width: f32,
+    /// Horizontal offset of the text column from the content area's left
+    /// edge. Lets the user shift the narrow column left/right with
+    /// Ctrl+Shift+arrow keys. Clamped against the content area at
+    /// layout time.
+    pub text_column_offset_x: f32,
 }
 
 pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
@@ -250,6 +260,16 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
 
     let content_left = sidebar_width + input.theme.margin_x;
     let content_right = (input.viewport_w as f32) - input.theme.margin_x;
+
+    // Compute the narrow text-column edges. The column starts at
+    // `content_left + offset_x` (clamped inside content), runs for
+    // `text_column_width` (clamped against the right edge). When the
+    // viewport is too narrow for the requested column we just use
+    // whatever's available — no negative-width columns.
+    let text_left_unclamped = content_left + input.text_column_offset_x.max(0.0);
+    let text_left = text_left_unclamped.min(content_right);
+    let text_avail = (content_right - text_left).max(0.0);
+    let text_right = text_left + input.text_column_width.max(0.0).min(text_avail);
 
     // Content panel uses a zoomed copy of the theme. Margins, colors, and
     // line-height multiplier stay fixed so the page geometry doesn't jump
@@ -282,6 +302,18 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
             mermaid_overrides: input.mermaid_overrides,
         };
         for b in input.blocks {
+            // Top-level blocks pick their layout column based on type:
+            // text-flow blocks go in the narrow reading column, "media"
+            // blocks (code, tables, mermaid, display math) span the
+            // full content area. Nested blocks inside lists / quotes
+            // inherit whichever column the outer container picked.
+            if is_text_block(b) {
+                ctx.content_left = text_left;
+                ctx.content_right = text_right;
+            } else {
+                ctx.content_left = content_left;
+                ctx.content_right = content_right;
+            }
             ctx.block(b, 0.0);
         }
         ctx.y + content_theme.margin_y
@@ -573,6 +605,21 @@ struct Ctx<'a> {
     /// handled. Used to key per-block layout overrides.
     mermaid_idx: usize,
     mermaid_overrides: Option<&'a std::collections::HashMap<usize, crate::mermaid::Direction>>,
+}
+
+/// True when a block participates in the narrow reading column.
+/// Code blocks, tables, mermaid diagrams and display math stay at full
+/// content width — they're conceptually "media" blocks and look wrong
+/// jammed into a 720-px column.
+fn is_text_block(b: &Block) -> bool {
+    matches!(
+        b,
+        Block::Heading { .. }
+            | Block::Paragraph(_)
+            | Block::List { .. }
+            | Block::BlockQuote(_)
+            | Block::ThematicBreak
+    )
 }
 
 impl<'a> Ctx<'a> {

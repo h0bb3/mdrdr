@@ -209,6 +209,14 @@ pub struct AppState {
     pub content_zoom: f32,
     pub sidebar_zoom: f32,
 
+    /// Maximum width (px) of the narrow text reading column. Code,
+    /// tables, images and diagrams ignore this and span the full
+    /// content area. Ctrl+Left / Ctrl+Right shrink / grow it.
+    pub text_column_width: f32,
+    /// Horizontal offset of the text column from the content area's
+    /// left edge. Ctrl+Shift+Left / Ctrl+Shift+Right shift it.
+    pub text_column_offset_x: f32,
+
     /// (time, x, y, path) of the most recent tree-folder click. Used to
     /// promote a second click on the same folder within the double-click
     /// window to a SetRoot (enter directory) action.
@@ -272,6 +280,8 @@ impl Shared {
             sidebar_scroll: s.sidebar_scroll,
             content_zoom: s.content_zoom,
             sidebar_zoom: s.sidebar_zoom,
+            text_column_width: s.text_column_width,
+            text_column_offset_x: s.text_column_offset_x,
             selection,
             hover_pos,
             context_menu: s.context_menu.clone(),
@@ -301,6 +311,8 @@ pub struct Snapshot {
     pub sidebar_scroll: f32,
     pub content_zoom: f32,
     pub sidebar_zoom: f32,
+    pub text_column_width: f32,
+    pub text_column_offset_x: f32,
     pub selection: Option<((f32, f32), (f32, f32))>,
     /// Mouse position in screen coords, but only when the window is in a
     /// "quiet" state — not dragging, not selecting. Drawn hover highlights
@@ -887,6 +899,19 @@ impl ApplicationHandler<UserEvent> for App {
                         self.request_redraw();
                         return;
                     }
+                    // Ctrl + Left / Right         — shrink / grow text column.
+                    // Ctrl + Shift + Left / Right — slide its left edge.
+                    let arrow_dir = match logical_key.as_ref() {
+                        Key::Named(NamedKey::ArrowLeft) => Some(-1i32),
+                        Key::Named(NamedKey::ArrowRight) => Some(1i32),
+                        _ => None,
+                    };
+                    if let Some(dir) = arrow_dir {
+                        if self.adjust_text_column(dir, self.shift_mod()) {
+                            self.request_redraw();
+                            return;
+                        }
+                    }
                 }
                 let (vh, source, vw, base_dir) = {
                     let s = self.shared.state.lock().unwrap();
@@ -1003,6 +1028,18 @@ impl ApplicationHandler<UserEvent> for App {
                     let search_active = self.shared.state.lock().unwrap().search.is_some();
                     if search_active {
                         self.handle_search_key(&key);
+                    } else if ctrl {
+                        // Main-view Ctrl+Arrow / Ctrl+Shift+Arrow column
+                        // resize. Only handled here when no modal owns
+                        // the keyboard.
+                        let dir = match &key {
+                            Key::Named(NamedKey::ArrowLeft) => Some(-1i32),
+                            Key::Named(NamedKey::ArrowRight) => Some(1i32),
+                            _ => None,
+                        };
+                        if let Some(d) = dir {
+                            self.adjust_text_column(d, shift);
+                        }
                     }
                 }
                 self.synth_mods = None;
@@ -1046,6 +1083,41 @@ impl App {
             return shift;
         }
         self.modifiers.state().shift_key()
+    }
+
+    /// Apply a Ctrl+Arrow / Ctrl+Shift+Arrow column-resize step. Returns
+    /// `true` if state actually changed (used to gate the redraw and the
+    /// `return` in the keyboard handler).
+    fn adjust_text_column(&self, dir: i32, slide: bool) -> bool {
+        const STEP: f32 = 48.0;
+        const MIN_WIDTH: f32 = 320.0;
+        let mut s = self.shared.state.lock().unwrap();
+        let vw = s.viewport.width as f32;
+        let margin_x = Theme::light().margin_x;
+        let max_content = (vw - s.sidebar_width - margin_x * 2.0).max(MIN_WIDTH);
+        if slide {
+            let max_off = (max_content - s.text_column_width.min(max_content)).max(0.0);
+            let new_off =
+                (s.text_column_offset_x + dir as f32 * STEP).clamp(0.0, max_off);
+            if (new_off - s.text_column_offset_x).abs() < f32::EPSILON {
+                return false;
+            }
+            s.text_column_offset_x = new_off;
+        } else {
+            let new_w = (s.text_column_width + dir as f32 * STEP)
+                .clamp(MIN_WIDTH, max_content);
+            if (new_w - s.text_column_width).abs() < f32::EPSILON {
+                return false;
+            }
+            s.text_column_width = new_w;
+            // Re-clamp offset against the new width so shrinking doesn't
+            // leave the column dangling beyond the right edge.
+            let max_off = (max_content - s.text_column_width).max(0.0);
+            if s.text_column_offset_x > max_off {
+                s.text_column_offset_x = max_off;
+            }
+        }
+        true
     }
 
     fn alt_mod(&self) -> bool {
@@ -1323,6 +1395,8 @@ impl App {
                 content_zoom: snap.content_zoom,
                 sidebar_zoom: snap.sidebar_zoom,
                 mermaid_overrides: Some(&snap.mermaid_overrides),
+            text_column_width: snap.text_column_width,
+            text_column_offset_x: snap.text_column_offset_x,
             },
             &mut images,
         );
@@ -1811,6 +1885,8 @@ impl App {
                 hover_pos: None,
                 search: None,
                 mermaid_overrides: Some(&snap.mermaid_overrides),
+            text_column_width: snap.text_column_width,
+            text_column_offset_x: snap.text_column_offset_x,
             },
             &mut images,
         )
@@ -1839,6 +1915,8 @@ impl App {
                 hover_pos: None,
                 search: None,
                 mermaid_overrides: Some(&snap.mermaid_overrides),
+            text_column_width: snap.text_column_width,
+            text_column_offset_x: snap.text_column_offset_x,
             },
             &mut images,
         )?;
@@ -1870,6 +1948,8 @@ impl App {
                 hover_pos: None,
                 search: None,
                 mermaid_overrides: Some(&snap.mermaid_overrides),
+            text_column_width: snap.text_column_width,
+            text_column_offset_x: snap.text_column_offset_x,
             },
             &mut images,
         )
@@ -1897,6 +1977,8 @@ impl App {
                 hover_pos: None,
                 search: None,
                 mermaid_overrides: Some(&snap.mermaid_overrides),
+            text_column_width: snap.text_column_width,
+            text_column_offset_x: snap.text_column_offset_x,
             },
             &mut images,
         )
@@ -2000,6 +2082,8 @@ impl App {
                     hover_pos: None,
                     search: None,
                     mermaid_overrides: Some(&snap.mermaid_overrides),
+            text_column_width: snap.text_column_width,
+            text_column_offset_x: snap.text_column_offset_x,
                 },
                 &mut images,
             )
@@ -2048,6 +2132,8 @@ impl App {
                     }
                 }),
                 mermaid_overrides: Some(&snap.mermaid_overrides),
+            text_column_width: snap.text_column_width,
+            text_column_offset_x: snap.text_column_offset_x,
             },
             &mut images,
         );
@@ -2113,6 +2199,8 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
                 hover_pos: None,
                 search: None,
                 mermaid_overrides: Some(&snap.mermaid_overrides),
+            text_column_width: snap.text_column_width,
+            text_column_offset_x: snap.text_column_offset_x,
             },
             &mut images,
         )
@@ -2295,6 +2383,8 @@ pub fn run(opts: WindowOptions) -> ExitCode {
             sidebar_scrollbar_grip: 0.0,
             content_zoom: 1.0,
             sidebar_zoom: 1.0,
+            text_column_width: 720.0,
+            text_column_offset_x: 0.0,
             last_folder_click: None,
             dark: false,
             context_menu: None,

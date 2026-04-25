@@ -287,6 +287,12 @@ pub struct RenderInput<'a> {
     /// Per-mermaid-block layout overrides, keyed by the block's 0-based
     /// index in document order. View-only.
     pub mermaid_overrides: Option<&'a std::collections::HashMap<usize, crate::mermaid::Direction>>,
+    /// Maximum width of the narrow text reading column. Code, tables,
+    /// images and diagrams ignore it.
+    pub text_column_width: f32,
+    /// Horizontal offset of the text column from the content area's left
+    /// edge.
+    pub text_column_offset_x: f32,
 }
 
 /// What the renderer needs to paint search highlights. Computed by the
@@ -313,6 +319,8 @@ pub fn render(input: &RenderInput, images: &mut ImageCache) -> Framebuffer {
             content_zoom: input.content_zoom,
             sidebar_zoom: input.sidebar_zoom,
             mermaid_overrides: input.mermaid_overrides,
+            text_column_width: input.text_column_width,
+            text_column_offset_x: input.text_column_offset_x,
         },
         images,
     );
@@ -356,6 +364,8 @@ pub fn measure(
             content_zoom,
             sidebar_zoom: 1.0,
             mermaid_overrides: None,
+            text_column_width: f32::INFINITY,
+            text_column_offset_x: 0.0,
         },
         images,
     );
@@ -497,6 +507,8 @@ pub fn compute_all_hit_targets(
             content_zoom: input.content_zoom,
             sidebar_zoom: input.sidebar_zoom,
             mermaid_overrides: input.mermaid_overrides,
+            text_column_width: input.text_column_width,
+            text_column_offset_x: input.text_column_offset_x,
         },
         images,
     );
@@ -523,6 +535,8 @@ pub fn compute_copy_zones(input: &RenderInput, images: &mut ImageCache) -> Vec<C
             content_zoom: input.content_zoom,
             sidebar_zoom: input.sidebar_zoom,
             mermaid_overrides: input.mermaid_overrides,
+            text_column_width: input.text_column_width,
+            text_column_offset_x: input.text_column_offset_x,
         },
         images,
     );
@@ -549,6 +563,8 @@ pub fn compute_outline(input: &RenderInput, images: &mut ImageCache) -> Vec<Outl
             content_zoom: input.content_zoom,
             sidebar_zoom: input.sidebar_zoom,
             mermaid_overrides: input.mermaid_overrides,
+            text_column_width: input.text_column_width,
+            text_column_offset_x: input.text_column_offset_x,
         },
         images,
     );
@@ -743,6 +759,8 @@ pub fn extract_selection(
             content_zoom: input.content_zoom,
             sidebar_zoom: input.sidebar_zoom,
             mermaid_overrides: input.mermaid_overrides,
+            text_column_width: input.text_column_width,
+            text_column_offset_x: input.text_column_offset_x,
         },
         images,
     );
