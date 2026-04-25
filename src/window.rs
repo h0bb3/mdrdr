@@ -32,6 +32,34 @@ use crate::tree::FileTree;
 pub enum UserEvent {
     Redraw,
     Quit,
+    /// Synthesized keypress, posted by the HTTP test API. The main
+    /// event-loop thread temporarily overrides its modifier state to
+    /// match `shift / ctrl / alt`, dispatches the key through the same
+    /// handlers that real keyboard input uses, then restores.
+    SynthKey {
+        kind: SynthKey,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+    },
+    /// Open the in-document search overlay (same as the user pressing
+    /// Ctrl+F). Posted by the test API.
+    OpenSearch,
+    /// Close the in-document search overlay if open.
+    CloseSearch,
+    /// Open the Ctrl+P quick-open panel.
+    OpenQuickOpen,
+    /// Close the Ctrl+P quick-open panel if open.
+    CloseQuickOpen,
+}
+
+/// Subset of winit keys the test API needs to forge. `Char` carries a
+/// single character (or short string for typed input) to mirror what
+/// `Key::Character` carries from real input.
+#[derive(Debug, Clone)]
+pub enum SynthKey {
+    Char(String),
+    Named(NamedKey),
 }
 
 /// One row of the right-click context menu. Kept tiny: a label and the
@@ -97,6 +125,11 @@ pub enum SubmenuKind {
 #[derive(Debug, Clone)]
 pub struct SearchUi {
     pub query: String,
+    /// Char-index of the insertion cursor.
+    pub cursor: usize,
+    /// Char-index of the selection anchor; equal to `cursor` when no
+    /// selection is active.
+    pub anchor: usize,
     /// 0-based; clamped into [0, match_count) externally.
     pub current: usize,
     /// Last-known match count (updated by the render / scroll path).
@@ -114,6 +147,11 @@ pub struct SearchUi {
 #[derive(Debug, Clone)]
 pub struct QuickOpenUi {
     pub query: String,
+    /// Char-index of the insertion cursor in `query`.
+    pub cursor: usize,
+    /// Char-index of the selection anchor; equal to `cursor` when no
+    /// selection is active.
+    pub anchor: usize,
     /// Files discovered so far. Grows over time as the background walker
     /// finds more — the panel re-renders on each batch.
     pub files: Vec<PathBuf>,
@@ -283,6 +321,12 @@ struct App {
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
     proxy: EventLoopProxy<UserEvent>,
     modifiers: Modifiers,
+    /// When `Some`, modifier-helper methods read from this tuple instead
+    /// of `self.modifiers`. Set during synthesised key events so the
+    /// shortcut detection sees the modifier state the API caller asked
+    /// for, regardless of physical keyboard state. Tuple is
+    /// `(shift, ctrl, alt, meta)`.
+    synth_mods: Option<(bool, bool, bool, bool)>,
     /// Cached last-set cursor so we don't spam `set_cursor` every mouse move.
     cursor: CursorIcon,
     /// Last hit-target rect under the pointer (screen coords for pinned,
@@ -946,6 +990,40 @@ impl ApplicationHandler<UserEvent> for App {
         match ev {
             UserEvent::Redraw => self.request_redraw(),
             UserEvent::Quit => event_loop.exit(),
+            UserEvent::SynthKey { kind, shift, ctrl, alt } => {
+                self.synth_mods = Some((shift, ctrl, alt, false));
+                let key = match kind {
+                    SynthKey::Char(s) => Key::Character(winit::keyboard::SmolStr::new(s)),
+                    SynthKey::Named(n) => Key::Named(n),
+                };
+                let qo_active = self.shared.state.lock().unwrap().quick_open.is_some();
+                if qo_active {
+                    self.handle_quick_open_key(&key, event_loop);
+                } else {
+                    let search_active = self.shared.state.lock().unwrap().search.is_some();
+                    if search_active {
+                        self.handle_search_key(&key);
+                    }
+                }
+                self.synth_mods = None;
+                self.request_redraw();
+            }
+            UserEvent::OpenSearch => {
+                self.open_search();
+                self.request_redraw();
+            }
+            UserEvent::CloseSearch => {
+                self.close_search();
+                self.request_redraw();
+            }
+            UserEvent::OpenQuickOpen => {
+                self.open_quick_open();
+                self.request_redraw();
+            }
+            UserEvent::CloseQuickOpen => {
+                self.close_quick_open();
+                self.request_redraw();
+            }
         }
     }
 }
@@ -956,12 +1034,25 @@ impl App {
     /// Accepting either everywhere keeps Ctrl-F / Ctrl-C muscle memory
     /// working on any platform.
     fn shortcut_mod(&self) -> bool {
+        if let Some((_, ctrl, _, meta)) = self.synth_mods {
+            return ctrl || meta;
+        }
         let m = self.modifiers.state();
         m.control_key() || m.super_key()
     }
 
     fn shift_mod(&self) -> bool {
+        if let Some((shift, _, _, _)) = self.synth_mods {
+            return shift;
+        }
         self.modifiers.state().shift_key()
+    }
+
+    fn alt_mod(&self) -> bool {
+        if let Some((_, _, alt, _)) = self.synth_mods {
+            return alt;
+        }
+        self.modifiers.state().alt_key()
     }
 
     /// Open the search overlay at the current mouse position (clamped
@@ -980,6 +1071,8 @@ impl App {
             let y = (my - SEARCH_PANEL_H * 0.5).clamp(0.0, (vh - SEARCH_PANEL_H).max(0.0));
             s.search = Some(SearchUi {
                 query: String::new(),
+                cursor: 0,
+                anchor: 0,
                 current: 0,
                 match_count: 0,
                 x,
@@ -997,17 +1090,142 @@ impl App {
     /// Interpret one keypress while the search overlay owns the keyboard.
     fn handle_search_key(&self, key: &winit::keyboard::Key) {
         use winit::keyboard::Key;
+        let select = self.shift_mod();
+        let word = self.alt_mod() || self.shortcut_mod();
+        // Cmd / Ctrl shortcut keys take priority over plain character input
+        // so e.g. typing 'c' with Ctrl held doesn't put 'c' in the query.
+        if self.shortcut_mod() {
+            if let Key::Character(c) = key.as_ref() {
+                match c {
+                    "c" => {
+                        let text = {
+                            let s = self.shared.state.lock().unwrap();
+                            s.search.as_ref().map(|su| {
+                                if crate::text_input::has_selection(su.cursor, su.anchor) {
+                                    crate::text_input::selected_text(&su.query, su.cursor, su.anchor)
+                                } else {
+                                    su.query.clone()
+                                }
+                            })
+                        };
+                        if let Some(t) = text {
+                            if !t.is_empty() { crate::clipboard::copy(&t); }
+                        }
+                        return;
+                    }
+                    "x" => {
+                        let mut changed = false;
+                        let to_copy = {
+                            let mut s = self.shared.state.lock().unwrap();
+                            s.search.as_mut().and_then(|su| {
+                                if crate::text_input::has_selection(su.cursor, su.anchor) {
+                                    let t = crate::text_input::selected_text(&su.query, su.cursor, su.anchor);
+                                    crate::text_input::delete_selection(&mut su.query, &mut su.cursor, &mut su.anchor);
+                                    su.current = 0;
+                                    changed = true;
+                                    Some(t)
+                                } else if !su.query.is_empty() {
+                                    let t = std::mem::take(&mut su.query);
+                                    su.cursor = 0;
+                                    su.anchor = 0;
+                                    su.current = 0;
+                                    changed = true;
+                                    Some(t)
+                                } else {
+                                    None
+                                }
+                            })
+                        };
+                        if let Some(t) = to_copy {
+                            if !t.is_empty() { crate::clipboard::copy(&t); }
+                        }
+                        if changed { self.after_search_query_change(); }
+                        return;
+                    }
+                    "v" => {
+                        if let Some(text) = crate::clipboard::paste() {
+                            let cleaned = sanitise_clipboard_for_input(&text);
+                            if !cleaned.is_empty() {
+                                {
+                                    let mut s = self.shared.state.lock().unwrap();
+                                    if let Some(su) = &mut s.search {
+                                        crate::text_input::insert_str(&mut su.query, &mut su.cursor, &mut su.anchor, &cleaned);
+                                        su.current = 0;
+                                    }
+                                }
+                                self.after_search_query_change();
+                            }
+                        }
+                        return;
+                    }
+                    "a" => {
+                        let mut s = self.shared.state.lock().unwrap();
+                        if let Some(su) = &mut s.search {
+                            crate::text_input::select_all(&su.query, &mut su.cursor, &mut su.anchor);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
         match key.as_ref() {
             Key::Named(NamedKey::Escape) => self.close_search(),
+            Key::Named(NamedKey::Tab) => {
+                let backward = self.shift_mod();
+                self.step_search(backward);
+            }
             Key::Named(NamedKey::Enter) => {
                 let backward = self.shift_mod();
                 self.step_search(backward);
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(su) = &mut s.search {
+                    if word {
+                        crate::text_input::move_word_left(&su.query, &mut su.cursor, &mut su.anchor, select);
+                    } else {
+                        crate::text_input::move_left(&su.query, &mut su.cursor, &mut su.anchor, select);
+                    }
+                }
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(su) = &mut s.search {
+                    if word {
+                        crate::text_input::move_word_right(&su.query, &mut su.cursor, &mut su.anchor, select);
+                    } else {
+                        crate::text_input::move_right(&su.query, &mut su.cursor, &mut su.anchor, select);
+                    }
+                }
+            }
+            Key::Named(NamedKey::Home) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(su) = &mut s.search {
+                    crate::text_input::move_home(&mut su.cursor, &mut su.anchor, select);
+                }
+            }
+            Key::Named(NamedKey::End) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(su) = &mut s.search {
+                    crate::text_input::move_end(&su.query, &mut su.cursor, &mut su.anchor, select);
+                }
             }
             Key::Named(NamedKey::Backspace) => {
                 {
                     let mut s = self.shared.state.lock().unwrap();
                     if let Some(su) = &mut s.search {
-                        su.query.pop();
+                        crate::text_input::backspace(&mut su.query, &mut su.cursor, &mut su.anchor);
+                        su.current = 0;
+                    }
+                }
+                self.after_search_query_change();
+            }
+            Key::Named(NamedKey::Delete) => {
+                {
+                    let mut s = self.shared.state.lock().unwrap();
+                    if let Some(su) = &mut s.search {
+                        crate::text_input::delete_forward(&mut su.query, &mut su.cursor, &mut su.anchor);
                         su.current = 0;
                     }
                 }
@@ -1019,30 +1237,24 @@ impl App {
                 {
                     let mut s = self.shared.state.lock().unwrap();
                     if let Some(su) = &mut s.search {
-                        su.query.push(' ');
+                        crate::text_input::insert_str(&mut su.query, &mut su.cursor, &mut su.anchor, " ");
                         su.current = 0;
                     }
                 }
                 self.after_search_query_change();
             }
             Key::Character(txt) => {
-                // Skip control chars. Append the string (usually one char).
-                let mut changed = false;
+                // Skip control chars. Insert at cursor (replacing selection).
+                let cleaned: String = txt.chars().filter(|c| !c.is_control()).collect();
+                if cleaned.is_empty() { return; }
                 {
                     let mut s = self.shared.state.lock().unwrap();
                     if let Some(su) = &mut s.search {
-                        for c in txt.chars() {
-                            if !c.is_control() {
-                                su.query.push(c);
-                                changed = true;
-                            }
-                        }
-                        if changed { su.current = 0; }
+                        crate::text_input::insert_str(&mut su.query, &mut su.cursor, &mut su.anchor, &cleaned);
+                        su.current = 0;
                     }
                 }
-                if changed {
-                    self.after_search_query_change();
-                }
+                self.after_search_query_change();
             }
             _ => {}
         }
@@ -1193,6 +1405,79 @@ impl App {
         event_loop: &winit::event_loop::ActiveEventLoop,
     ) {
         use winit::keyboard::Key;
+        let select = self.shift_mod();
+        let word = self.alt_mod() || self.shortcut_mod();
+        if self.shortcut_mod() {
+            if let Key::Character(c) = key.as_ref() {
+                match c {
+                    "c" => {
+                        let text = {
+                            let s = self.shared.state.lock().unwrap();
+                            s.quick_open.as_ref().map(|qo| {
+                                if crate::text_input::has_selection(qo.cursor, qo.anchor) {
+                                    crate::text_input::selected_text(&qo.query, qo.cursor, qo.anchor)
+                                } else {
+                                    qo.query.clone()
+                                }
+                            })
+                        };
+                        if let Some(t) = text {
+                            if !t.is_empty() { crate::clipboard::copy(&t); }
+                        }
+                        return;
+                    }
+                    "x" => {
+                        let to_copy = {
+                            let mut s = self.shared.state.lock().unwrap();
+                            s.quick_open.as_mut().and_then(|qo| {
+                                if crate::text_input::has_selection(qo.cursor, qo.anchor) {
+                                    let t = crate::text_input::selected_text(&qo.query, qo.cursor, qo.anchor);
+                                    crate::text_input::delete_selection(&mut qo.query, &mut qo.cursor, &mut qo.anchor);
+                                    qo.selected = 0;
+                                    qo.scroll = 0;
+                                    Some(t)
+                                } else if !qo.query.is_empty() {
+                                    let t = std::mem::take(&mut qo.query);
+                                    qo.cursor = 0;
+                                    qo.anchor = 0;
+                                    qo.selected = 0;
+                                    qo.scroll = 0;
+                                    Some(t)
+                                } else {
+                                    None
+                                }
+                            })
+                        };
+                        if let Some(t) = to_copy {
+                            if !t.is_empty() { crate::clipboard::copy(&t); }
+                        }
+                        return;
+                    }
+                    "v" => {
+                        if let Some(text) = crate::clipboard::paste() {
+                            let cleaned = sanitise_clipboard_for_input(&text);
+                            if !cleaned.is_empty() {
+                                let mut s = self.shared.state.lock().unwrap();
+                                if let Some(qo) = &mut s.quick_open {
+                                    crate::text_input::insert_str(&mut qo.query, &mut qo.cursor, &mut qo.anchor, &cleaned);
+                                    qo.selected = 0;
+                                    qo.scroll = 0;
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    "a" => {
+                        let mut s = self.shared.state.lock().unwrap();
+                        if let Some(qo) = &mut s.quick_open {
+                            crate::text_input::select_all(&qo.query, &mut qo.cursor, &mut qo.anchor);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
         match key.as_ref() {
             Key::Named(NamedKey::Escape) => {
                 self.close_quick_open();
@@ -1246,25 +1531,51 @@ impl App {
                     Self::clamp_quick_open_scroll(qo);
                 }
             }
+            // Text-cursor moves inside the query input.
+            Key::Named(NamedKey::ArrowLeft) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(qo) = &mut s.quick_open {
+                    if word {
+                        crate::text_input::move_word_left(&qo.query, &mut qo.cursor, &mut qo.anchor, select);
+                    } else {
+                        crate::text_input::move_left(&qo.query, &mut qo.cursor, &mut qo.anchor, select);
+                    }
+                }
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(qo) = &mut s.quick_open {
+                    if word {
+                        crate::text_input::move_word_right(&qo.query, &mut qo.cursor, &mut qo.anchor, select);
+                    } else {
+                        crate::text_input::move_right(&qo.query, &mut qo.cursor, &mut qo.anchor, select);
+                    }
+                }
+            }
             Key::Named(NamedKey::Home) => {
                 let mut s = self.shared.state.lock().unwrap();
                 if let Some(qo) = &mut s.quick_open {
-                    qo.selected = 0;
-                    qo.scroll = 0;
+                    crate::text_input::move_home(&mut qo.cursor, &mut qo.anchor, select);
                 }
             }
             Key::Named(NamedKey::End) => {
                 let mut s = self.shared.state.lock().unwrap();
                 if let Some(qo) = &mut s.quick_open {
-                    let ms = Self::quick_open_matches(qo);
-                    qo.selected = ms.len().saturating_sub(1);
-                    Self::clamp_quick_open_scroll(qo);
+                    crate::text_input::move_end(&qo.query, &mut qo.cursor, &mut qo.anchor, select);
                 }
             }
             Key::Named(NamedKey::Backspace) => {
                 let mut s = self.shared.state.lock().unwrap();
                 if let Some(qo) = &mut s.quick_open {
-                    qo.query.pop();
+                    crate::text_input::backspace(&mut qo.query, &mut qo.cursor, &mut qo.anchor);
+                    qo.selected = 0;
+                    qo.scroll = 0;
+                }
+            }
+            Key::Named(NamedKey::Delete) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(qo) = &mut s.quick_open {
+                    crate::text_input::delete_forward(&mut qo.query, &mut qo.cursor, &mut qo.anchor);
                     qo.selected = 0;
                     qo.scroll = 0;
                 }
@@ -1272,19 +1583,17 @@ impl App {
             Key::Named(NamedKey::Space) => {
                 let mut s = self.shared.state.lock().unwrap();
                 if let Some(qo) = &mut s.quick_open {
-                    qo.query.push(' ');
+                    crate::text_input::insert_str(&mut qo.query, &mut qo.cursor, &mut qo.anchor, " ");
                     qo.selected = 0;
                     qo.scroll = 0;
                 }
             }
             Key::Character(txt) => {
+                let cleaned: String = txt.chars().filter(|c| !c.is_control()).collect();
+                if cleaned.is_empty() { return; }
                 let mut s = self.shared.state.lock().unwrap();
                 if let Some(qo) = &mut s.quick_open {
-                    for c in txt.chars() {
-                        if !c.is_control() {
-                            qo.query.push(c);
-                        }
-                    }
+                    crate::text_input::insert_str(&mut qo.query, &mut qo.cursor, &mut qo.anchor, &cleaned);
                     qo.selected = 0;
                     qo.scroll = 0;
                 }
@@ -2016,6 +2325,7 @@ pub fn run(opts: WindowOptions) -> ExitCode {
         surface: None,
         proxy,
         modifiers: Modifiers::default(),
+        synth_mods: None,
         cursor: CursorIcon::Default,
         last_hover_rect: None,
     };
@@ -2057,6 +2367,96 @@ struct SearchGeom {
     close_btn: (f32, f32, f32, f32),
 }
 
+/// Render the contents of a single-line text input: selection rect,
+/// glyphs, and cursor caret. Shared by the search and quick-open
+/// panels — both use the same model so they get the same look.
+fn draw_text_input(
+    fb: &mut crate::render::Framebuffer,
+    text: &str,
+    cursor: usize,
+    anchor: usize,
+    font_size: f32,
+    fonts: &Fonts,
+    text_left: f32,
+    text_right: f32,
+    baseline: f32,
+    fg: crate::theme::Rgba,
+    sel: crate::theme::Rgba,
+) {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    // Pre-compute per-char advance widths and the prefix sums so we can
+    // map any cursor index to a pixel x in O(1).
+    let advances: Vec<f32> = chars
+        .iter()
+        .map(|&ch| {
+            let font = if crate::font::is_emoji(ch) { &fonts.emoji } else { &fonts.body };
+            font.metrics(ch, font_size).advance_width
+        })
+        .collect();
+    let mut prefix: Vec<f32> = Vec::with_capacity(n + 1);
+    prefix.push(0.0);
+    for w in &advances {
+        let last = *prefix.last().unwrap();
+        prefix.push(last + w);
+    }
+    let total = *prefix.last().unwrap();
+    let avail_w = (text_right - text_left).max(1.0);
+    let cursor_idx = cursor.min(n);
+    let cursor_x = prefix[cursor_idx];
+
+    // Scroll the visible window so the cursor stays inside it. Standard
+    // text-input behaviour: when the user types past the right edge we
+    // scroll along; when they Home/Left back into the leading text we
+    // scroll back.
+    let mut scroll = 0.0_f32;
+    if total > avail_w {
+        let margin = 4.0;
+        if cursor_x > avail_w - margin {
+            scroll = cursor_x - (avail_w - margin);
+        }
+        if cursor_x - scroll < margin {
+            scroll = (cursor_x - margin).max(0.0);
+        }
+        let max_scroll = (total - avail_w).max(0.0);
+        scroll = scroll.clamp(0.0, max_scroll);
+    }
+
+    // Selection rect first so glyphs sit on top.
+    if cursor != anchor {
+        let (lo, hi) = if cursor < anchor { (cursor, anchor) } else { (anchor, cursor) };
+        let lo = lo.min(n);
+        let hi = hi.min(n);
+        let sx0 = (text_left + prefix[lo] - scroll).max(text_left);
+        let sx1 = (text_left + prefix[hi] - scroll).min(text_right);
+        if sx1 > sx0 {
+            let sy = baseline - font_size * 0.85;
+            let sh = font_size * 1.15;
+            fb.fill_rect(sx0 as i32, sy as i32, (sx1 - sx0) as i32, sh as i32, sel);
+        }
+    }
+
+    // Glyphs — skip those clipped entirely outside the visible window.
+    for (i, &ch) in chars.iter().enumerate() {
+        let gx = text_left + prefix[i] - scroll;
+        let gx_end = text_left + prefix[i + 1] - scroll;
+        if gx_end < text_left || gx > text_right { continue; }
+        let font = if crate::font::is_emoji(ch) { &fonts.emoji } else { &fonts.body };
+        fb.draw_glyph(font, ch, font_size, gx, baseline, fg);
+    }
+
+    // Caret. Always drawn (no blink) so the user can see where they're
+    // about to type.
+    let caret_x = (text_left + cursor_x - scroll).clamp(text_left, text_right);
+    fb.fill_rect(
+        caret_x as i32,
+        (baseline - font_size * 0.85) as i32,
+        1,
+        font_size as i32,
+        fg,
+    );
+}
+
 fn search_geom(su: &SearchUi) -> SearchGeom {
     let x = su.x; let y = su.y;
     let w = SEARCH_PANEL_W; let h = SEARCH_PANEL_H;
@@ -2092,7 +2492,7 @@ fn search_hit_test(su: &SearchUi, x: f32, y: f32) -> SearchHit {
     SearchHit::Outside
 }
 
-fn draw_search_ui(
+pub fn draw_search_ui(
     fb: &mut crate::render::Framebuffer,
     theme: &Theme,
     fonts: &Fonts,
@@ -2130,49 +2530,24 @@ fn draw_search_ui(
     fb.fill_rect(ix as i32, iy as i32, 1, ih as i32, theme.muted);
     fb.fill_rect(ix as i32 + iw as i32 - 1, iy as i32, 1, ih as i32, theme.muted);
 
-    // Query text + blinking-less cursor caret at the end. When the query
-    // outgrows the input, drop leading chars so the tail (and caret)
-    // remain visible — standard text-input behaviour.
+    // Query text + selection + caret. Cursor-aware scroll keeps the
+    // insertion point visible regardless of where in the string it is.
     let baseline = iy + ih * 0.5 + SEARCH_FONT_SIZE * 0.35;
     let text_left = ix + 6.0;
-    let text_right = ix + iw - 8.0;  // reserve ~2px before the right border + 6px caret room
-    let avail_w = (text_right - text_left).max(0.0);
-    let chars: Vec<char> = su.query.chars().collect();
-    // Scan right-to-left and keep every char that still fits.
-    let mut widths: Vec<f32> = Vec::with_capacity(chars.len());
-    let mut total = 0.0;
-    for ch in chars.iter().rev() {
-        let font = if crate::font::is_emoji(*ch) { &fonts.emoji } else { &fonts.body };
-        let w = font.metrics(*ch, SEARCH_FONT_SIZE).advance_width;
-        total += w;
-        widths.push(w);
-    }
-    let mut start_idx = 0;
-    if total > avail_w && !chars.is_empty() {
-        let mut acc = 0.0;
-        for (k, w) in widths.iter().enumerate() {
-            acc += w;
-            if acc > avail_w {
-                // Drop this char and everything before it — it no longer fits.
-                start_idx = chars.len() - k;
-                break;
-            }
-        }
-    }
-    let mut cx = text_left;
-    for &ch in &chars[start_idx..] {
-        let font = if crate::font::is_emoji(ch) { &fonts.emoji } else { &fonts.body };
-        fb.draw_glyph(font, ch, SEARCH_FONT_SIZE, cx, baseline, theme.fg);
-        cx += font.metrics(ch, SEARCH_FONT_SIZE).advance_width;
-    }
-    // Caret right after the last drawn char; clamp inside the input.
-    let caret_x = cx.min(text_right);
-    fb.fill_rect(
-        caret_x as i32,
-        (baseline - SEARCH_FONT_SIZE * 0.85) as i32,
-        1,
-        SEARCH_FONT_SIZE as i32,
+    let text_right = ix + iw - 8.0;
+    let sel = [theme.accent[0], theme.accent[1], theme.accent[2], 110];
+    draw_text_input(
+        fb,
+        &su.query,
+        su.cursor,
+        su.anchor,
+        SEARCH_FONT_SIZE,
+        fonts,
+        text_left,
+        text_right,
+        baseline,
         theme.fg,
+        sel,
     );
 
     // Match count "n / N" right of the input. `0 / 0` when there are none
@@ -2245,7 +2620,7 @@ fn quick_open_row_hit(geom: &QuickOpenGeom, x: f32, y: f32) -> Option<usize> {
     if row < QUICK_OPEN_ROWS { Some(row) } else { None }
 }
 
-fn draw_quick_open_ui(
+pub fn draw_quick_open_ui(
     fb: &mut crate::render::Framebuffer,
     theme: &Theme,
     fonts: &Fonts,
@@ -2278,54 +2653,42 @@ fn draw_quick_open_ui(
     fb.fill_rect(ix as i32, iy as i32, 1, ih as i32, theme.muted);
     fb.fill_rect(ix as i32 + iw as i32 - 1, iy as i32, 1, ih as i32, theme.muted);
 
-    // Query + caret. Same scroll-the-tail trick as the search panel.
+    // Query text + selection + caret.
     let baseline = iy + ih * 0.5 + QUICK_OPEN_FONT_SIZE * 0.35;
     let text_left = ix + 8.0;
     let text_right = ix + iw - 8.0;
-    let avail_w = (text_right - text_left).max(0.0);
-    let chars: Vec<char> = qo.query.chars().collect();
-    let mut widths: Vec<f32> = Vec::with_capacity(chars.len());
-    let mut total = 0.0;
-    for ch in chars.iter().rev() {
-        let font = if crate::font::is_emoji(*ch) { &fonts.emoji } else { &fonts.body };
-        let w = font.metrics(*ch, QUICK_OPEN_FONT_SIZE).advance_width;
-        total += w;
-        widths.push(w);
-    }
-    let mut start_idx = 0;
-    if total > avail_w && !chars.is_empty() {
-        let mut acc = 0.0;
-        for (k, w) in widths.iter().enumerate() {
-            acc += w;
-            if acc > avail_w {
-                start_idx = chars.len() - k;
-                break;
-            }
-        }
-    }
-    if chars.is_empty() {
-        // Placeholder hint — muted.
+    if qo.query.is_empty() {
+        // Placeholder hint — muted. Draw the caret on top so it's visible
+        // even with no real text.
         let hint = "Type to filter files…";
         let mut hx = text_left;
         for ch in hint.chars() {
             fb.draw_glyph(&fonts.body, ch, QUICK_OPEN_FONT_SIZE, hx, baseline, theme.muted);
             hx += fonts.body.metrics(ch, QUICK_OPEN_FONT_SIZE).advance_width;
         }
+        fb.fill_rect(
+            text_left as i32,
+            (baseline - QUICK_OPEN_FONT_SIZE * 0.85) as i32,
+            1,
+            QUICK_OPEN_FONT_SIZE as i32,
+            theme.fg,
+        );
+    } else {
+        let sel = [theme.accent[0], theme.accent[1], theme.accent[2], 110];
+        draw_text_input(
+            fb,
+            &qo.query,
+            qo.cursor,
+            qo.anchor,
+            QUICK_OPEN_FONT_SIZE,
+            fonts,
+            text_left,
+            text_right,
+            baseline,
+            theme.fg,
+            sel,
+        );
     }
-    let mut cx = text_left;
-    for &ch in &chars[start_idx..] {
-        let font = if crate::font::is_emoji(ch) { &fonts.emoji } else { &fonts.body };
-        fb.draw_glyph(font, ch, QUICK_OPEN_FONT_SIZE, cx, baseline, theme.fg);
-        cx += font.metrics(ch, QUICK_OPEN_FONT_SIZE).advance_width;
-    }
-    let caret_x = cx.min(text_right);
-    fb.fill_rect(
-        caret_x as i32,
-        (baseline - QUICK_OPEN_FONT_SIZE * 0.85) as i32,
-        1,
-        QUICK_OPEN_FONT_SIZE as i32,
-        theme.fg,
-    );
 
     // Results list.
     let matches = App::quick_open_matches(qo);
@@ -2649,6 +3012,14 @@ fn active_submenu(m: &ContextMenu, x: f32, y: f32, fonts: &Fonts) -> Option<Subm
     None
 }
 
+/// Strip newlines/tabs and other control chars from clipboard text
+/// before it lands in a single-line text input. Pasting a multi-line
+/// snippet would otherwise put hidden newlines in a search query that
+/// then never matches.
+fn sanitise_clipboard_for_input(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
 fn submenu_width(items: &[(String, MenuAction)], fonts: &Fonts) -> f32 {
     let mut w = 0.0f32;
     for (label, _) in items {
@@ -2687,6 +3058,8 @@ fn launch_quick_open(shared: &Arc<Shared>, proxy: &EventLoopProxy<UserEvent>) {
         let cancel = Arc::new(AtomicBool::new(false));
         s.quick_open = Some(QuickOpenUi {
             query: String::new(),
+            cursor: 0,
+            anchor: 0,
             files: Vec::new(),
             base,
             selected: 0,
@@ -2755,6 +3128,8 @@ fn apply_menu_action(shared: &Arc<Shared>, proxy: &EventLoopProxy<UserEvent>, ac
                 let y = (my - SEARCH_PANEL_H * 0.5).clamp(0.0, (vh - SEARCH_PANEL_H).max(0.0));
                 s.search = Some(SearchUi {
                     query: String::new(),
+                    cursor: 0,
+                    anchor: 0,
                     current: 0,
                     match_count: 0,
                     x,

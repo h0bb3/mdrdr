@@ -1,8 +1,8 @@
 //! Tiny clipboard bridge — no crate, just shells out.
 //!
-//! Tries `wl-copy` first (Wayland), then `xclip -selection clipboard` (X11).
-//! If neither is available, the copy silently no-ops. The returned `bool`
-//! tells callers whether a helper was found.
+//! Tries `wl-copy` / `wl-paste` first (Wayland), then `xclip -selection
+//! clipboard` (X11). If neither helper is available, copy silently
+//! no-ops and paste returns `None`.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -24,4 +24,29 @@ pub fn copy(text: &str) -> bool {
         }
     }
     false
+}
+
+/// Read the system clipboard as UTF-8 text. Returns `None` if no helper
+/// is available, the clipboard is empty, or the contents aren't UTF-8.
+/// `wl-paste -n` suppresses the trailing newline it would otherwise add;
+/// `xclip` also gets a trim pass so the two backends behave the same.
+pub fn paste() -> Option<String> {
+    for (prog, args) in [
+        ("wl-paste", &["-n"][..]),
+        ("xclip", &["-selection", "clipboard", "-o"]),
+    ] {
+        if let Ok(out) = Command::new(prog)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            if !out.status.success() {
+                continue;
+            }
+            let s = String::from_utf8(out.stdout).ok()?;
+            return Some(s);
+        }
+    }
+    None
 }

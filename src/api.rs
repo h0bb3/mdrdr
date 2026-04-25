@@ -20,7 +20,7 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::render::{measure, render, RenderInput, Viewport};
 use crate::tree::{TreeEntry, TreeKind};
-use crate::window::{click_at, Shared, UserEvent};
+use crate::window::{click_at, Shared, SynthKey, UserEvent};
 
 /// Spawn the HTTP control API on `127.0.0.1:port`. Port `0` picks an
 /// ephemeral one. Returns the actually-bound port, or an `io::Error` if
@@ -86,6 +86,17 @@ fn handle(
         ("POST", "/select/clear") => do_select_clear(&mut stream, &shared, &proxy),
         ("POST", "/copy") | ("GET", "/selection") => do_copy(&mut stream, &shared),
         ("POST", "/quit") => do_quit(&mut stream, &proxy),
+        // Test-driver hooks. Synthesize keystrokes through the same
+        // dispatch path that real keyboard events use, so the API can
+        // exercise the search / quick-open input keyboard model end-to-end.
+        ("POST", "/key") => do_key(&mut stream, &proxy, &q),
+        ("POST", "/type") => do_type(&mut stream, &proxy, &q),
+        ("POST", "/search/open") => do_search_open(&mut stream, &shared, &proxy),
+        ("POST", "/search/close") => do_search_close(&mut stream, &shared, &proxy),
+        ("GET", "/search") => ok_json(&mut stream, &search_json(&shared)),
+        ("POST", "/quickopen/open") => do_quickopen_open(&mut stream, &shared, &proxy),
+        ("POST", "/quickopen/close") => do_quickopen_close(&mut stream, &shared, &proxy),
+        ("GET", "/quickopen") => ok_json(&mut stream, &quickopen_json(&shared)),
         ("GET", "/") => ok_text(&mut stream, INDEX),
         _ => not_found(&mut stream),
     }
@@ -169,7 +180,7 @@ fn screenshot(
         _ => None,
     };
     let mut images = shared.images.lock().unwrap();
-    let fb = render(
+    let mut fb = render(
         &RenderInput {
             source: &snap.source,
             viewport: snap.viewport,
@@ -185,12 +196,24 @@ fn screenshot(
             sidebar_zoom: snap.sidebar_zoom,
             selection: snap.selection,
             hover_pos,
-            search: None,
-            mermaid_overrides: None,
+            search: snap.search.as_ref().filter(|s| !s.query.is_empty()).map(|s| crate::render::SearchHighlights {
+                query: &s.query,
+                current: if s.match_count > 0 { Some(s.current) } else { None },
+            }),
+            mermaid_overrides: Some(&snap.mermaid_overrides),
         },
         &mut images,
     );
     drop(images);
+
+    // Draw overlay panels last so the test API screenshots match what the
+    // user actually sees in the live window.
+    if let Some(su) = &snap.search {
+        crate::window::draw_search_ui(&mut fb, &snap.theme, &shared.fonts, su, hover_pos);
+    }
+    if let Some(qo) = &snap.quick_open {
+        crate::window::draw_quick_open_ui(&mut fb, &snap.theme, &shared.fonts, qo, snap.viewport, hover_pos);
+    }
     let img: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> =
         image::ImageBuffer::from_raw(fb.width, fb.height, fb.pixels).expect("fb size mismatch");
     let mut png = Vec::new();
@@ -687,4 +710,165 @@ mdrdr api
   POST /select/clear
   POST /copy                    — copy selection to clipboard (also GET /selection)
   POST /quit             — exit
+
+  Test driver — used by automated checks; would not normally be hand-driven.
+  POST /search/open
+  POST /search/close
+  GET  /search                  — query, cursor, anchor, current, match_count
+  POST /quickopen/open
+  POST /quickopen/close
+  GET  /quickopen               — query, cursor, anchor, selected, scanning, scan_count
+  POST /key?name=K[&shift=1][&ctrl=1][&alt=1]
+       Names: any single character, or one of:
+       Escape, Enter, Tab, Backspace, Delete, Space, Home, End,
+       ArrowLeft, ArrowRight, ArrowUp, ArrowDown, PageUp, PageDown
+  POST /type?text=...           — sugar for one /key per char
 ";
+
+// ───── test-driver endpoints ────────────────────────────────────────────────
+
+/// Map an endpoint name string to a winit NamedKey or a Char(s).
+fn parse_synth_key(name: &str) -> Option<SynthKey> {
+    use winit::keyboard::NamedKey as N;
+    let named = match name {
+        "Escape" => N::Escape,
+        "Enter" => N::Enter,
+        "Tab" => N::Tab,
+        "Backspace" => N::Backspace,
+        "Delete" => N::Delete,
+        "Space" => N::Space,
+        "Home" => N::Home,
+        "End" => N::End,
+        "ArrowLeft" => N::ArrowLeft,
+        "ArrowRight" => N::ArrowRight,
+        "ArrowUp" => N::ArrowUp,
+        "ArrowDown" => N::ArrowDown,
+        "PageUp" => N::PageUp,
+        "PageDown" => N::PageDown,
+        _ => {
+            // Anything else is a literal character (or short string,
+            // which winit can deliver via Key::Character on platforms
+            // with composed input).
+            return Some(SynthKey::Char(name.to_string()));
+        }
+    };
+    Some(SynthKey::Named(named))
+}
+
+fn flag(q: &HashMap<String, String>, key: &str) -> bool {
+    matches!(q.get(key).map(|s| s.as_str()), Some("1") | Some("true") | Some("yes"))
+}
+
+fn do_key(
+    stream: &mut TcpStream,
+    proxy: &EventLoopProxy<UserEvent>,
+    q: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    let name = match q.get("name") {
+        Some(s) if !s.is_empty() => s.clone(),
+        _ => return ok_text(stream, "{\"ok\":false,\"error\":\"missing name\"}"),
+    };
+    let Some(kind) = parse_synth_key(&name) else {
+        return ok_text(stream, "{\"ok\":false,\"error\":\"unknown key\"}");
+    };
+    let _ = proxy.send_event(UserEvent::SynthKey {
+        kind,
+        shift: flag(q, "shift"),
+        ctrl: flag(q, "ctrl"),
+        alt: flag(q, "alt"),
+    });
+    ok_text(stream, "{\"ok\":true}")
+}
+
+fn do_type(
+    stream: &mut TcpStream,
+    proxy: &EventLoopProxy<UserEvent>,
+    q: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    let Some(text) = q.get("text") else {
+        return ok_text(stream, "{\"ok\":false,\"error\":\"missing text\"}");
+    };
+    for ch in text.chars() {
+        // Space goes through the NamedKey arm in the input handlers,
+        // so the synthesiser has to deliver it the same way.
+        let kind = if ch == ' ' {
+            SynthKey::Named(winit::keyboard::NamedKey::Space)
+        } else {
+            SynthKey::Char(ch.to_string())
+        };
+        let _ = proxy.send_event(UserEvent::SynthKey {
+            kind,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+    }
+    ok_text(stream, "{\"ok\":true}")
+}
+
+fn do_search_open(
+    stream: &mut TcpStream,
+    _shared: &Arc<Shared>,
+    proxy: &EventLoopProxy<UserEvent>,
+) -> std::io::Result<()> {
+    let _ = proxy.send_event(UserEvent::OpenSearch);
+    ok_text(stream, "{\"ok\":true}")
+}
+
+fn do_search_close(
+    stream: &mut TcpStream,
+    _shared: &Arc<Shared>,
+    proxy: &EventLoopProxy<UserEvent>,
+) -> std::io::Result<()> {
+    let _ = proxy.send_event(UserEvent::CloseSearch);
+    ok_text(stream, "{\"ok\":true}")
+}
+
+fn search_json(shared: &Arc<Shared>) -> String {
+    let s = shared.state.lock().unwrap();
+    match &s.search {
+        Some(su) => format!(
+            "{{\"open\":true,\"query\":\"{}\",\"cursor\":{},\"anchor\":{},\"current\":{},\"match_count\":{}}}",
+            json_escape(&su.query),
+            su.cursor,
+            su.anchor,
+            su.current,
+            su.match_count,
+        ),
+        None => "{\"open\":false}".to_string(),
+    }
+}
+
+fn do_quickopen_open(
+    stream: &mut TcpStream,
+    _shared: &Arc<Shared>,
+    proxy: &EventLoopProxy<UserEvent>,
+) -> std::io::Result<()> {
+    let _ = proxy.send_event(UserEvent::OpenQuickOpen);
+    ok_text(stream, "{\"ok\":true}")
+}
+
+fn do_quickopen_close(
+    stream: &mut TcpStream,
+    _shared: &Arc<Shared>,
+    proxy: &EventLoopProxy<UserEvent>,
+) -> std::io::Result<()> {
+    let _ = proxy.send_event(UserEvent::CloseQuickOpen);
+    ok_text(stream, "{\"ok\":true}")
+}
+
+fn quickopen_json(shared: &Arc<Shared>) -> String {
+    let s = shared.state.lock().unwrap();
+    match &s.quick_open {
+        Some(qo) => format!(
+            "{{\"open\":true,\"query\":\"{}\",\"cursor\":{},\"anchor\":{},\"selected\":{},\"scanning\":{},\"file_count\":{}}}",
+            json_escape(&qo.query),
+            qo.cursor,
+            qo.anchor,
+            qo.selected,
+            qo.scanning,
+            qo.files.len(),
+        ),
+        None => "{\"open\":false}".to_string(),
+    }
+}

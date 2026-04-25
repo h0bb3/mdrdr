@@ -18,6 +18,7 @@ mod math;
 mod md;
 mod mermaid;
 mod render;
+mod text_input;
 mod theme;
 mod tree;
 mod watch;
