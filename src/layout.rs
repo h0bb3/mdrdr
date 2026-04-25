@@ -855,12 +855,14 @@ impl<'a> Ctx<'a> {
                     );
                     return;
                 };
-                // Padding around the diagram and horizontal centering.
+                // Padding around the diagram. Left-aligned: the diagram
+                // hugs the content column's left edge so it tracks the
+                // text margin instead of floating in a centered void.
                 let pad = 16.0;
                 let outer_w = r.width + pad * 2.0;
                 let outer_h = r.height + pad * 2.0;
                 let outer_w_clipped = outer_w.min(avail);
-                let x0 = self.content_left + indent + ((avail - outer_w) / 2.0).max(0.0);
+                let x0 = self.content_left + indent;
                 let start_y = self.y;
                 let y0 = self.y + pad;
                 self.items.push(Placed::Rect {
@@ -891,7 +893,10 @@ impl<'a> Ctx<'a> {
                 let avail = (self.content_right - self.content_left - indent).max(1.0);
                 let scale = if b.width > avail { avail / b.width } else { 1.0 };
                 let w = b.width * scale;
-                let x0 = self.content_left + indent + (avail - w) / 2.0;
+                let _ = w;
+                // Left-aligned: equations follow the same left margin as
+                // surrounding text instead of floating centered.
+                let x0 = self.content_left + indent;
                 let baseline = self.y + b.ascent * scale + self.theme.body_size * 0.4;
                 for g in &b.glyphs {
                     self.items.push(Placed::Glyph {
