@@ -32,13 +32,28 @@ Everything above the primitive layer (window, pixels, font raster, image decode)
 
 ### Pre-built binaries (recommended)
 
-Every push to the `release` branch cuts a GitHub Release with:
+Every push to the `release` branch cuts a GitHub Release with one binary per platform. Grab the matching one from https://github.com/h0bb3/mdrdr/releases/latest:
 
-- `mdrdr-linux-x86_64`
-- `mdrdr-macos-universal` (Apple Silicon + Intel)
-- `mdrdr-windows-x86_64.exe`
+**Linux** (`mdrdr-linux-x86_64`)
 
-Grab from https://github.com/h0bb3/mdrdr/releases/latest, `chmod +x`, drop on your PATH.
+```bash
+chmod +x mdrdr-linux-x86_64
+mv mdrdr-linux-x86_64 ~/.local/bin/mdrdr
+```
+
+**macOS** (`mdrdr-macos-universal` — Apple Silicon + Intel in one binary)
+
+```bash
+chmod +x mdrdr-macos-universal
+xattr -d com.apple.quarantine mdrdr-macos-universal   # release binaries are unsigned
+mv mdrdr-macos-universal /usr/local/bin/mdrdr         # or ~/.local/bin/mdrdr
+```
+
+If you skip the `xattr` step, Gatekeeper blocks the first launch — open Finder, right-click the binary, **Open**, then **Open** again in the warning dialog to whitelist it once.
+
+**Windows** (`mdrdr-windows-x86_64.exe`)
+
+Rename to `mdrdr.exe`, drop in a folder on `PATH` (e.g. `%LOCALAPPDATA%\Programs\mdrdr\`, then add that to **System Properties → Environment Variables → Path**). First launch shows a SmartScreen warning — click **More info → Run anyway** (the binary is unsigned).
 
 ### From source
 
@@ -48,14 +63,17 @@ Requires a recent stable Rust toolchain.
 git clone https://github.com/h0bb3/mdrdr.git
 cd mdrdr
 cargo build --release
-install -Dm755 target/release/mdrdr ~/.local/bin/mdrdr
 ```
 
-`~/.local/bin` is typically already on `$PATH`. Alternatively `cargo install --path .` installs to `~/.cargo/bin`.
+The compiled binary lands at `target/release/mdrdr` (or `mdrdr.exe` on Windows). Install it however you like:
 
-### Register as the default `.md` handler (Linux)
+- **Linux / macOS:** `install -Dm755 target/release/mdrdr ~/.local/bin/mdrdr`
+- **Windows (PowerShell):** `Copy-Item target\release\mdrdr.exe $Env:LOCALAPPDATA\Programs\mdrdr\mdrdr.exe`
+- **Any platform:** `cargo install --path .` drops it in `~/.cargo/bin` (already on `PATH` if you installed Rust via rustup).
 
-Write a desktop entry, refresh the MIME database, make it the default:
+### Register as the default `.md` handler
+
+**Linux** — write a desktop entry, refresh the MIME database, make it the default:
 
 ```bash
 cat > ~/.local/share/applications/mdrdr.desktop <<'EOF'
@@ -75,9 +93,36 @@ update-desktop-database ~/.local/share/applications
 xdg-mime default mdrdr.desktop text/markdown
 ```
 
-Verify with `xdg-mime query default text/markdown` (should print `mdrdr.desktop`).
+Verify with `xdg-mime query default text/markdown` (should print `mdrdr.desktop`). Undo: `xdg-mime default <previous>.desktop text/markdown` and `rm ~/.local/share/applications/mdrdr.desktop`.
 
-To undo: `xdg-mime default <previous>.desktop text/markdown` and `rm ~/.local/share/applications/mdrdr.desktop`.
+**macOS** — `mdrdr` is a CLI tool, not a `.app` bundle, so Finder's "Open With" UI can't target it directly. Easiest path is [`duti`](https://github.com/moretension/duti) plus a tiny wrapper `.app`:
+
+```bash
+brew install duti
+
+# 1. Make a one-line wrapper .app that just shells out to mdrdr.
+osacompile -o ~/Applications/mdrdr.app -e \
+  'on open theFiles
+     repeat with f in theFiles
+       do shell script "/usr/local/bin/mdrdr " & quoted form of POSIX path of f & " >/dev/null 2>&1 &"
+     end repeat
+   end open'
+
+# 2. Tell LaunchServices to use it for net.daringfireball.markdown (the
+#    UTI most editors register `.md` under).
+duti -s com.yourname.mdrdr net.daringfireball.markdown all
+```
+
+Adjust the bundle id in the `osacompile` step's `Info.plist` if you want the `duti` line to match. To undo, delete `~/Applications/mdrdr.app` and re-pick a default in Finder ▸ **Get Info** ▸ **Open with**.
+
+**Windows** — from an admin **Command Prompt** (`cmd.exe`, not PowerShell — `assoc` / `ftype` are cmd builtins):
+
+```cmd
+assoc .md=mdrdrFile
+ftype mdrdrFile="C:\path\to\mdrdr.exe" "%1"
+```
+
+Or via the GUI: right-click any `.md` file ▸ **Open with** ▸ **Choose another app** ▸ **Always use this app** ▸ browse to `mdrdr.exe`. Undo via **Settings ▸ Apps ▸ Default apps ▸ Choose defaults by file type**.
 
 ## Usage
 
