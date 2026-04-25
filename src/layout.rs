@@ -302,18 +302,18 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
             mermaid_overrides: input.mermaid_overrides,
         };
         for b in input.blocks {
-            // Top-level blocks pick their layout column based on type:
-            // text-flow blocks go in the narrow reading column, "media"
-            // blocks (code, tables, mermaid, display math) span the
-            // full content area. Nested blocks inside lists / quotes
-            // inherit whichever column the outer container picked.
-            if is_text_block(b) {
-                ctx.content_left = text_left;
-                ctx.content_right = text_right;
-            } else {
-                ctx.content_left = content_left;
-                ctx.content_right = content_right;
-            }
+            // Top-level blocks pick their layout column based on type.
+            // The *left* edge always follows the text column so an
+            // offset slide carries every element with it; only the
+            // right edge differs:
+            //   - text-flow blocks stop at `text_right` (narrow).
+            //   - media blocks (code, tables, mermaid, display math)
+            //     extend to `content_right` so wide diagrams still get
+            //     the full canvas.
+            // Nested blocks inside lists / quotes inherit whichever
+            // column the outer container picked.
+            ctx.content_left = text_left;
+            ctx.content_right = if is_text_block(b) { text_right } else { content_right };
             ctx.block(b, 0.0);
         }
         ctx.y + content_theme.margin_y
