@@ -4,6 +4,7 @@
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use softbuffer::{Context, Surface};
@@ -113,8 +114,8 @@ pub struct SearchUi {
 #[derive(Debug, Clone)]
 pub struct QuickOpenUi {
     pub query: String,
-    /// Full file list snapshotted when the panel opened — avoids a disk
-    /// walk on every keystroke.
+    /// Files discovered so far. Grows over time as the background walker
+    /// finds more — the panel re-renders on each batch.
     pub files: Vec<PathBuf>,
     /// Common prefix stripped when displaying entries (the tree root).
     pub base: PathBuf,
@@ -122,6 +123,15 @@ pub struct QuickOpenUi {
     pub selected: usize,
     /// Scroll offset (rows) into the filtered list.
     pub scroll: usize,
+    /// True while the background walker is still running.
+    pub scanning: bool,
+    /// Tripped to `true` when the panel closes; the walker checks this
+    /// at every directory boundary and exits.
+    pub cancel: Arc<AtomicBool>,
+    /// Monotonic open-id. Lets a slow walker detect that the panel was
+    /// closed and reopened (different generation), so it doesn't write
+    /// stale results into the new panel's file list.
+    pub generation: u64,
 }
 
 pub struct AppState {
@@ -177,6 +187,11 @@ pub struct AppState {
 
     /// Active Ctrl+P quick-open panel. `None` when closed.
     pub quick_open: Option<QuickOpenUi>,
+    /// Monotonic counter that increments every time a new quick-open
+    /// panel opens. Each background walker captures the generation at
+    /// spawn and checks it before writing results, so a slow walk for
+    /// a previously-closed panel can't poison a freshly-opened one.
+    pub quick_open_seq: u64,
 
     /// Per-diagram mermaid layout overrides, keyed by
     /// `(file path, mermaid block index within the document)`. The
@@ -591,7 +606,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 let mut s = self.shared.state.lock().unwrap();
                                 s.context_menu = None;
                             }
-                            apply_menu_action(&self.shared, &action);
+                            apply_menu_action(&self.shared, &self.proxy, &action);
                             self.request_redraw();
                         }
                         None => {
@@ -1136,30 +1151,18 @@ impl App {
     }
 
     fn open_quick_open(&self) {
-        let mut s = self.shared.state.lock().unwrap();
-        if s.quick_open.is_some() {
-            return;
-        }
-        // Walk the tree root once on open — cheap for typical repo sizes,
-        // and avoids re-scanning on every keystroke while the user types.
-        let (root, base) = if let Some(t) = &s.tree {
-            (t.root.clone(), t.root.clone())
-        } else {
-            (std::env::current_dir().unwrap_or_default(), std::env::current_dir().unwrap_or_default())
-        };
-        let files = crate::tree::walk_md_files(&root);
-        s.quick_open = Some(QuickOpenUi {
-            query: String::new(),
-            files,
-            base,
-            selected: 0,
-            scroll: 0,
-        });
+        launch_quick_open(&self.shared, &self.proxy);
     }
 
     fn close_quick_open(&self) {
         let mut s = self.shared.state.lock().unwrap();
-        s.quick_open = None;
+        if let Some(qo) = s.quick_open.take() {
+            // Tell the still-running walker (if any) to exit at its next
+            // directory boundary. Stale batches are also rejected by the
+            // generation check, but the cancel flag stops the disk I/O
+            // sooner.
+            qo.cancel.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Compute filtered list (indices into `files`) given the current query.
@@ -1316,7 +1319,7 @@ impl App {
             let root = tree.root.clone();
             let mut cur = p.parent();
             while let Some(dir) = cur {
-                tree.expanded.insert(dir.to_path_buf());
+                tree.expand(dir.to_path_buf());
                 if dir == root {
                     break;
                 }
@@ -1988,6 +1991,7 @@ pub fn run(opts: WindowOptions) -> ExitCode {
             context_menu: None,
             search: None,
             quick_open: None,
+            quick_open_seq: 0,
             mermaid_overrides: std::collections::HashMap::new(),
         }),
     });
@@ -2658,7 +2662,74 @@ fn submenu_height(items: &[(String, MenuAction)]) -> f32 {
     MENU_PAD_Y * 2.0 + MENU_ITEM_H * items.len() as f32
 }
 
-fn apply_menu_action(shared: &Arc<Shared>, action: &MenuAction) {
+/// Open the Ctrl+P quick-open panel and spawn a background walker that
+/// streams md-file results into it. Idempotent: a no-op if the panel is
+/// already open.
+///
+/// The walker runs entirely off the UI thread so even pointing it at a
+/// huge tree (`$HOME`, `~/projects`, …) leaves the window fully
+/// responsive — the user can keep scrolling, typing, or Esc out while
+/// files are still being discovered.
+fn launch_quick_open(shared: &Arc<Shared>, proxy: &EventLoopProxy<UserEvent>) {
+    let (root, base, generation, cancel) = {
+        let mut s = shared.state.lock().unwrap();
+        if s.quick_open.is_some() {
+            return;
+        }
+        let (root, base) = if let Some(t) = &s.tree {
+            (t.root.clone(), t.root.clone())
+        } else {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            (cwd.clone(), cwd)
+        };
+        s.quick_open_seq = s.quick_open_seq.wrapping_add(1);
+        let generation = s.quick_open_seq;
+        let cancel = Arc::new(AtomicBool::new(false));
+        s.quick_open = Some(QuickOpenUi {
+            query: String::new(),
+            files: Vec::new(),
+            base,
+            selected: 0,
+            scroll: 0,
+            scanning: true,
+            cancel: cancel.clone(),
+            generation,
+        });
+        let base = s.quick_open.as_ref().map(|q| q.base.clone()).unwrap_or_default();
+        (root, base, generation, cancel)
+    };
+    let _ = base; // base is captured into QuickOpenUi above; binding kept for symmetry
+    let shared_for_worker = shared.clone();
+    let proxy_for_worker = proxy.clone();
+    std::thread::Builder::new()
+        .name("mdrdr-quickopen".into())
+        .spawn(move || {
+            crate::tree::walk_streaming(&root, &cancel, |batch| {
+                let mut s = shared_for_worker.state.lock().unwrap();
+                let Some(qo) = s.quick_open.as_mut() else { return false };
+                if qo.generation != generation {
+                    return false;
+                }
+                qo.files.extend(batch);
+                drop(s);
+                let _ = proxy_for_worker.send_event(UserEvent::Redraw);
+                true
+            });
+            // Final tidy-up: sort what we found, mark scan complete.
+            let mut s = shared_for_worker.state.lock().unwrap();
+            if let Some(qo) = s.quick_open.as_mut() {
+                if qo.generation == generation {
+                    qo.files.sort();
+                    qo.scanning = false;
+                }
+            }
+            drop(s);
+            let _ = proxy_for_worker.send_event(UserEvent::Redraw);
+        })
+        .ok();
+}
+
+fn apply_menu_action(shared: &Arc<Shared>, proxy: &EventLoopProxy<UserEvent>, action: &MenuAction) {
     match action {
         MenuAction::ToggleTheme => {
             let mut s = shared.state.lock().unwrap();
@@ -2693,25 +2764,9 @@ fn apply_menu_action(shared: &Arc<Shared>, action: &MenuAction) {
             }
         }
         MenuAction::QuickOpen => {
-            // Mirror Ctrl+P: open the quick-open panel. Safe from a menu
-            // callback because we don't touch the tree walk in parallel.
-            let mut s = shared.state.lock().unwrap();
-            if s.quick_open.is_none() {
-                let (root, base) = if let Some(t) = &s.tree {
-                    (t.root.clone(), t.root.clone())
-                } else {
-                    let cwd = std::env::current_dir().unwrap_or_default();
-                    (cwd.clone(), cwd)
-                };
-                let files = crate::tree::walk_md_files(&root);
-                s.quick_open = Some(QuickOpenUi {
-                    query: String::new(),
-                    files,
-                    base,
-                    selected: 0,
-                    scroll: 0,
-                });
-            }
+            // Mirror Ctrl+P: open the quick-open panel and let its
+            // background walker stream results in.
+            launch_quick_open(shared, proxy);
         }
         MenuAction::SetMermaidLayout(idx, dir) => {
             let mut s = shared.state.lock().unwrap();

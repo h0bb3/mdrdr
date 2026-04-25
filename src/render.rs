@@ -104,14 +104,58 @@ pub struct ContentMatch {
     pub doc_y: f32,
 }
 
+/// Cheap fingerprint over a layout's content items + query. Used to short-
+/// circuit `find_content_matches` when the same search has already been
+/// computed for the same layout. Item count plus sampled glyph coordinates
+/// uniquely identify a layout result for our purposes — anything that
+/// reflows (zoom, viewport, source edit) changes either the count or the
+/// sample positions.
+fn layout_fingerprint(items: &[Placed], query: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    items.len().hash(&mut h);
+    query.hash(&mut h);
+    let n = items.len();
+    let probes = [0, n / 4, n / 2, (n * 3) / 4, n.saturating_sub(1)];
+    for i in probes {
+        if let Some(Placed::Glyph { ch, x, baseline, size, .. }) = items.get(i) {
+            ch.hash(&mut h);
+            x.to_bits().hash(&mut h);
+            baseline.to_bits().hash(&mut h);
+            size.to_bits().hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
 /// ASCII case-insensitive substring search across the laid-out content.
 /// Walks glyphs in order, synthesising spaces at word gaps and newlines at
 /// baseline changes so multi-word queries find their target. Non-selectable
 /// "chrome" glyphs (e.g. the code-block "copy" button glyphs — now gone
 /// but the selectable flag is still honoured) are skipped.
+///
+/// Memoised per-thread by `(items fingerprint, query)`. A naive 100k-glyph
+/// document re-scanned at paint rate (~60 Hz) plus once per search-box
+/// keystroke is enough work to back up the compositor's request queue and
+/// trigger an EPIPE on the wayland/X11 socket. The cache makes the second
+/// and later calls for the same layout+query free.
 pub fn find_content_matches(items: &[Placed], query: &str, fonts: &Fonts) -> Vec<ContentMatch> {
     if query.is_empty() {
         return Vec::new();
+    }
+
+    thread_local! {
+        static CACHE: std::cell::RefCell<Option<(u64, Vec<ContentMatch>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let key = layout_fingerprint(items, query);
+    if let Some(hit) = CACHE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, v)| v.clone())
+    }) {
+        return hit;
     }
 
     // Build a parallel char/glyph-index stream. Synthetic gaps (space/newline)
@@ -167,6 +211,7 @@ pub fn find_content_matches(items: &[Placed], query: &str, fonts: &Fonts) -> Vec
             i += 1;
         }
     }
+    CACHE.with(|c| *c.borrow_mut() = Some((key, out.clone())));
     out
 }
 
