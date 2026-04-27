@@ -245,6 +245,12 @@ pub struct AppState {
     /// Cleared on file-swap is unnecessary: stale entries key on an old
     /// path and simply aren't consulted.
     pub mermaid_overrides: std::collections::HashMap<(Option<PathBuf>, usize), crate::mermaid::Direction>,
+
+    /// Reading cursor — doc-y of the current line. None until the user
+    /// drives the keyboard navigation (↑/↓ activate it). Drawn as a thin
+    /// caret in the left margin; ←/→ jumps between section headings;
+    /// Ctrl alone opens the context menu at the cursor's position.
+    pub read_cursor: Option<f32>,
 }
 
 pub struct Shared {
@@ -296,6 +302,7 @@ impl Shared {
                     })
                     .collect()
             },
+            read_cursor: s.read_cursor,
         }
     }
 }
@@ -325,6 +332,7 @@ pub struct Snapshot {
     /// Pre-filtered at snapshot time so the render path doesn't need to know
     /// the current file path.
     pub mermaid_overrides: std::collections::HashMap<usize, crate::mermaid::Direction>,
+    pub read_cursor: Option<f32>,
 }
 
 struct App {
@@ -345,6 +353,11 @@ struct App {
     /// doc coords for content). Used to detect the need to repaint the
     /// hover highlight when crossing between adjacent clickable rects.
     last_hover_rect: Option<(f32, f32, f32, f32)>,
+    /// Tracks "Ctrl pressed alone, no chord yet" — set true when Ctrl
+    /// becomes the only modifier with no other keys, cleared the moment
+    /// any other key is pressed. On Ctrl release while still armed, we
+    /// open the context menu at the read cursor.
+    ctrl_alone_armed: bool,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -572,6 +585,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                self.ctrl_alone_armed = false;
                 let (pos, sidebar_w, tree_visible, scroll, viewport, menu) = {
                     let s = self.shared.state.lock().unwrap();
                     (s.last_mouse, s.sidebar_width, s.tree.is_some(), s.scroll, s.viewport, s.context_menu.clone())
@@ -759,6 +773,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                self.ctrl_alone_armed = false;
                 // Open (or reposition) the context menu at the cursor. The
                 // menu is small and position-clamped to stay on-screen.
                 let (pos, viewport, dark, active_path, scroll, sidebar_w) = {
@@ -863,6 +878,24 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::ModifiersChanged(mods) => {
+                let old = self.modifiers.state();
+                let new = mods.state();
+                let old_ctrl = old.control_key() || old.super_key();
+                let new_ctrl = new.control_key() || new.super_key();
+                let other_new = new.shift_key() || new.alt_key();
+                if !old_ctrl && new_ctrl && !other_new {
+                    self.ctrl_alone_armed = true;
+                } else if old_ctrl && !new_ctrl && self.ctrl_alone_armed {
+                    self.ctrl_alone_armed = false;
+                    self.modifiers = mods;
+                    if self.shared.state.lock().unwrap().read_cursor.is_some() {
+                        self.open_context_menu_at_cursor();
+                        self.request_redraw();
+                    }
+                    return;
+                } else {
+                    self.ctrl_alone_armed = false;
+                }
                 self.modifiers = mods;
             }
 
@@ -870,6 +903,13 @@ impl ApplicationHandler<UserEvent> for App {
                 event: KeyEvent { logical_key, state: ElementState::Pressed, .. },
                 ..
             } => {
+                // Any non-Control key press while Ctrl is held turns the
+                // tap into a chord — disarm so Ctrl release doesn't open
+                // the context menu after e.g. Ctrl+C.
+                if !matches!(logical_key.as_ref(), Key::Named(NamedKey::Control)
+                    | Key::Named(NamedKey::Super)) {
+                    self.ctrl_alone_armed = false;
+                }
                 // Quick-open overlay is modal for keyboard when open.
                 let quick_open_active = self.shared.state.lock().unwrap().quick_open.is_some();
                 if quick_open_active {
@@ -923,6 +963,27 @@ impl ApplicationHandler<UserEvent> for App {
                     )
                 };
                 let page = (vh * 0.85).max(60.0);
+                // Plain arrows drive the read cursor (line stepping for
+                // ↑/↓, section jumping for ←/→). Returning early here
+                // bypasses the scroll-by-dy fallback below.
+                if !self.shortcut_mod() && !self.shift_mod() && !self.alt_mod() {
+                    let cursor_dir = match logical_key.as_ref() {
+                        Key::Named(NamedKey::ArrowDown) => Some((true, 1)),
+                        Key::Named(NamedKey::ArrowUp) => Some((true, -1)),
+                        Key::Named(NamedKey::ArrowRight) => Some((false, 1)),
+                        Key::Named(NamedKey::ArrowLeft) => Some((false, -1)),
+                        _ => None,
+                    };
+                    if let Some((line, dir)) = cursor_dir {
+                        if line {
+                            self.move_read_cursor(dir);
+                        } else {
+                            self.jump_section(dir);
+                        }
+                        self.request_redraw();
+                        return;
+                    }
+                }
                 let dy: Option<f32> = match logical_key.as_ref() {
                     Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => Some(page),
                     Key::Named(NamedKey::PageUp) => Some(-page),
@@ -1752,6 +1813,157 @@ impl App {
         }
     }
 
+    /// Step the read cursor up/down by one rendered line. Activates the
+    /// cursor on first call (anchored near the top of the viewport).
+    /// Auto-scrolls when the new position is close to the viewport edges.
+    fn move_read_cursor(&self, dir: i32) {
+        let baselines = self.current_baselines();
+        if baselines.is_empty() {
+            return;
+        }
+        let (cur, scroll, vh) = {
+            let s = self.shared.state.lock().unwrap();
+            (s.read_cursor, s.scroll, s.viewport.height as f32)
+        };
+        let new_y = match cur {
+            None => {
+                // First activation — pick the baseline nearest the top
+                // of the visible area so the cursor lands where the eye
+                // already is.
+                let target = scroll + 24.0;
+                *baselines
+                    .iter()
+                    .min_by(|a, b| {
+                        (**a - target)
+                            .abs()
+                            .partial_cmp(&(**b - target).abs())
+                            .unwrap()
+                    })
+                    .unwrap()
+            }
+            Some(y) => {
+                // Find current index by nearest match (the baseline list
+                // can shift slightly between renders — e.g. font swap or
+                // resize — so don't require exact equality).
+                let idx = baselines
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        (**a - y).abs().partial_cmp(&(**b - y).abs()).unwrap()
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap();
+                let new_idx = (idx as i32 + dir).clamp(0, baselines.len() as i32 - 1) as usize;
+                baselines[new_idx]
+            }
+        };
+        {
+            let mut s = self.shared.state.lock().unwrap();
+            s.read_cursor = Some(new_y);
+            // Keep the cursor inside a comfortable reading band; nudge
+            // scroll only when the cursor would fall outside it.
+            let margin = 80.0_f32.min(vh * 0.25);
+            let screen_y = new_y - s.scroll;
+            if screen_y < margin {
+                s.scroll = (new_y - margin).max(0.0);
+            } else if screen_y > vh - margin {
+                s.scroll = new_y - (vh - margin);
+            }
+        }
+        self.clamp_scroll();
+    }
+
+    /// Move the read cursor to the previous/next section heading and
+    /// scroll so the heading is near the top of the viewport.
+    fn jump_section(&self, dir: i32) {
+        let outline = self.current_outline();
+        if outline.is_empty() {
+            return;
+        }
+        let cur = self.shared.state.lock().unwrap().read_cursor.unwrap_or(0.0);
+        let target = if dir > 0 {
+            outline
+                .iter()
+                .find(|o| o.doc_y > cur + 0.5)
+                .map(|o| o.doc_y)
+                .unwrap_or(outline.last().unwrap().doc_y)
+        } else {
+            outline
+                .iter()
+                .rev()
+                .find(|o| o.doc_y < cur - 0.5)
+                .map(|o| o.doc_y)
+                .unwrap_or(outline.first().unwrap().doc_y)
+        };
+        // Snap to the first baseline at or after the heading's doc_y so
+        // the cursor lands on the heading text itself.
+        let baselines = self.current_baselines();
+        let snap_y = baselines
+            .iter()
+            .find(|b| **b >= target)
+            .copied()
+            .unwrap_or(target);
+        {
+            let mut s = self.shared.state.lock().unwrap();
+            s.read_cursor = Some(snap_y);
+            // Pull the heading near the top of the viewport.
+            s.scroll = (snap_y - 24.0).max(0.0);
+        }
+        self.clamp_scroll();
+    }
+
+    /// Open the context menu at the read cursor's screen position. Menu
+    /// items mirror the right-click flow so the user gets the same
+    /// affordances (copy code, copy table, link actions, dark mode,
+    /// outline jump, etc.) without ever touching the mouse.
+    fn open_context_menu_at_cursor(&self) {
+        let (cursor_y, viewport, dark, active_path, scroll, sidebar_w) = {
+            let s = self.shared.state.lock().unwrap();
+            let Some(y) = s.read_cursor else { return };
+            (y, s.viewport, s.dark, s.source_path.clone(), s.scroll, s.sidebar_width)
+        };
+        // Virtual mouse position: just inside the content area at the
+        // cursor's row. Used for hit-testing copy zones.
+        let theme = if dark { Theme::dark() } else { Theme::light() };
+        let px = sidebar_w + theme.margin_x + 8.0;
+        let py = (cursor_y - scroll).max(0.0);
+        let copy_path = active_path.clone();
+        let zones = self.current_copy_zones();
+        let doc_y = py + scroll;
+        let zone_hit = zones
+            .iter()
+            .find(|z| px >= z.x && px < z.x + z.w && doc_y >= z.y && doc_y < z.y + z.h)
+            .cloned();
+        let copy_selection = self.current_selection_text();
+        let outline_items = outline_to_menu_items(&self.current_outline());
+        let mermaid_items = zone_hit
+            .as_ref()
+            .and_then(|z| z.mermaid_block.map(mermaid_layout_items))
+            .unwrap_or_default();
+        let items = build_context_menu_items(
+            dark,
+            copy_path,
+            !outline_items.is_empty(),
+            copy_selection,
+            zone_hit.as_ref(),
+        );
+        let menu_w = context_menu_width(&items, &self.shared.fonts);
+        let menu_h = context_menu_height(&items);
+        let mut mx = px;
+        let mut my = py;
+        mx = mx.min(viewport.width as f32 - menu_w - 4.0).max(4.0);
+        my = my.min(viewport.height as f32 - menu_h - 4.0).max(4.0);
+        let mut s = self.shared.state.lock().unwrap();
+        s.context_menu = Some(ContextMenu {
+            x: mx,
+            y: my,
+            items,
+            outline_items,
+            mermaid_items,
+            active_submenu: None,
+        });
+    }
+
     fn clamp_scroll(&self) {
         let theme = Theme::light();
         let (source, vw, vh, base_dir, sidebar_w, content_zoom, tcw, tcox) = {
@@ -1930,6 +2142,38 @@ impl App {
             &mut images,
         )?;
         if text.is_empty() { None } else { Some(text) }
+    }
+
+    /// Sorted unique baseline y's for the current document. Same recompute
+    /// pattern as `current_outline` — cheap enough on each ↑/↓ press given
+    /// how the rest of the helpers are written.
+    fn current_baselines(&self) -> Vec<f32> {
+        let snap = self.shared.snapshot();
+        let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+        let mut images = self.shared.images.lock().unwrap();
+        crate::render::compute_baselines(
+            &RenderInput {
+                source: &snap.source,
+                viewport: snap.viewport,
+                scroll: snap.scroll,
+                theme: &snap.theme,
+                fonts: &self.shared.fonts,
+                tree: snap.tree_flat.as_deref(),
+                active_path: snap.source_path.as_deref(),
+                base_dir: base_dir.as_deref(),
+                sidebar_width: snap.sidebar_width,
+                sidebar_scroll: snap.sidebar_scroll,
+                content_zoom: snap.content_zoom,
+                sidebar_zoom: snap.sidebar_zoom,
+                selection: None,
+                hover_pos: None,
+                search: None,
+                mermaid_overrides: Some(&snap.mermaid_overrides),
+                text_column_width: snap.text_column_width,
+                text_column_offset_x: snap.text_column_offset_x,
+            },
+            &mut images,
+        )
     }
 
     fn current_outline(&self) -> Vec<crate::layout::OutlineEntry> {
@@ -2151,6 +2395,24 @@ impl App {
             &mut images,
         );
         drop(images);
+
+        // Read cursor — thin vertical caret in the left margin at the
+        // current line's baseline. Only drawn when the user has actually
+        // started keyboard navigation.
+        if let Some(cursor_y) = snap.read_cursor {
+            let screen_y = cursor_y - snap.scroll;
+            // Approximate the caret height from body line-height; the
+            // caret is purely a visual marker so this doesn't need to
+            // match any specific glyph metric.
+            let lh = snap.theme.body_size * snap.theme.line_height_mult;
+            let top = (screen_y - lh + 2.0).round() as i32;
+            let height = (lh * 0.95) as i32;
+            // Sit just left of the content's left edge — close enough to
+            // the text to read as "this line", far enough not to overlap
+            // letters.
+            let x = (snap.sidebar_width + snap.theme.margin_x - 8.0).max(snap.sidebar_width + 2.0) as i32;
+            fb.fill_rect(x, top, 3, height.max(8), snap.theme.accent);
+        }
 
         if let Some(su) = &snap.search {
             let hover = {
@@ -2409,6 +2671,7 @@ pub fn run(opts: WindowOptions) -> ExitCode {
             quick_open: None,
             quick_open_seq: 0,
             mermaid_overrides: std::collections::HashMap::new(),
+            read_cursor: None,
         }),
     });
 
@@ -2435,6 +2698,7 @@ pub fn run(opts: WindowOptions) -> ExitCode {
         synth_mods: None,
         cursor: CursorIcon::Default,
         last_hover_rect: None,
+        ctrl_alone_armed: false,
     };
 
     match event_loop.run_app(&mut app) {

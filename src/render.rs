@@ -545,6 +545,46 @@ pub fn compute_copy_zones(input: &RenderInput, images: &mut ImageCache) -> Vec<C
     lay.copy_zones
 }
 
+/// Sorted, de-duplicated list of glyph baseline y-coords in document
+/// space. Drives the read-cursor's ↑/↓ stepping so each press lands on
+/// a real line of text rather than scrolling by a fixed offset. Filtered
+/// to selectable glyphs only — chrome (e.g. the code-block copy icon)
+/// is skipped so the cursor doesn't catch on it.
+pub fn compute_baselines(input: &RenderInput, images: &mut ImageCache) -> Vec<f32> {
+    let blocks = parse(input.source);
+    let lay = layout(
+        LayoutInput {
+            blocks: &blocks,
+            tree: input.tree,
+            active_path: input.active_path,
+            base_dir: input.base_dir,
+            viewport_w: input.viewport.width,
+            viewport_h: input.viewport.height,
+            theme: input.theme,
+            fonts: input.fonts,
+            sidebar_width: input.sidebar_width,
+            sidebar_scroll: input.sidebar_scroll,
+            content_zoom: input.content_zoom,
+            sidebar_zoom: input.sidebar_zoom,
+            mermaid_overrides: input.mermaid_overrides,
+            text_column_width: input.text_column_width,
+            text_column_offset_x: input.text_column_offset_x,
+        },
+        images,
+    );
+    let mut ys: Vec<f32> = lay
+        .content_items
+        .iter()
+        .filter_map(|p| match p {
+            Placed::Glyph { baseline, selectable: true, .. } => Some(*baseline),
+            _ => None,
+        })
+        .collect();
+    ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    ys.dedup_by(|a, b| (*a - *b).abs() < 0.5);
+    ys
+}
+
 /// Heading outline of the current document. Computed by the same layout
 /// pass that the render pipeline uses, so doc_y values line up with the
 /// current viewport.
