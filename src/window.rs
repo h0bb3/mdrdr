@@ -888,7 +888,32 @@ impl ApplicationHandler<UserEvent> for App {
                     (click, s.last_mouse)
                 };
                 if click_candidate {
-                    click_at(&self.shared, last_mouse.x as f32, last_mouse.y as f32);
+                    let cx = last_mouse.x as f32;
+                    let cy = last_mouse.y as f32;
+                    click_at(&self.shared, cx, cy);
+                    // Move the read cursor to the clicked row when the
+                    // click lands inside the content area. Snap to the
+                    // nearest baseline so the marker aligns with text.
+                    let (sidebar_w, scroll) = {
+                        let s = self.shared.state.lock().unwrap();
+                        (s.sidebar_width, s.scroll)
+                    };
+                    if cx >= sidebar_w {
+                        let target = cy + scroll;
+                        let baselines = self.current_baselines();
+                        if !baselines.is_empty() {
+                            let snap_y = *baselines
+                                .iter()
+                                .min_by(|a, b| {
+                                    (**a - target)
+                                        .abs()
+                                        .partial_cmp(&(**b - target).abs())
+                                        .unwrap()
+                                })
+                                .unwrap();
+                            self.shared.state.lock().unwrap().read_cursor = Some(snap_y);
+                        }
+                    }
                     self.request_redraw();
                 }
             }
