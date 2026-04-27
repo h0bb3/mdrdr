@@ -974,9 +974,12 @@ impl<'a> Ctx<'a> {
             natural[c] = natural[c].max(measure_inline_run(&header[c], h_style, self.fonts, self.theme));
             for row in rows {
                 if let Some(cell) = row.get(c) {
-                    natural[c] = natural[c].max(
-                        measure_inline_run(cell, base, self.fonts, self.theme),
-                    );
+                    let cw = if let Some(data) = self.cell_image(cell) {
+                        data.width as f32
+                    } else {
+                        measure_inline_run(cell, base, self.fonts, self.theme)
+                    };
+                    natural[c] = natural[c].max(cw);
                 }
             }
             natural[c] += pad_x * 2.0;
@@ -1055,8 +1058,17 @@ impl<'a> Ctx<'a> {
         self.y = y + self.theme.body_size * 0.4;
     }
 
+    /// If `cell` is just an image (whitespace allowed), load it and
+    /// return the cached pixels. Used by table layout to render image
+    /// cells as actual images rather than `[image: alt]` placeholders.
+    fn cell_image(&mut self, cell: &[Inline]) -> Option<Arc<CachedImage>> {
+        let (_, src) = single_image(cell)?;
+        let resolved = ImageCache::resolve(src, self.base_dir)?;
+        self.images.get_or_load(&resolved)
+    }
+
     fn row_height(
-        &self,
+        &mut self,
         row: &[Vec<Inline>],
         _align: &[Align],
         col_w: &[f32],
@@ -1067,8 +1079,14 @@ impl<'a> Ctx<'a> {
         for (c, cell) in row.iter().enumerate() {
             let w = col_w.get(c).copied().unwrap_or(0.0);
             let inner_w = (w - 24.0).max(40.0);
-            let lines = count_wrapped_lines(cell, style, inner_w, self.fonts, self.theme);
-            let h = (lines as f32) * style.size * self.theme.line_height_mult;
+            let h = if let Some(data) = self.cell_image(cell) {
+                let nat_w = data.width as f32;
+                let nat_h = data.height as f32;
+                if nat_w > inner_w { nat_h * (inner_w / nat_w) } else { nat_h }
+            } else {
+                let lines = count_wrapped_lines(cell, style, inner_w, self.fonts, self.theme);
+                (lines as f32) * style.size * self.theme.line_height_mult
+            };
             if h > max_h {
                 max_h = h;
             }
@@ -1094,7 +1112,27 @@ impl<'a> Ctx<'a> {
             let cell_w_inner = (w - pad_x * 2.0).max(1.0);
             let a = align.get(c).copied().unwrap_or(Align::Left);
             let cell_top = y + pad_y;
-            self.draw_cell_inlines(cell, style, cell_x + pad_x, cell_w_inner, cell_top, a);
+            if let Some(data) = self.cell_image(cell) {
+                let nat_w = data.width as f32;
+                let nat_h = data.height as f32;
+                let (img_w, img_h) = if nat_w > cell_w_inner {
+                    (cell_w_inner, nat_h * (cell_w_inner / nat_w))
+                } else {
+                    (nat_w, nat_h)
+                };
+                // Centre vertically inside the cell content area; align
+                // horizontally according to the column's alignment.
+                let inner_h = (row_h - pad_y * 2.0).max(1.0);
+                let img_y = cell_top + ((inner_h - img_h) * 0.5).max(0.0);
+                let img_x = match a {
+                    Align::Left => cell_x + pad_x,
+                    Align::Center => cell_x + pad_x + ((cell_w_inner - img_w) * 0.5).max(0.0),
+                    Align::Right => cell_x + w - pad_x - img_w,
+                };
+                self.items.push(Placed::Image { x: img_x, y: img_y, w: img_w, h: img_h, data });
+            } else {
+                self.draw_cell_inlines(cell, style, cell_x + pad_x, cell_w_inner, cell_top, a);
+            }
             cell_x += w;
             let _ = row_h;
         }
