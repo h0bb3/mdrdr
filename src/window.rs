@@ -2571,19 +2571,18 @@ impl App {
 
         // Read cursor — thin vertical caret in the left margin at the
         // current line's baseline. Only drawn when the user has actually
-        // started keyboard navigation.
+        // started keyboard navigation. Anchored to the text column's
+        // left edge so the caret tracks alongside the text when the
+        // user slides the column with Ctrl+Shift+←/→.
         if let Some(cursor_y) = snap.read_cursor {
             let screen_y = cursor_y - snap.scroll;
-            // Approximate the caret height from body line-height; the
-            // caret is purely a visual marker so this doesn't need to
-            // match any specific glyph metric.
             let lh = snap.theme.body_size * snap.theme.line_height_mult;
             let top = (screen_y - lh + 2.0).round() as i32;
             let height = (lh * 0.95) as i32;
-            // Sit just left of the content's left edge — close enough to
-            // the text to read as "this line", far enough not to overlap
-            // letters.
-            let x = (snap.sidebar_width + snap.theme.margin_x - 8.0).max(snap.sidebar_width + 2.0) as i32;
+            let text_left = snap.sidebar_width
+                + snap.theme.margin_x
+                + snap.text_column_offset_x.max(0.0);
+            let x = (text_left - 8.0).max(snap.sidebar_width + 2.0) as i32;
             fb.fill_rect(x, top, 3, height.max(8), snap.theme.accent);
         }
 
