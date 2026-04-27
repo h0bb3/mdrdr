@@ -2758,6 +2758,9 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
             let max_scroll = (doc_h - vh).max(0.0);
             let mut s = shared.state.lock().unwrap();
             s.scroll = (*y - 8.0).clamp(0.0, max_scroll);
+            // Pull the read cursor along to the new section so the
+            // reader token marks where the user just jumped.
+            s.read_cursor = Some(*y);
         }
     }
     Some(action)
@@ -3700,6 +3703,9 @@ fn apply_menu_action(shared: &Arc<Shared>, proxy: &EventLoopProxy<UserEvent>, ac
             let max_scroll = (doc_h - vh).max(0.0);
             let mut s = shared.state.lock().unwrap();
             s.scroll = (*doc_y - 8.0).clamp(0.0, max_scroll);
+            // Pull the read cursor along to the new section so the
+            // reader token marks where the user just jumped.
+            s.read_cursor = Some(*doc_y);
         }
     }
 }
