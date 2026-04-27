@@ -666,7 +666,19 @@ impl<'a> Ctx<'a> {
                 }
                 let start_y = self.y;
                 let rect_x = self.content_left + indent;
-                let rect_w = (self.content_right - rect_x).max(1.0);
+                let avail_w = (self.content_right - rect_x).max(1.0);
+                // Shrink-fit to the longest line so short snippets don't
+                // sprawl across the whole content column. Capped at avail_w
+                // — long lines still get the truncation path below.
+                let max_line_w: f32 = lines
+                    .iter()
+                    .map(|l| {
+                        l.chars()
+                            .map(|c| self.fonts.mono.metrics(c, size).advance_width)
+                            .sum::<f32>()
+                    })
+                    .fold(0.0, f32::max);
+                let rect_w = (max_line_w + pad * 2.0).min(avail_w).max(1.0);
                 let rect_h = lines.len() as f32 * lh + pad * 2.0;
                 self.items.push(Placed::Rect {
                     x: rect_x,
