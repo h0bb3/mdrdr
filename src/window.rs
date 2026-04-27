@@ -110,6 +110,15 @@ pub struct ContextMenu {
     /// overlapping panel rects (outline + mermaid layout both anchor at
     /// `m.x + main_w - 2`) from fighting each other.
     pub active_submenu: Option<SubmenuKind>,
+    /// Keyboard selection in the main menu — `Some(i)` means item `i`
+    /// is highlighted and Enter activates it. `None` means the menu is
+    /// purely mouse-driven (right-click flow). Set to `Some(0)` when
+    /// the menu opens via Ctrl-tap or when ↑/↓ is pressed.
+    pub selected: Option<usize>,
+    /// Keyboard selection inside an open submenu. When `Some`, the
+    /// submenu is drawn regardless of mouse position and Enter activates
+    /// the chosen entry. ←/Esc returns to the parent menu.
+    pub submenu_selected: Option<(SubmenuKind, usize)>,
 }
 
 /// The two kinds of submenu sharing the same layout machinery, distinguished
@@ -486,6 +495,11 @@ impl ApplicationHandler<UserEvent> for App {
                     let mut s = self.shared.state.lock().unwrap();
                     if let Some(m) = s.context_menu.as_mut() {
                         m.active_submenu = new_active;
+                        // The user is steering with the mouse now — hand
+                        // control back to hover so a stale keyboard
+                        // selection doesn't outshine the cursor.
+                        m.selected = None;
+                        m.submenu_selected = None;
                     }
                     drop(s);
                     self.request_redraw();
@@ -834,6 +848,8 @@ impl ApplicationHandler<UserEvent> for App {
                     s.context_menu = Some(ContextMenu {
                         x: mx, y: my, items, outline_items, mermaid_items,
                         active_submenu: None,
+                        selected: None,
+                        submenu_selected: None,
                     });
                 }
                 self.request_redraw();
@@ -888,7 +904,18 @@ impl ApplicationHandler<UserEvent> for App {
                 } else if old_ctrl && !new_ctrl && self.ctrl_alone_armed {
                     self.ctrl_alone_armed = false;
                     self.modifiers = mods;
-                    if self.shared.state.lock().unwrap().read_cursor.is_some() {
+                    let menu_was_open = {
+                        let mut s = self.shared.state.lock().unwrap();
+                        if s.context_menu.is_some() {
+                            s.context_menu = None;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if menu_was_open {
+                        self.request_redraw();
+                    } else if self.shared.state.lock().unwrap().read_cursor.is_some() {
                         self.open_context_menu_at_cursor();
                         self.request_redraw();
                     }
@@ -909,6 +936,40 @@ impl ApplicationHandler<UserEvent> for App {
                 if !matches!(logical_key.as_ref(), Key::Named(NamedKey::Control)
                     | Key::Named(NamedKey::Super)) {
                     self.ctrl_alone_armed = false;
+                }
+                // Context menu — modal for keyboard while open. ↑/↓ moves
+                // the selection (wraps); → opens a submenu trigger; ←
+                // returns from a submenu; Enter activates the highlighted
+                // item; Esc closes (handled below in the main key match).
+                if self.shared.state.lock().unwrap().context_menu.is_some() {
+                    match logical_key.as_ref() {
+                        Key::Named(NamedKey::ArrowDown) => {
+                            self.menu_move(1);
+                            self.request_redraw();
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            self.menu_move(-1);
+                            self.request_redraw();
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowRight) => {
+                            self.menu_open_submenu();
+                            self.request_redraw();
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowLeft) => {
+                            self.menu_close_submenu();
+                            self.request_redraw();
+                            return;
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            self.menu_activate();
+                            self.request_redraw();
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
                 // Quick-open overlay is modal for keyboard when open.
                 let quick_open_active = self.shared.state.lock().unwrap().quick_open.is_some();
@@ -1961,7 +2022,94 @@ impl App {
             outline_items,
             mermaid_items,
             active_submenu: None,
+            // Ctrl-tap is keyboard-driven — start with the first item
+            // selected so ↓/Enter just works without a mouse move.
+            selected: Some(0),
+            submenu_selected: None,
         });
+    }
+
+    /// Move the keyboard selection in the open context menu by `dir`
+    /// rows (wraps). Operates inside the active submenu when one is
+    /// open; otherwise on the main list. First press on a mouse-opened
+    /// menu seeds `selected` so the user doesn't have to press twice.
+    fn menu_move(&self, dir: i32) {
+        let mut s = self.shared.state.lock().unwrap();
+        let Some(m) = s.context_menu.as_mut() else { return };
+        if let Some((kind, idx)) = m.submenu_selected {
+            let items = kind.items(m).len() as i32;
+            if items == 0 {
+                return;
+            }
+            let new = (idx as i32 + dir).rem_euclid(items) as usize;
+            m.submenu_selected = Some((kind, new));
+        } else {
+            let n = m.items.len() as i32;
+            if n == 0 {
+                return;
+            }
+            let cur = m.selected.unwrap_or(if dir > 0 { n - 1 } else { 0 } as usize);
+            let new = (cur as i32 + dir).rem_euclid(n) as usize;
+            m.selected = Some(new);
+        }
+    }
+
+    /// → on a submenu trigger row opens that submenu and moves the
+    /// keyboard selection into its first item. No-op on plain rows.
+    fn menu_open_submenu(&self) {
+        let mut s = self.shared.state.lock().unwrap();
+        let Some(m) = s.context_menu.as_mut() else { return };
+        // Already in a submenu — nothing to do.
+        if m.submenu_selected.is_some() {
+            return;
+        }
+        let Some(idx) = m.selected else { return };
+        let action = m.items.get(idx).map(|(_, a)| a.clone());
+        let kind = match action {
+            Some(MenuAction::Outline) => SubmenuKind::Outline,
+            Some(MenuAction::MermaidMenu) => SubmenuKind::Mermaid,
+            _ => return,
+        };
+        if !kind.items(m).is_empty() {
+            m.submenu_selected = Some((kind, 0));
+        }
+    }
+
+    /// ← inside a submenu returns focus to the parent menu's trigger row.
+    fn menu_close_submenu(&self) {
+        let mut s = self.shared.state.lock().unwrap();
+        if let Some(m) = s.context_menu.as_mut() {
+            m.submenu_selected = None;
+        }
+    }
+
+    /// Activate the keyboard-selected menu item. Submenu triggers open
+    /// the submenu rather than dispatching. Returns true if anything
+    /// was acted on (so the caller knows to redraw).
+    fn menu_activate(&self) -> bool {
+        let action = {
+            let s = self.shared.state.lock().unwrap();
+            let Some(m) = s.context_menu.as_ref() else { return false };
+            if let Some((kind, idx)) = m.submenu_selected {
+                kind.items(m).get(idx).map(|(_, a)| a.clone())
+            } else if let Some(idx) = m.selected {
+                m.items.get(idx).map(|(_, a)| a.clone())
+            } else {
+                None
+            }
+        };
+        let Some(action) = action else { return false };
+        match action {
+            MenuAction::Outline | MenuAction::MermaidMenu => {
+                self.menu_open_submenu();
+                true
+            }
+            other => {
+                self.shared.state.lock().unwrap().context_menu = None;
+                apply_menu_action(&self.shared, &self.proxy, &other);
+                true
+            }
+        }
     }
 
     fn clamp_scroll(&self) {
@@ -3566,15 +3714,20 @@ fn draw_context_menu(
     m: &ContextMenu,
     hover: Option<(f32, f32)>,
 ) {
-    draw_menu_panel(fb, theme, fonts, m.x, m.y, &m.items, hover);
+    // Main panel — highlight either the hovered row or the keyboard
+    // selection. Mouse hover wins when both are available; the cursor-
+    // moved handler clears `selected` once the mouse enters the menu.
+    let main_kb = if hover.is_none() { m.selected } else { None };
+    draw_menu_panel(fb, theme, fonts, m.x, m.y, &m.items, hover, main_kb);
 
-    // At most one submenu is active at a time — whichever trigger row or
-    // panel the cursor is over.
-    if let Some((hx, hy)) = hover {
-        if let Some(kind) = active_submenu(m, hx, hy, fonts) {
-            if let Some((sx, sy, _sw, _sh)) = kind.anchor(m, fonts) {
-                draw_submenu_panel(fb, theme, fonts, sx, sy, kind.items(m), hover);
-            }
+    // Submenu — drawn when the keyboard has opened it OR the cursor is
+    // over a trigger row / submenu panel.
+    let kb_kind = m.submenu_selected.map(|(k, _)| k);
+    let mouse_kind = hover.and_then(|(hx, hy)| active_submenu(m, hx, hy, fonts));
+    if let Some(kind) = kb_kind.or(mouse_kind) {
+        if let Some((sx, sy, _sw, _sh)) = kind.anchor(m, fonts) {
+            let sub_kb = m.submenu_selected.and_then(|(k, i)| if k == kind { Some(i) } else { None });
+            draw_submenu_panel(fb, theme, fonts, sx, sy, kind.items(m), hover, sub_kb);
         }
     }
 }
@@ -3587,6 +3740,7 @@ fn draw_menu_panel(
     my: f32,
     items: &[(String, MenuAction)],
     hover: Option<(f32, f32)>,
+    keyboard_selected: Option<usize>,
 ) {
     let w = context_menu_width(items, fonts);
     let h = context_menu_height(items);
@@ -3612,10 +3766,11 @@ fn draw_menu_panel(
         let idx = (local_y / MENU_ITEM_H) as usize;
         if idx < items.len() { Some(idx) } else { None }
     });
+    let highlight = hover_idx.or(keyboard_selected);
 
     for (i, (label, _)) in items.iter().enumerate() {
         let iy = my + MENU_PAD_Y + MENU_ITEM_H * i as f32;
-        if Some(i) == hover_idx {
+        if Some(i) == highlight {
             fb.fill_rect(
                 (mx + 1.0) as i32,
                 iy as i32,
@@ -3642,6 +3797,7 @@ fn draw_submenu_panel(
     sy: f32,
     items: &[(String, MenuAction)],
     hover: Option<(f32, f32)>,
+    keyboard_selected: Option<usize>,
 ) {
     let w = submenu_width(items, fonts);
     let h = submenu_height(items);
@@ -3668,10 +3824,11 @@ fn draw_submenu_panel(
         let idx = (local_y / MENU_ITEM_H) as usize;
         if idx < items.len() { Some(idx) } else { None }
     });
+    let highlight = hover_idx.or(keyboard_selected);
 
     for (i, (label, _)) in items.iter().enumerate() {
         let iy = sy + MENU_PAD_Y + MENU_ITEM_H * i as f32;
-        if Some(i) == hover_idx {
+        if Some(i) == highlight {
             fb.fill_rect(
                 (sx + 1.0) as i32,
                 iy as i32,
