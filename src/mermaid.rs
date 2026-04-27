@@ -1184,35 +1184,87 @@ fn layout_sequence(seq: Sequence, max_width: f32, theme: &Theme, fonts: &Fonts) 
     let top_margin = 4.0;
     let bottom_margin = 4.0;
 
-    // Lane width — start from the widest header label, then bump if any
-    // adjacent-pair message label needs more room.
-    let mut lane_w: f32 = 80.0;
-    for p in &seq.participants {
-        let w = measure_label(&p.label, head_size, head_font).0 + pad_x * 2.0;
-        if w > lane_w {
-            lane_w = w;
-        }
+    // Per-participant header widths.
+    let header_w: Vec<f32> = seq
+        .participants
+        .iter()
+        .map(|p| measure_label(&p.label, head_size, head_font).0 + pad_x * 2.0)
+        .collect();
+    // Lane sizing as per-gap widths so wide labels only widen the gaps
+    // they actually cross — no global ballooning that wastes space on
+    // the unrelated lanes. Each gap starts at "fit the two adjacent
+    // header halves with breathing room", then grows if a message
+    // spanning that gap (single- or multi-hop) demands more.
+    let min_gap_pad: f32 = 24.0;
+    let mut gap: Vec<f32> = Vec::with_capacity(n.saturating_sub(1));
+    for i in 0..n.saturating_sub(1) {
+        gap.push((header_w[i] + header_w[i + 1]) / 2.0 + min_gap_pad);
     }
     for m in &seq.messages {
         if m.from == m.to {
             continue;
         }
-        let span = (m.to as i32 - m.from as i32).unsigned_abs() as f32;
-        let need = (measure_label(&m.label, msg_size, msg_font).0 + 24.0) / span.max(1.0);
-        if need > lane_w {
-            lane_w = need;
+        let (a, b) = (m.from.min(m.to), m.from.max(m.to));
+        let label_w = measure_label(&m.label, msg_size, msg_font).0;
+        let need = label_w + 24.0;
+        let cur_span: f32 = gap[a..b].iter().sum();
+        if need > cur_span {
+            let extra = need - cur_span;
+            let per = extra / (b - a) as f32;
+            for g in &mut gap[a..b] {
+                *g += per;
+            }
         }
     }
-    // Don't overflow the available width — clamp lane_w if the
-    // unbounded layout is wider than what the caller offered.
-    let unbounded_w = lane_w * n as f32;
-    let scale = if unbounded_w > max_width && unbounded_w > 0.0 {
-        max_width / unbounded_w
-    } else {
-        1.0
-    };
-    let lane_w = lane_w * scale;
-    let total_w = lane_w * n as f32;
+    // Self-call loops always sit on the right side of the participant
+    // lifeline; the loop + label can extend either into the next lane's
+    // gap (when there is one) or past the diagram's right edge (when on
+    // the rightmost lane). Reserve space accordingly so labels never
+    // paint outside the wrapping background.
+    let loop_w = 36.0_f32;
+    let mut right_extra = 0.0_f32;
+    for m in &seq.messages {
+        if m.from != m.to {
+            continue;
+        }
+        let label_w = if m.label.is_empty() {
+            0.0
+        } else {
+            measure_label(&m.label, msg_size, msg_font).0
+        };
+        let extent = loop_w + 8.0 + label_w + 8.0;
+        if m.from + 1 == n {
+            right_extra = right_extra.max(extent);
+        } else if let Some(g) = gap.get_mut(m.from) {
+            // Need room for: half of this lane's header + loop + label,
+            // measured from this lane's centre to the next one. Half of
+            // the next header doesn't apply since the label sits in the
+            // gap, not on the next lifeline.
+            let half_self = header_w[m.from] / 2.0;
+            let need = half_self + extent;
+            if need > *g {
+                *g = need;
+            }
+        }
+    }
+    let left_margin = header_w.first().copied().unwrap_or(0.0) / 2.0 + 8.0;
+    let right_margin = header_w.last().copied().unwrap_or(0.0) / 2.0 + 8.0 + right_extra;
+    let mut center_x: Vec<f32> = Vec::with_capacity(n);
+    center_x.push(left_margin);
+    for i in 1..n {
+        center_x.push(center_x[i - 1] + gap[i - 1]);
+    }
+    let mut total_w = center_x.last().copied().unwrap_or(0.0) + right_margin;
+    // If the unbounded layout overflows the caller's width, scale the
+    // whole layout uniformly. Self-call loop widths track the scale via
+    // `lane_step` below so the loops shrink with everything else.
+    if total_w > max_width && total_w > 0.0 {
+        let scale = max_width / total_w;
+        for c in center_x.iter_mut() {
+            *c *= scale;
+        }
+        total_w = max_width;
+    }
 
     // Row heights: one row per message; self-messages take more.
     let mut row_top: Vec<f32> = Vec::with_capacity(seq.messages.len() + 1);
@@ -1234,7 +1286,6 @@ fn layout_sequence(seq: Sequence, max_width: f32, theme: &Theme, fonts: &Fonts) 
     // sandwich, outer = stroke colour, inner = fill).
     let head_bg = theme.bg;
     let head_border = stroke;
-    let center_x: Vec<f32> = (0..n).map(|i| lane_w * (i as f32 + 0.5)).collect();
 
     // Lifelines — dashed verticals from the bottom of the top header to
     // the top of the bottom header.
@@ -1247,9 +1298,8 @@ fn layout_sequence(seq: Sequence, max_width: f32, theme: &Theme, fonts: &Fonts) 
     // Participant headers (top + bottom copies, drawn as rounded rects).
     for (i, p) in seq.participants.iter().enumerate() {
         let cx = center_x[i];
-        let w = (lane_w - 12.0).max(40.0);
         let label_w = measure_label(&p.label, head_size, head_font).0;
-        let used_w = (label_w + pad_x * 2.0).min(w);
+        let used_w = (label_w + pad_x * 2.0).max(40.0);
         let x = cx - used_w / 2.0;
         for &y_top in &[top_margin, footer_y] {
             // Outer rect = border colour, inner rect = fill — same
@@ -1289,9 +1339,9 @@ fn layout_sequence(seq: Sequence, max_width: f32, theme: &Theme, fonts: &Fonts) 
         let y = row_top[i];
         if m.from == m.to {
             // Self-call: small loop on the right side of the participant's
-            // lifeline.
+            // lifeline. The right margin reservation above already
+            // accounts for this when the participant is the rightmost.
             let cx = center_x[m.from];
-            let loop_w = (lane_w * 0.38).clamp(28.0, 80.0);
             let y0 = y + msg_size * 0.6;
             let y1 = y + self_row_h - msg_size * 0.8;
             // Top horizontal
