@@ -111,7 +111,8 @@ pub fn render(src: &str, max_width: f32, theme: &Theme, fonts: &Fonts) -> Option
 
 /// Same as `render`, but lets the caller replace the direction declared
 /// by the source's `flowchart ...` header. Used by the per-diagram layout
-/// override the right-click context menu offers.
+/// override the right-click context menu offers. The override is ignored
+/// for sequence diagrams — they don't have a TB/LR concept.
 pub fn render_with(
     src: &str,
     max_width: f32,
@@ -119,6 +120,9 @@ pub fn render_with(
     fonts: &Fonts,
     override_dir: Option<Direction>,
 ) -> Option<MermaidRender> {
+    if let Some(seq) = parse_sequence(src) {
+        return Some(layout_sequence(seq, max_width, theme, fonts));
+    }
     let mut graph = parse(src)?;
     if let Some(d) = override_dir {
         graph.direction = d;
@@ -1049,4 +1053,333 @@ fn anchor_in(n: &Node, dir: &Direction, scale: f32) -> (f32, f32) {
         Direction::RightLeft => ((n.x + n.w) * scale, (n.y + n.h / 2.0) * scale),
         Direction::Diagonal => ((n.x + n.w / 2.0) * scale, (n.y + n.h / 2.0) * scale),
     }
+}
+
+// ───── sequence diagrams ───────────────────────────────────────────────────
+//
+// Minimal subset of mermaid sequence diagrams. Supports:
+//   sequenceDiagram
+//   participant ID
+//   participant ID as Display Label
+//   X->>Y: msg            — solid arrow
+//   X-->>Y: msg           — dashed arrow (typical "response")
+//   X->Y: msg / X-->Y: msg — also accepted
+//   X->>X: msg            — self-call rendered as a small loop on X's lifeline
+//
+// Out of scope: alt/loop/opt/par blocks, Note over/left of/right of,
+// activate/deactivate, autonumber. Falls back to a code block on parse
+// failure (handled by the caller).
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeqLineKind {
+    Solid,
+    Dashed,
+}
+
+#[derive(Debug)]
+struct SeqMsg {
+    from: usize,
+    to: usize,
+    kind: SeqLineKind,
+    label: String,
+}
+
+#[derive(Debug)]
+struct SeqParticipant {
+    /// Display label — what's drawn in the header. Defaults to the id.
+    label: String,
+}
+
+struct Sequence {
+    participants: Vec<SeqParticipant>,
+    messages: Vec<SeqMsg>,
+}
+
+fn parse_sequence(src: &str) -> Option<Sequence> {
+    let mut it = src.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("%%"));
+    let header = it.next()?;
+    if !header.eq_ignore_ascii_case("sequenceDiagram") {
+        return None;
+    }
+    let mut ids: Vec<String> = Vec::new();
+    let mut participants: Vec<SeqParticipant> = Vec::new();
+    let mut messages: Vec<SeqMsg> = Vec::new();
+
+    fn ensure(ids: &mut Vec<String>, participants: &mut Vec<SeqParticipant>, id: &str) -> usize {
+        if let Some(i) = ids.iter().position(|x| x == id) {
+            return i;
+        }
+        ids.push(id.to_string());
+        participants.push(SeqParticipant { label: id.to_string() });
+        ids.len() - 1
+    }
+
+    for line in it {
+        if let Some(rest) = line.strip_prefix("participant ").or_else(|| line.strip_prefix("actor ")) {
+            let rest = rest.trim();
+            // "ID" or "ID as Label" — split on " as " (literal).
+            let (id, label) = if let Some(idx) = rest.find(" as ") {
+                (rest[..idx].trim(), rest[idx + 4..].trim())
+            } else {
+                (rest, rest)
+            };
+            if let Some(i) = ids.iter().position(|x| x == id) {
+                participants[i].label = label.to_string();
+            } else {
+                ids.push(id.to_string());
+                participants.push(SeqParticipant { label: label.to_string() });
+            }
+            continue;
+        }
+        if let Some((arrow_start, arrow_end, kind)) = find_seq_arrow(line) {
+            let from_str = line[..arrow_start].trim();
+            let after = &line[arrow_end..];
+            let (to_str, label) = match after.split_once(':') {
+                Some((t, l)) => (t.trim(), l.trim().to_string()),
+                None => (after.trim(), String::new()),
+            };
+            if from_str.is_empty() || to_str.is_empty() {
+                continue;
+            }
+            let from = ensure(&mut ids, &mut participants, from_str);
+            let to = ensure(&mut ids, &mut participants, to_str);
+            messages.push(SeqMsg { from, to, kind, label });
+        }
+        // Other lines (Note, alt, loop, etc.) are silently skipped — the
+        // parse still produces a usable diagram for the supported subset.
+    }
+    if participants.is_empty() {
+        return None;
+    }
+    Some(Sequence { participants, messages })
+}
+
+/// Match the longest arrow form first so `-->>` doesn't get parsed as `-->`.
+fn find_seq_arrow(line: &str) -> Option<(usize, usize, SeqLineKind)> {
+    for (pat, kind) in [
+        ("-->>", SeqLineKind::Dashed),
+        ("->>", SeqLineKind::Solid),
+        ("-->", SeqLineKind::Dashed),
+        ("->", SeqLineKind::Solid),
+    ] {
+        if let Some(start) = line.find(pat) {
+            return Some((start, start + pat.len(), kind));
+        }
+    }
+    None
+}
+
+fn layout_sequence(seq: Sequence, max_width: f32, theme: &Theme, fonts: &Fonts) -> MermaidRender {
+    let n = seq.participants.len();
+    let head_size = theme.body_size;
+    let msg_size = theme.body_size * 0.92;
+    let head_font = pick_font(fonts, FontId::Body);
+    let msg_font = pick_font(fonts, FontId::Body);
+
+    let pad_x = 14.0;
+    let head_pad_y = 8.0;
+    let head_h = head_size + head_pad_y * 2.0;
+    let row_h = msg_size * 2.0;
+    let self_row_h = msg_size * 3.0;
+    let top_margin = 4.0;
+    let bottom_margin = 4.0;
+
+    // Lane width — start from the widest header label, then bump if any
+    // adjacent-pair message label needs more room.
+    let mut lane_w: f32 = 80.0;
+    for p in &seq.participants {
+        let w = measure_label(&p.label, head_size, head_font).0 + pad_x * 2.0;
+        if w > lane_w {
+            lane_w = w;
+        }
+    }
+    for m in &seq.messages {
+        if m.from == m.to {
+            continue;
+        }
+        let span = (m.to as i32 - m.from as i32).unsigned_abs() as f32;
+        let need = (measure_label(&m.label, msg_size, msg_font).0 + 24.0) / span.max(1.0);
+        if need > lane_w {
+            lane_w = need;
+        }
+    }
+    // Don't overflow the available width — clamp lane_w if the
+    // unbounded layout is wider than what the caller offered.
+    let unbounded_w = lane_w * n as f32;
+    let scale = if unbounded_w > max_width && unbounded_w > 0.0 {
+        max_width / unbounded_w
+    } else {
+        1.0
+    };
+    let lane_w = lane_w * scale;
+    let total_w = lane_w * n as f32;
+
+    // Row heights: one row per message; self-messages take more.
+    let mut row_top: Vec<f32> = Vec::with_capacity(seq.messages.len() + 1);
+    let mut y = top_margin + head_h + 8.0;
+    for m in &seq.messages {
+        row_top.push(y);
+        y += if m.from == m.to { self_row_h } else { row_h };
+    }
+    let messages_end_y = y;
+    let footer_y = messages_end_y + 8.0;
+    let total_h = footer_y + head_h + bottom_margin;
+
+    let mut items: Vec<Placed> = Vec::new();
+    let stroke = theme.muted;
+    let body_fg = theme.fg;
+    // The diagram's outer wrapper already paints `code_bg`; pop the
+    // participant headers out by filling them with the page background
+    // and giving them a muted-stroke outline (round-rect-on-round-rect
+    // sandwich, outer = stroke colour, inner = fill).
+    let head_bg = theme.bg;
+    let head_border = stroke;
+    let center_x: Vec<f32> = (0..n).map(|i| lane_w * (i as f32 + 0.5)).collect();
+
+    // Lifelines — dashed verticals from the bottom of the top header to
+    // the top of the bottom header.
+    let life_top = top_margin + head_h;
+    let life_bottom = footer_y;
+    for &cx in &center_x {
+        emit_dashed_v(&mut items, cx, life_top, life_bottom, stroke);
+    }
+
+    // Participant headers (top + bottom copies, drawn as rounded rects).
+    for (i, p) in seq.participants.iter().enumerate() {
+        let cx = center_x[i];
+        let w = (lane_w - 12.0).max(40.0);
+        let label_w = measure_label(&p.label, head_size, head_font).0;
+        let used_w = (label_w + pad_x * 2.0).min(w);
+        let x = cx - used_w / 2.0;
+        for &y_top in &[top_margin, footer_y] {
+            // Outer rect = border colour, inner rect = fill — same
+            // sandwich trick the flowchart nodes use.
+            items.push(Placed::RoundRect {
+                x,
+                y: y_top,
+                w: used_w,
+                h: head_h,
+                radius: 6.0,
+                color: head_border,
+            });
+            items.push(Placed::RoundRect {
+                x: x + 1.0,
+                y: y_top + 1.0,
+                w: used_w - 2.0,
+                h: head_h - 2.0,
+                radius: 5.0,
+                color: head_bg,
+            });
+            // Underline-style baseline for the top header to give it a
+            // visual handle where the lifeline drops.
+            emit_label_lines(
+                &mut items,
+                &p.label,
+                head_font,
+                head_size,
+                cx,
+                y_top + head_h / 2.0,
+                body_fg,
+            );
+        }
+    }
+
+    // Messages.
+    for (i, m) in seq.messages.iter().enumerate() {
+        let y = row_top[i];
+        if m.from == m.to {
+            // Self-call: small loop on the right side of the participant's
+            // lifeline.
+            let cx = center_x[m.from];
+            let loop_w = (lane_w * 0.38).clamp(28.0, 80.0);
+            let y0 = y + msg_size * 0.6;
+            let y1 = y + self_row_h - msg_size * 0.8;
+            // Top horizontal
+            items.push(Placed::Rect { x: cx, y: y0, w: loop_w, h: 1.0, color: stroke });
+            // Right vertical
+            items.push(Placed::Rect { x: cx + loop_w, y: y0, w: 1.0, h: y1 - y0, color: stroke });
+            // Bottom horizontal back to the lifeline
+            if m.kind == SeqLineKind::Dashed {
+                emit_dashed_h(&mut items, cx, cx + loop_w, y1, stroke);
+            } else {
+                items.push(Placed::Rect { x: cx, y: y1, w: loop_w, h: 1.0, color: stroke });
+            }
+            emit_arrow_head(&mut items, cx, y1, false, stroke);
+            // Label to the right of the loop
+            if !m.label.is_empty() {
+                emit_label_lines(
+                    &mut items,
+                    &m.label,
+                    msg_font,
+                    msg_size,
+                    cx + loop_w + 6.0 + measure_label(&m.label, msg_size, msg_font).0 / 2.0,
+                    (y0 + y1) / 2.0,
+                    body_fg,
+                );
+            }
+        } else {
+            let x_from = center_x[m.from];
+            let x_to = center_x[m.to];
+            let arrow_y = y + row_h * 0.62;
+            let going_right = x_to > x_from;
+            let (lo, hi) = if going_right { (x_from, x_to) } else { (x_to, x_from) };
+            // Line
+            if m.kind == SeqLineKind::Dashed {
+                emit_dashed_h(&mut items, lo, hi, arrow_y, stroke);
+            } else {
+                items.push(Placed::Rect { x: lo, y: arrow_y, w: hi - lo, h: 1.0, color: stroke });
+            }
+            // Arrow head at the destination
+            emit_arrow_head(&mut items, x_to, arrow_y, going_right, stroke);
+            // Label centered above the arrow
+            if !m.label.is_empty() {
+                let cx = (lo + hi) / 2.0;
+                let cy = arrow_y - msg_size * 0.85;
+                emit_label_lines(&mut items, &m.label, msg_font, msg_size, cx, cy, body_fg);
+            }
+        }
+    }
+
+    MermaidRender {
+        items,
+        width: total_w,
+        height: total_h,
+    }
+}
+
+/// Draw a dashed vertical line as a column of short rect segments.
+fn emit_dashed_v(items: &mut Vec<Placed>, x: f32, y0: f32, y1: f32, color: Rgba) {
+    let dash: f32 = 4.0;
+    let gap: f32 = 4.0;
+    let mut y = y0;
+    while y < y1 {
+        let h = dash.min(y1 - y);
+        items.push(Placed::Rect { x: x - 0.5, y, w: 1.0, h, color });
+        y += dash + gap;
+    }
+}
+
+fn emit_dashed_h(items: &mut Vec<Placed>, x0: f32, x1: f32, y: f32, color: Rgba) {
+    let dash: f32 = 5.0;
+    let gap: f32 = 4.0;
+    let mut x = x0;
+    while x < x1 {
+        let w = dash.min(x1 - x);
+        items.push(Placed::Rect { x, y: y - 0.5, w, h: 1.0, color });
+        x += dash + gap;
+    }
+}
+
+/// Filled triangle pointing into `(x, y)`. `right` chooses the direction
+/// the arrow flies (true → arrow pointing rightwards, head sits at x).
+fn emit_arrow_head(items: &mut Vec<Placed>, x: f32, y: f32, right: bool, color: Rgba) {
+    let h = 6.0;
+    let w = 8.0;
+    let (tail_x, tip_x) = if right { (x - w, x) } else { (x + w, x) };
+    items.push(Placed::Triangle {
+        p1: (tip_x, y),
+        p2: (tail_x, y - h * 0.5),
+        p3: (tail_x, y + h * 0.5),
+        color,
+    });
 }
