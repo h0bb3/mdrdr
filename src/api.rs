@@ -262,6 +262,8 @@ fn compute_max_scroll(shared: &Arc<Shared>) -> f32 {
         base_dir.as_deref(),
         snap.sidebar_width,
         snap.content_zoom,
+        snap.text_column_width,
+        snap.text_column_offset_x,
         &snap.theme,
         &shared.fonts,
         &mut images,

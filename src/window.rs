@@ -935,9 +935,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     Key::Named(NamedKey::End) => {
                         let theme = Theme::light();
-                        let (sidebar_w, content_zoom) = {
+                        let (sidebar_w, content_zoom, tcw, tcox) = {
                             let s = self.shared.state.lock().unwrap();
-                            (s.sidebar_width, s.content_zoom)
+                            (s.sidebar_width, s.content_zoom, s.text_column_width, s.text_column_offset_x)
                         };
                         let mut images = self.shared.images.lock().unwrap();
                         let doc_h = measure(
@@ -947,6 +947,8 @@ impl ApplicationHandler<UserEvent> for App {
                             base_dir.as_deref(),
                             sidebar_w,
                             content_zoom,
+                            tcw,
+                            tcox,
                             &theme,
                             &self.shared.fonts,
                             &mut images,
@@ -1407,7 +1409,7 @@ impl App {
     /// Centre the current match in the viewport, clamped to doc bounds.
     fn scroll_to_match(&self, doc_y: f32) {
         let theme = Theme::light();
-        let (source, vw, vh, base_dir, sidebar_w, content_zoom) = {
+        let (source, vw, vh, base_dir, sidebar_w, content_zoom, tcw, tcox) = {
             let s = self.shared.state.lock().unwrap();
             (
                 s.source.clone(),
@@ -1416,12 +1418,15 @@ impl App {
                 s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
                 s.sidebar_width,
                 s.content_zoom,
+                s.text_column_width,
+                s.text_column_offset_x,
             )
         };
         let mut images = self.shared.images.lock().unwrap();
         let doc_h = measure(
             &source, vw, vh as u32,
             base_dir.as_deref(), sidebar_w, content_zoom,
+            tcw, tcox,
             &theme, &self.shared.fonts, &mut images,
         );
         drop(images);
@@ -1749,7 +1754,7 @@ impl App {
 
     fn clamp_scroll(&self) {
         let theme = Theme::light();
-        let (source, vw, vh, base_dir, sidebar_w, content_zoom) = {
+        let (source, vw, vh, base_dir, sidebar_w, content_zoom, tcw, tcox) = {
             let s = self.shared.state.lock().unwrap();
             (
                 s.source.clone(),
@@ -1758,6 +1763,8 @@ impl App {
                 s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
                 s.sidebar_width,
                 s.content_zoom,
+                s.text_column_width,
+                s.text_column_offset_x,
             )
         };
         let mut images = self.shared.images.lock().unwrap();
@@ -1768,6 +1775,8 @@ impl App {
             base_dir.as_deref(),
             sidebar_w,
             content_zoom,
+            tcw,
+            tcox,
             &theme,
             &self.shared.fonts,
             &mut images,
@@ -2030,7 +2039,7 @@ impl App {
 
     fn current_scrollbar_geom(&self) -> Option<SbGeom> {
         let theme = Theme::light();
-        let (source, viewport, base_dir, sidebar_w, scroll, content_zoom) = {
+        let (source, viewport, base_dir, sidebar_w, scroll, content_zoom, tcw, tcox) = {
             let s = self.shared.state.lock().unwrap();
             (
                 s.source.clone(),
@@ -2039,6 +2048,8 @@ impl App {
                 s.sidebar_width,
                 s.scroll,
                 s.content_zoom,
+                s.text_column_width,
+                s.text_column_offset_x,
             )
         };
         let mut images = self.shared.images.lock().unwrap();
@@ -2049,6 +2060,8 @@ impl App {
             base_dir.as_deref(),
             sidebar_w,
             content_zoom,
+            tcw,
+            tcox,
             &theme,
             &self.shared.fonts,
             &mut images,
@@ -2304,7 +2317,7 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
             // Clamp against the actual doc height so clicking "Smallest
             // heading" near the end doesn't scroll past the bottom.
             let theme = Theme::light();
-            let (source, vw, vh, base_dir, sidebar_w, content_zoom) = {
+            let (source, vw, vh, base_dir, sidebar_w, content_zoom, tcw, tcox) = {
                 let s = shared.state.lock().unwrap();
                 (
                     s.source.clone(),
@@ -2313,6 +2326,8 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
                     s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
                     s.sidebar_width,
                     s.content_zoom,
+                    s.text_column_width,
+                    s.text_column_offset_x,
                 )
             };
             let mut images = shared.images.lock().unwrap();
@@ -2323,6 +2338,8 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
                 base_dir.as_deref(),
                 sidebar_w,
                 content_zoom,
+                tcw,
+                tcox,
                 &theme,
                 &shared.fonts,
                 &mut images,
@@ -3247,7 +3264,7 @@ fn apply_menu_action(shared: &Arc<Shared>, proxy: &EventLoopProxy<UserEvent>, ac
             // Mirror the HitAction::ScrollTo flow in click_at so clamping
             // against the real doc height stays consistent.
             let theme = Theme::light();
-            let (source, vw, vh, base_dir, sidebar_w, content_zoom) = {
+            let (source, vw, vh, base_dir, sidebar_w, content_zoom, tcw, tcox) = {
                 let s = shared.state.lock().unwrap();
                 (
                     s.source.clone(),
@@ -3256,12 +3273,15 @@ fn apply_menu_action(shared: &Arc<Shared>, proxy: &EventLoopProxy<UserEvent>, ac
                     s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
                     s.sidebar_width,
                     s.content_zoom,
+                    s.text_column_width,
+                    s.text_column_offset_x,
                 )
             };
             let mut images = shared.images.lock().unwrap();
             let doc_h = measure(
                 &source, vw, vh as u32,
                 base_dir.as_deref(), sidebar_w, content_zoom,
+                tcw, tcox,
                 &theme, &shared.fonts, &mut images,
             );
             drop(images);
