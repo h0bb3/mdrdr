@@ -3715,10 +3715,11 @@ fn draw_context_menu(
     hover: Option<(f32, f32)>,
 ) {
     // Main panel — highlight either the hovered row or the keyboard
-    // selection. Mouse hover wins when both are available; the cursor-
-    // moved handler clears `selected` once the mouse enters the menu.
-    let main_kb = if hover.is_none() { m.selected } else { None };
-    draw_menu_panel(fb, theme, fonts, m.x, m.y, &m.items, hover, main_kb);
+    // selection. `draw_menu_panel` falls back to `keyboard_selected`
+    // only when the cursor isn't on a row, so passing `m.selected`
+    // unconditionally is safe; the cursor-moved handler also clears
+    // `m.selected` the moment the mouse enters the menu.
+    draw_menu_panel(fb, theme, fonts, m.x, m.y, &m.items, hover, m.selected);
 
     // Submenu — drawn when the keyboard has opened it OR the cursor is
     // over a trigger row / submenu panel.
