@@ -1025,6 +1025,20 @@ impl ApplicationHandler<UserEvent> for App {
                         self.request_redraw();
                         return;
                     }
+                    // Ctrl + Up / Down — jump the read cursor between
+                    // section headings (prev / next).
+                    if !self.shift_mod() {
+                        let section_dir = match logical_key.as_ref() {
+                            Key::Named(NamedKey::ArrowUp) => Some(-1i32),
+                            Key::Named(NamedKey::ArrowDown) => Some(1i32),
+                            _ => None,
+                        };
+                        if let Some(dir) = section_dir {
+                            self.jump_section(dir);
+                            self.request_redraw();
+                            return;
+                        }
+                    }
                     // Ctrl + Left / Right         — shrink / grow text column.
                     // Ctrl + Shift + Left / Right — slide its left edge.
                     let arrow_dir = match logical_key.as_ref() {
@@ -1049,23 +1063,18 @@ impl ApplicationHandler<UserEvent> for App {
                     )
                 };
                 let page = (vh * 0.85).max(60.0);
-                // Plain arrows drive the read cursor (line stepping for
-                // ↑/↓, section jumping for ←/→). Returning early here
-                // bypasses the scroll-by-dy fallback below.
+                // Plain ↑/↓ step the read cursor by one rendered line.
+                // Section jumping moved to Ctrl+↑/↓ above so plain ←/→
+                // stay free for column resizing under Ctrl. Returning
+                // early bypasses the scroll-by-dy fallback below.
                 if !self.shortcut_mod() && !self.shift_mod() && !self.alt_mod() {
                     let cursor_dir = match logical_key.as_ref() {
-                        Key::Named(NamedKey::ArrowDown) => Some((true, 1)),
-                        Key::Named(NamedKey::ArrowUp) => Some((true, -1)),
-                        Key::Named(NamedKey::ArrowRight) => Some((false, 1)),
-                        Key::Named(NamedKey::ArrowLeft) => Some((false, -1)),
+                        Key::Named(NamedKey::ArrowDown) => Some(1),
+                        Key::Named(NamedKey::ArrowUp) => Some(-1),
                         _ => None,
                     };
-                    if let Some((line, dir)) = cursor_dir {
-                        if line {
-                            self.move_read_cursor(dir);
-                        } else {
-                            self.jump_section(dir);
-                        }
+                    if let Some(dir) = cursor_dir {
+                        self.move_read_cursor(dir);
                         self.request_redraw();
                         return;
                     }
