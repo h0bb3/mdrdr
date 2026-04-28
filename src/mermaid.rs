@@ -1421,7 +1421,10 @@ fn layout_sequence(seq: Sequence, max_width: f32, theme: &Theme, fonts: &Fonts) 
     let head_bg = theme.bg;
     let head_border = stroke;
     let block_tag_bg: Rgba = [stroke[0], stroke[1], stroke[2], 220];
-    let note_bg: Rgba = [theme.accent[0], theme.accent[1], theme.accent[2], 30];
+    // Notes need to occlude the dashed lifelines that would otherwise
+    // show through their fill — alpha ≈ 90 reads as a clear tinted
+    // panel without going so dark that the text contrast suffers.
+    let note_bg: Rgba = [theme.accent[0], theme.accent[1], theme.accent[2], 90];
     let note_border = stroke;
 
     /// Pending block on the layout stack. `top_y` is where the frame
@@ -1443,7 +1446,7 @@ fn layout_sequence(seq: Sequence, max_width: f32, theme: &Theme, fonts: &Fonts) 
     enum Deferred {
         Msg { msg: SeqMsg, y: f32, is_self: bool },
         Note { from: usize, to: usize, text: String, y: f32, h: f32 },
-        Block { kind: SeqBlockKind, label: String, top_y: f32, bottom_y: f32, dividers: Vec<(f32, String)> },
+        Block { kind: SeqBlockKind, label: String, top_y: f32, bottom_y: f32, depth: usize, dividers: Vec<(f32, String)> },
     }
     let mut deferred: Vec<Deferred> = Vec::new();
     // Track the most recently opened block index (in `deferred`) per
@@ -1466,6 +1469,7 @@ fn layout_sequence(seq: Sequence, max_width: f32, theme: &Theme, fonts: &Fonts) 
             }
             SeqEvent::BlockStart { kind, label } => {
                 let top_y = y;
+                let depth = block_stack.len();
                 block_stack.push(PendingBlock { kind, label: label.clone(), top_y });
                 // Emit a placeholder; we'll fill in bottom_y at BlockEnd.
                 let idx = deferred.len();
@@ -1474,6 +1478,7 @@ fn layout_sequence(seq: Sequence, max_width: f32, theme: &Theme, fonts: &Fonts) 
                     label,
                     top_y,
                     bottom_y: top_y,
+                    depth,
                     dividers: Vec::new(),
                 });
                 block_idx_stack.push(idx);
@@ -1521,11 +1526,13 @@ fn layout_sequence(seq: Sequence, max_width: f32, theme: &Theme, fonts: &Fonts) 
 
     // Block frames go before notes/messages so their borders sit behind.
     for d in &deferred {
-        if let Deferred::Block { kind, label, top_y, bottom_y, dividers } = d {
-            // Outer rectangle border (1px) — simple two-rect outline.
-            let bx = 0.0_f32;
+        if let Deferred::Block { kind, label, top_y, bottom_y, depth, dividers } = d {
+            // Inset nested blocks so each level's frame sits visibly
+            // inside its parent rather than stacking edge-to-edge.
+            let inset = (*depth as f32) * 6.0;
+            let bx = inset;
             let by = *top_y;
-            let bw = total_w;
+            let bw = (total_w - inset * 2.0).max(1.0);
             let bh = bottom_y - top_y;
             // Top, bottom, left, right strokes.
             items.push(Placed::Rect { x: bx, y: by, w: bw, h: 1.0, color: stroke });
