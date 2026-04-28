@@ -1090,9 +1090,45 @@ struct SeqParticipant {
     label: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeqBlockKind {
+    Loop,
+    Alt,
+    Opt,
+    Par,
+    Rect,
+    Critical,
+    Break,
+}
+
+impl SeqBlockKind {
+    fn keyword(self) -> &'static str {
+        match self {
+            SeqBlockKind::Loop => "loop",
+            SeqBlockKind::Alt => "alt",
+            SeqBlockKind::Opt => "opt",
+            SeqBlockKind::Par => "par",
+            SeqBlockKind::Rect => "rect",
+            SeqBlockKind::Critical => "critical",
+            SeqBlockKind::Break => "break",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SeqEvent {
+    Msg(SeqMsg),
+    /// Note over a range of lanes [from..=to]. Multi-line via `\n`.
+    Note { from: usize, to: usize, text: String },
+    BlockStart { kind: SeqBlockKind, label: String },
+    /// Mid-block divider (`else <label>` inside an `alt`).
+    Else { label: String },
+    BlockEnd,
+}
+
 struct Sequence {
     participants: Vec<SeqParticipant>,
-    messages: Vec<SeqMsg>,
+    events: Vec<SeqEvent>,
 }
 
 fn parse_sequence(src: &str) -> Option<Sequence> {
@@ -1103,7 +1139,7 @@ fn parse_sequence(src: &str) -> Option<Sequence> {
     }
     let mut ids: Vec<String> = Vec::new();
     let mut participants: Vec<SeqParticipant> = Vec::new();
-    let mut messages: Vec<SeqMsg> = Vec::new();
+    let mut events: Vec<SeqEvent> = Vec::new();
 
     fn ensure(ids: &mut Vec<String>, participants: &mut Vec<SeqParticipant>, id: &str) -> usize {
         if let Some(i) = ids.iter().position(|x| x == id) {
@@ -1112,6 +1148,43 @@ fn parse_sequence(src: &str) -> Option<Sequence> {
         ids.push(id.to_string());
         participants.push(SeqParticipant { label: id.to_string() });
         ids.len() - 1
+    }
+
+    fn unbreak(s: &str) -> String {
+        // Mermaid uses `<br/>` (and sometimes `<br>`) inside note text and
+        // labels for line breaks. Normalise to `\n`.
+        s.replace("<br/>", "\n").replace("<br>", "\n")
+    }
+
+    fn parse_block_keyword(line: &str) -> Option<(SeqBlockKind, String)> {
+        for (kw, kind) in [
+            ("loop ", SeqBlockKind::Loop),
+            ("alt ", SeqBlockKind::Alt),
+            ("opt ", SeqBlockKind::Opt),
+            ("par ", SeqBlockKind::Par),
+            ("rect ", SeqBlockKind::Rect),
+            ("critical ", SeqBlockKind::Critical),
+            ("break ", SeqBlockKind::Break),
+        ] {
+            if let Some(rest) = line.strip_prefix(kw) {
+                return Some((kind, rest.trim().to_string()));
+            }
+        }
+        // Bare keywords with no label.
+        for (kw, kind) in [
+            ("loop", SeqBlockKind::Loop),
+            ("alt", SeqBlockKind::Alt),
+            ("opt", SeqBlockKind::Opt),
+            ("par", SeqBlockKind::Par),
+            ("rect", SeqBlockKind::Rect),
+            ("critical", SeqBlockKind::Critical),
+            ("break", SeqBlockKind::Break),
+        ] {
+            if line == kw {
+                return Some((kind, String::new()));
+            }
+        }
+        None
     }
 
     for line in it {
@@ -1131,11 +1204,64 @@ fn parse_sequence(src: &str) -> Option<Sequence> {
             }
             continue;
         }
+        // autonumber / activate / deactivate are silently accepted but
+        // not visualised — the diagram still draws everything else.
+        if line == "autonumber"
+            || line.starts_with("autonumber ")
+            || line.starts_with("activate ")
+            || line.starts_with("deactivate ")
+        {
+            continue;
+        }
+        if line == "end" {
+            events.push(SeqEvent::BlockEnd);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("else ") {
+            events.push(SeqEvent::Else { label: rest.trim().to_string() });
+            continue;
+        }
+        if line == "else" {
+            events.push(SeqEvent::Else { label: String::new() });
+            continue;
+        }
+        if let Some((kind, label)) = parse_block_keyword(line) {
+            events.push(SeqEvent::BlockStart { kind, label });
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("Note over ").or_else(|| line.strip_prefix("note over ")) {
+            // "X[,Y]: text"
+            let (targets, text) = rest.split_once(':').unwrap_or((rest, ""));
+            let targets = targets.trim();
+            let text = unbreak(text.trim());
+            let (from_id, to_id) = match targets.split_once(',') {
+                Some((a, b)) => (a.trim(), b.trim()),
+                None => (targets, targets),
+            };
+            let from = ensure(&mut ids, &mut participants, from_id);
+            let to = ensure(&mut ids, &mut participants, to_id);
+            let (lo, hi) = (from.min(to), from.max(to));
+            events.push(SeqEvent::Note { from: lo, to: hi, text });
+            continue;
+        }
+        // "Note left of X: text" / "Note right of X: text" — render same
+        // as "Note over X: text"; simpler than tracking placement and
+        // good enough at this resolution.
+        for prefix in ["Note left of ", "Note right of ", "note left of ", "note right of "] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                let (target, text) = rest.split_once(':').unwrap_or((rest, ""));
+                let target = target.trim();
+                let text = unbreak(text.trim());
+                let i = ensure(&mut ids, &mut participants, target);
+                events.push(SeqEvent::Note { from: i, to: i, text });
+                break;
+            }
+        }
         if let Some((arrow_start, arrow_end, kind)) = find_seq_arrow(line) {
             let from_str = line[..arrow_start].trim();
             let after = &line[arrow_end..];
             let (to_str, label) = match after.split_once(':') {
-                Some((t, l)) => (t.trim(), l.trim().to_string()),
+                Some((t, l)) => (t.trim(), unbreak(l.trim())),
                 None => (after.trim(), String::new()),
             };
             if from_str.is_empty() || to_str.is_empty() {
@@ -1143,15 +1269,13 @@ fn parse_sequence(src: &str) -> Option<Sequence> {
             }
             let from = ensure(&mut ids, &mut participants, from_str);
             let to = ensure(&mut ids, &mut participants, to_str);
-            messages.push(SeqMsg { from, to, kind, label });
+            events.push(SeqEvent::Msg(SeqMsg { from, to, kind, label }));
         }
-        // Other lines (Note, alt, loop, etc.) are silently skipped — the
-        // parse still produces a usable diagram for the supported subset.
     }
     if participants.is_empty() {
         return None;
     }
-    Some(Sequence { participants, messages })
+    Some(Sequence { participants, events })
 }
 
 /// Match the longest arrow form first so `-->>` doesn't get parsed as `-->`.
@@ -1173,78 +1297,105 @@ fn layout_sequence(seq: Sequence, max_width: f32, theme: &Theme, fonts: &Fonts) 
     let n = seq.participants.len();
     let head_size = theme.body_size;
     let msg_size = theme.body_size * 0.92;
+    let block_label_size = theme.body_size * 0.78;
+    let note_size = msg_size;
     let head_font = pick_font(fonts, FontId::Body);
     let msg_font = pick_font(fonts, FontId::Body);
+    let block_font = pick_font(fonts, FontId::Italic);
 
     let pad_x = 14.0;
     let head_pad_y = 8.0;
     let head_h = head_size + head_pad_y * 2.0;
     let row_h = msg_size * 2.0;
     let self_row_h = msg_size * 3.0;
+    let block_header_h = block_label_size * 1.6 + 6.0;
+    let block_inner_pad = 6.0;
+    let note_pad_x = 10.0;
+    let note_pad_y = 6.0;
     let top_margin = 4.0;
     let bottom_margin = 4.0;
 
-    // Per-participant header widths.
+    // ── width pass ────────────────────────────────────────────────────────
     let header_w: Vec<f32> = seq
         .participants
         .iter()
         .map(|p| measure_label(&p.label, head_size, head_font).0 + pad_x * 2.0)
         .collect();
-    // Lane sizing as per-gap widths so wide labels only widen the gaps
-    // they actually cross — no global ballooning that wastes space on
-    // the unrelated lanes. Each gap starts at "fit the two adjacent
-    // header halves with breathing room", then grows if a message
-    // spanning that gap (single- or multi-hop) demands more.
     let min_gap_pad: f32 = 24.0;
     let mut gap: Vec<f32> = Vec::with_capacity(n.saturating_sub(1));
     for i in 0..n.saturating_sub(1) {
         gap.push((header_w[i] + header_w[i + 1]) / 2.0 + min_gap_pad);
     }
-    for m in &seq.messages {
-        if m.from == m.to {
-            continue;
+    let bump_span = |gap: &mut Vec<f32>, a: usize, b: usize, need: f32| {
+        if a >= b {
+            return;
         }
-        let (a, b) = (m.from.min(m.to), m.from.max(m.to));
-        let label_w = measure_label(&m.label, msg_size, msg_font).0;
-        let need = label_w + 24.0;
-        let cur_span: f32 = gap[a..b].iter().sum();
-        if need > cur_span {
-            let extra = need - cur_span;
+        let cur: f32 = gap[a..b].iter().sum();
+        if need > cur {
+            let extra = need - cur;
             let per = extra / (b - a) as f32;
             for g in &mut gap[a..b] {
                 *g += per;
             }
         }
-    }
-    // Self-call loops always sit on the right side of the participant
-    // lifeline; the loop + label can extend either into the next lane's
-    // gap (when there is one) or past the diagram's right edge (when on
-    // the rightmost lane). Reserve space accordingly so labels never
-    // paint outside the wrapping background.
+    };
     let loop_w = 36.0_f32;
     let mut right_extra = 0.0_f32;
-    for m in &seq.messages {
-        if m.from != m.to {
-            continue;
-        }
-        let label_w = if m.label.is_empty() {
-            0.0
-        } else {
-            measure_label(&m.label, msg_size, msg_font).0
-        };
-        let extent = loop_w + 8.0 + label_w + 8.0;
-        if m.from + 1 == n {
-            right_extra = right_extra.max(extent);
-        } else if let Some(g) = gap.get_mut(m.from) {
-            // Need room for: half of this lane's header + loop + label,
-            // measured from this lane's centre to the next one. Half of
-            // the next header doesn't apply since the label sits in the
-            // gap, not on the next lifeline.
-            let half_self = header_w[m.from] / 2.0;
-            let need = half_self + extent;
-            if need > *g {
-                *g = need;
+    for ev in &seq.events {
+        match ev {
+            SeqEvent::Msg(m) if m.from != m.to => {
+                let (a, b) = (m.from.min(m.to), m.from.max(m.to));
+                let need = measure_label(&m.label, msg_size, msg_font).0 + 24.0;
+                bump_span(&mut gap, a, b, need);
             }
+            SeqEvent::Msg(m) => {
+                let label_w = if m.label.is_empty() {
+                    0.0
+                } else {
+                    measure_label(&m.label, msg_size, msg_font).0
+                };
+                let extent = loop_w + 8.0 + label_w + 8.0;
+                if m.from + 1 == n {
+                    right_extra = right_extra.max(extent);
+                } else if let Some(g) = gap.get_mut(m.from) {
+                    let need = header_w[m.from] / 2.0 + extent;
+                    if need > *g {
+                        *g = need;
+                    }
+                }
+            }
+            SeqEvent::Note { from, to, text } => {
+                let text_w = measure_label(text, note_size, msg_font).0;
+                let need = text_w + note_pad_x * 2.0;
+                if from == to {
+                    // Single-lane note centres over the lane and overflows
+                    // into the gaps on either side. Bump each side by
+                    // half-overflow.
+                    let half_overflow = ((need - header_w[*from]) * 0.5).max(0.0);
+                    if *from > 0 {
+                        let g = &mut gap[*from - 1];
+                        let want = header_w[*from] / 2.0 + half_overflow + 6.0;
+                        if want > *g {
+                            *g = want;
+                        }
+                    }
+                    if *from + 1 < n {
+                        let g = &mut gap[*from];
+                        let want = header_w[*from] / 2.0 + half_overflow + 6.0;
+                        if want > *g {
+                            *g = want;
+                        }
+                    }
+                    if *from + 1 == n && *from == 0 {
+                        // Lone-participant diagrams: nothing to bump; let
+                        // the right margin take the slack.
+                        right_extra = right_extra.max(half_overflow);
+                    }
+                } else {
+                    bump_span(&mut gap, *from, *to, need);
+                }
+            }
+            _ => {}
         }
     }
     let left_margin = header_w.first().copied().unwrap_or(0.0) / 2.0 + 8.0;
@@ -1255,9 +1406,6 @@ fn layout_sequence(seq: Sequence, max_width: f32, theme: &Theme, fonts: &Fonts) 
         center_x.push(center_x[i - 1] + gap[i - 1]);
     }
     let mut total_w = center_x.last().copied().unwrap_or(0.0) + right_margin;
-    // If the unbounded layout overflows the caller's width, scale the
-    // whole layout uniformly. Self-call loop widths track the scale via
-    // `lane_step` below so the loops shrink with everything else.
     if total_w > max_width && total_w > 0.0 {
         let scale = max_width / total_w;
         for c in center_x.iter_mut() {
@@ -1266,44 +1414,265 @@ fn layout_sequence(seq: Sequence, max_width: f32, theme: &Theme, fonts: &Fonts) 
         total_w = max_width;
     }
 
-    // Row heights: one row per message; self-messages take more.
-    let mut row_top: Vec<f32> = Vec::with_capacity(seq.messages.len() + 1);
-    let mut y = top_margin + head_h + 8.0;
-    for m in &seq.messages {
-        row_top.push(y);
-        y += if m.from == m.to { self_row_h } else { row_h };
-    }
-    let messages_end_y = y;
-    let footer_y = messages_end_y + 8.0;
-    let total_h = footer_y + head_h + bottom_margin;
-
+    // ── height pass: walk events sequentially, tracking nested blocks ────
     let mut items: Vec<Placed> = Vec::new();
     let stroke = theme.muted;
     let body_fg = theme.fg;
-    // The diagram's outer wrapper already paints `code_bg`; pop the
-    // participant headers out by filling them with the page background
-    // and giving them a muted-stroke outline (round-rect-on-round-rect
-    // sandwich, outer = stroke colour, inner = fill).
     let head_bg = theme.bg;
     let head_border = stroke;
+    let block_tag_bg: Rgba = [stroke[0], stroke[1], stroke[2], 220];
+    let note_bg: Rgba = [theme.accent[0], theme.accent[1], theme.accent[2], 30];
+    let note_border = stroke;
 
-    // Lifelines — dashed verticals from the bottom of the top header to
-    // the top of the bottom header.
+    /// Pending block on the layout stack. `top_y` is where the frame
+    /// begins (before the tag); `kind`/`label` drive the tag rendering.
+    struct PendingBlock {
+        kind: SeqBlockKind,
+        label: String,
+        top_y: f32,
+    }
+    let mut block_stack: Vec<PendingBlock> = Vec::new();
+
     let life_top = top_margin + head_h;
+    let mut y = life_top + 8.0;
+
+    // We need to know the lifeline bottom *before* drawing the lifelines,
+    // but the bottom depends on how tall the messages/blocks/notes turn
+    // out to be. So: walk events into deferred draw closures, advancing
+    // `y` as we go, then emit lifelines at the end.
+    enum Deferred {
+        Msg { msg: SeqMsg, y: f32, is_self: bool },
+        Note { from: usize, to: usize, text: String, y: f32, h: f32 },
+        Block { kind: SeqBlockKind, label: String, top_y: f32, bottom_y: f32, dividers: Vec<(f32, String)> },
+    }
+    let mut deferred: Vec<Deferred> = Vec::new();
+    // Track the most recently opened block index (in `deferred`) per
+    // stack depth so an `else` event can append a divider to it.
+    let mut block_idx_stack: Vec<usize> = Vec::new();
+
+    for ev in seq.events {
+        match ev {
+            SeqEvent::Msg(m) => {
+                let is_self = m.from == m.to;
+                let h = if is_self { self_row_h } else { row_h };
+                deferred.push(Deferred::Msg { msg: m, y, is_self });
+                y += h;
+            }
+            SeqEvent::Note { from, to, text } => {
+                let lines = text.split('\n').count().max(1) as f32;
+                let h = lines * note_size * 1.25 + note_pad_y * 2.0;
+                deferred.push(Deferred::Note { from, to, text, y, h });
+                y += h + 6.0;
+            }
+            SeqEvent::BlockStart { kind, label } => {
+                let top_y = y;
+                block_stack.push(PendingBlock { kind, label: label.clone(), top_y });
+                // Emit a placeholder; we'll fill in bottom_y at BlockEnd.
+                let idx = deferred.len();
+                deferred.push(Deferred::Block {
+                    kind,
+                    label,
+                    top_y,
+                    bottom_y: top_y,
+                    dividers: Vec::new(),
+                });
+                block_idx_stack.push(idx);
+                y += block_header_h;
+            }
+            SeqEvent::Else { label } => {
+                // Add the divider y to the innermost open block. Render-
+                // order ensures it sits between the rows above and below.
+                if let Some(&idx) = block_idx_stack.last() {
+                    if let Deferred::Block { dividers, .. } = &mut deferred[idx] {
+                        dividers.push((y, label));
+                    }
+                }
+                y += block_header_h * 0.7;
+            }
+            SeqEvent::BlockEnd => {
+                if let (Some(_), Some(idx)) = (block_stack.pop(), block_idx_stack.pop()) {
+                    y += block_inner_pad;
+                    if let Deferred::Block { bottom_y, .. } = &mut deferred[idx] {
+                        *bottom_y = y;
+                    }
+                    y += 4.0;
+                }
+            }
+        }
+    }
+    // Unclosed blocks — terminate them at the current y so the frame
+    // still draws (sources missing `end` shouldn't lose the frame).
+    while let (Some(_), Some(idx)) = (block_stack.pop(), block_idx_stack.pop()) {
+        y += block_inner_pad;
+        if let Deferred::Block { bottom_y, .. } = &mut deferred[idx] {
+            *bottom_y = y;
+        }
+        y += 4.0;
+    }
+
+    let footer_y = y + 8.0;
     let life_bottom = footer_y;
+    let total_h = footer_y + head_h + bottom_margin;
+
+    // Lifelines first so messages/notes/blocks paint over them.
     for &cx in &center_x {
         emit_dashed_v(&mut items, cx, life_top, life_bottom, stroke);
     }
 
-    // Participant headers (top + bottom copies, drawn as rounded rects).
+    // Block frames go before notes/messages so their borders sit behind.
+    for d in &deferred {
+        if let Deferred::Block { kind, label, top_y, bottom_y, dividers } = d {
+            // Outer rectangle border (1px) — simple two-rect outline.
+            let bx = 0.0_f32;
+            let by = *top_y;
+            let bw = total_w;
+            let bh = bottom_y - top_y;
+            // Top, bottom, left, right strokes.
+            items.push(Placed::Rect { x: bx, y: by, w: bw, h: 1.0, color: stroke });
+            items.push(Placed::Rect { x: bx, y: by + bh - 1.0, w: bw, h: 1.0, color: stroke });
+            items.push(Placed::Rect { x: bx, y: by, w: 1.0, h: bh, color: stroke });
+            items.push(Placed::Rect { x: bx + bw - 1.0, y: by, w: 1.0, h: bh, color: stroke });
+
+            // Tag in top-left: filled darker rect with keyword + label.
+            let kw = kind.keyword();
+            let tag_text = if label.is_empty() {
+                kw.to_string()
+            } else {
+                format!("{kw}  {label}")
+            };
+            let tw = measure_label(&tag_text, block_label_size, block_font).0 + 14.0;
+            let th = block_label_size + 6.0;
+            items.push(Placed::Rect {
+                x: bx + 1.0,
+                y: by + 1.0,
+                w: tw,
+                h: th,
+                color: block_tag_bg,
+            });
+            // Wrap the keyword in brackets visually by drawing the label
+            // centred inside the tag, with the body bg colour so it pops
+            // against the dark tag fill.
+            emit_label_lines(
+                &mut items,
+                &tag_text,
+                block_font,
+                block_label_size,
+                bx + 1.0 + tw / 2.0,
+                by + 1.0 + th / 2.0,
+                head_bg,
+            );
+
+            for (dy, dlabel) in dividers {
+                // Dashed horizontal divider across the frame.
+                emit_dashed_h(&mut items, bx + 1.0, bx + bw - 1.0, *dy, stroke);
+                if !dlabel.is_empty() {
+                    let dtag = format!("else  {dlabel}");
+                    let tw2 = measure_label(&dtag, block_label_size, block_font).0 + 14.0;
+                    let th2 = block_label_size + 6.0;
+                    items.push(Placed::Rect {
+                        x: bx + 1.0,
+                        y: dy + 2.0,
+                        w: tw2,
+                        h: th2,
+                        color: block_tag_bg,
+                    });
+                    emit_label_lines(
+                        &mut items,
+                        &dtag,
+                        block_font,
+                        block_label_size,
+                        bx + 1.0 + tw2 / 2.0,
+                        dy + 2.0 + th2 / 2.0,
+                        head_bg,
+                    );
+                }
+            }
+        }
+    }
+
+    // Notes and messages on top.
+    for d in deferred {
+        match d {
+            Deferred::Msg { msg, y, is_self } => {
+                if is_self {
+                    let cx = center_x[msg.from];
+                    let y0 = y + msg_size * 0.6;
+                    let y1 = y + self_row_h - msg_size * 0.8;
+                    items.push(Placed::Rect { x: cx, y: y0, w: loop_w, h: 1.0, color: stroke });
+                    items.push(Placed::Rect { x: cx + loop_w, y: y0, w: 1.0, h: y1 - y0, color: stroke });
+                    if msg.kind == SeqLineKind::Dashed {
+                        emit_dashed_h(&mut items, cx, cx + loop_w, y1, stroke);
+                    } else {
+                        items.push(Placed::Rect { x: cx, y: y1, w: loop_w, h: 1.0, color: stroke });
+                    }
+                    emit_arrow_head(&mut items, cx, y1, false, stroke);
+                    if !msg.label.is_empty() {
+                        emit_label_lines(
+                            &mut items,
+                            &msg.label,
+                            msg_font,
+                            msg_size,
+                            cx + loop_w + 6.0 + measure_label(&msg.label, msg_size, msg_font).0 / 2.0,
+                            (y0 + y1) / 2.0,
+                            body_fg,
+                        );
+                    }
+                } else {
+                    let x_from = center_x[msg.from];
+                    let x_to = center_x[msg.to];
+                    let arrow_y = y + row_h * 0.62;
+                    let going_right = x_to > x_from;
+                    let (lo, hi) = if going_right { (x_from, x_to) } else { (x_to, x_from) };
+                    if msg.kind == SeqLineKind::Dashed {
+                        emit_dashed_h(&mut items, lo, hi, arrow_y, stroke);
+                    } else {
+                        items.push(Placed::Rect { x: lo, y: arrow_y, w: hi - lo, h: 1.0, color: stroke });
+                    }
+                    emit_arrow_head(&mut items, x_to, arrow_y, going_right, stroke);
+                    if !msg.label.is_empty() {
+                        let cx = (lo + hi) / 2.0;
+                        let cy = arrow_y - msg_size * 0.85;
+                        emit_label_lines(&mut items, &msg.label, msg_font, msg_size, cx, cy, body_fg);
+                    }
+                }
+            }
+            Deferred::Note { from, to, text, y, h } => {
+                let text_w = measure_label(&text, note_size, msg_font).0;
+                let lo_cx = center_x[from];
+                let hi_cx = center_x[to];
+                let span_centre = (lo_cx + hi_cx) / 2.0;
+                let need_w = text_w + note_pad_x * 2.0;
+                let nat_span = (hi_cx - lo_cx) + 60.0;
+                let note_w = need_w.max(nat_span);
+                let note_x = span_centre - note_w / 2.0;
+                items.push(Placed::Rect { x: note_x, y, w: note_w, h, color: note_bg });
+                // Border (1px outline)
+                items.push(Placed::Rect { x: note_x, y, w: note_w, h: 1.0, color: note_border });
+                items.push(Placed::Rect { x: note_x, y: y + h - 1.0, w: note_w, h: 1.0, color: note_border });
+                items.push(Placed::Rect { x: note_x, y, w: 1.0, h, color: note_border });
+                items.push(Placed::Rect { x: note_x + note_w - 1.0, y, w: 1.0, h, color: note_border });
+                emit_label_lines(
+                    &mut items,
+                    &text,
+                    msg_font,
+                    note_size,
+                    span_centre,
+                    y + h / 2.0,
+                    body_fg,
+                );
+            }
+            Deferred::Block { .. } => {}
+        }
+    }
+
+    // Participant headers (top + bottom) — drawn last so they sit on
+    // top of any frame borders that pass through their rects.
     for (i, p) in seq.participants.iter().enumerate() {
         let cx = center_x[i];
         let label_w = measure_label(&p.label, head_size, head_font).0;
         let used_w = (label_w + pad_x * 2.0).max(40.0);
         let x = cx - used_w / 2.0;
         for &y_top in &[top_margin, footer_y] {
-            // Outer rect = border colour, inner rect = fill — same
-            // sandwich trick the flowchart nodes use.
             items.push(Placed::RoundRect {
                 x,
                 y: y_top,
@@ -1320,8 +1689,6 @@ fn layout_sequence(seq: Sequence, max_width: f32, theme: &Theme, fonts: &Fonts) 
                 radius: 5.0,
                 color: head_bg,
             });
-            // Underline-style baseline for the top header to give it a
-            // visual handle where the lifeline drops.
             emit_label_lines(
                 &mut items,
                 &p.label,
@@ -1331,62 +1698,6 @@ fn layout_sequence(seq: Sequence, max_width: f32, theme: &Theme, fonts: &Fonts) 
                 y_top + head_h / 2.0,
                 body_fg,
             );
-        }
-    }
-
-    // Messages.
-    for (i, m) in seq.messages.iter().enumerate() {
-        let y = row_top[i];
-        if m.from == m.to {
-            // Self-call: small loop on the right side of the participant's
-            // lifeline. The right margin reservation above already
-            // accounts for this when the participant is the rightmost.
-            let cx = center_x[m.from];
-            let y0 = y + msg_size * 0.6;
-            let y1 = y + self_row_h - msg_size * 0.8;
-            // Top horizontal
-            items.push(Placed::Rect { x: cx, y: y0, w: loop_w, h: 1.0, color: stroke });
-            // Right vertical
-            items.push(Placed::Rect { x: cx + loop_w, y: y0, w: 1.0, h: y1 - y0, color: stroke });
-            // Bottom horizontal back to the lifeline
-            if m.kind == SeqLineKind::Dashed {
-                emit_dashed_h(&mut items, cx, cx + loop_w, y1, stroke);
-            } else {
-                items.push(Placed::Rect { x: cx, y: y1, w: loop_w, h: 1.0, color: stroke });
-            }
-            emit_arrow_head(&mut items, cx, y1, false, stroke);
-            // Label to the right of the loop
-            if !m.label.is_empty() {
-                emit_label_lines(
-                    &mut items,
-                    &m.label,
-                    msg_font,
-                    msg_size,
-                    cx + loop_w + 6.0 + measure_label(&m.label, msg_size, msg_font).0 / 2.0,
-                    (y0 + y1) / 2.0,
-                    body_fg,
-                );
-            }
-        } else {
-            let x_from = center_x[m.from];
-            let x_to = center_x[m.to];
-            let arrow_y = y + row_h * 0.62;
-            let going_right = x_to > x_from;
-            let (lo, hi) = if going_right { (x_from, x_to) } else { (x_to, x_from) };
-            // Line
-            if m.kind == SeqLineKind::Dashed {
-                emit_dashed_h(&mut items, lo, hi, arrow_y, stroke);
-            } else {
-                items.push(Placed::Rect { x: lo, y: arrow_y, w: hi - lo, h: 1.0, color: stroke });
-            }
-            // Arrow head at the destination
-            emit_arrow_head(&mut items, x_to, arrow_y, going_right, stroke);
-            // Label centered above the arrow
-            if !m.label.is_empty() {
-                let cx = (lo + hi) / 2.0;
-                let cy = arrow_y - msg_size * 0.85;
-                emit_label_lines(&mut items, &m.label, msg_font, msg_size, cx, cy, body_fg);
-            }
         }
     }
 

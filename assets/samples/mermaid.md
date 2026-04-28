@@ -71,6 +71,30 @@ sequenceDiagram
     API-->>U: {widgets: [...]}
 ```
 
+## Sequence diagram — loop / alt / note
+
+```mermaid
+sequenceDiagram
+    participant Cron as Scheduler
+    participant S as Service
+    participant DB as Database
+    participant Op as Ops on-call
+
+    Note over Cron,Op: weekly health check
+    loop every asset
+        Cron->>S: tick
+        S->>DB: SELECT health
+        DB-->>S: rows
+        alt all green
+            S->>S: log ok
+        else any red
+            S->>Op: page (PagerDuty)
+            Note over S,Op: severity = high<br/>auto-mitigation off
+        end
+    end
+    S-->>Cron: done
+```
+
 ## Unknown graph falls back to code
 
 A plain code block should still render if the content is not a graph we can parse:
