@@ -2567,7 +2567,11 @@ impl App {
         // Compute baselines before locking the surface so we can snap
         // the read cursor to a real line for display without a borrow
         // conflict against `self.surface.as_mut()` below.
-        let cursor_display_y: Option<f32> = self.shared.state.lock().unwrap().read_cursor.map(|cy| {
+        // Read the cursor field *first* (drop the state lock before
+        // calling current_baselines, which itself takes the lock via
+        // `snapshot()` — std Mutex is non-reentrant).
+        let cursor_y_raw = self.shared.state.lock().unwrap().read_cursor;
+        let cursor_display_y: Option<f32> = cursor_y_raw.map(|cy| {
             let baselines = self.current_baselines();
             baselines
                 .iter()
