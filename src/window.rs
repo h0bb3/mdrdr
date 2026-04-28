@@ -488,18 +488,43 @@ impl ApplicationHandler<UserEvent> for App {
                     // stays inside a panel.
                     let (mx, my) = (position.x as f32, position.y as f32);
                     let fonts = &self.shared.fonts;
-                    let new_active = {
+                    let (new_active, mouse_in_menu) = {
                         let s = self.shared.state.lock().unwrap();
-                        s.context_menu.as_ref().and_then(|m| active_submenu(m, mx, my, fonts))
+                        let m_ref = s.context_menu.as_ref();
+                        let new_active = m_ref.and_then(|m| active_submenu(m, mx, my, fonts));
+                        let inside = m_ref
+                            .map(|m| {
+                                let mw = context_menu_width(&m.items, fonts);
+                                let mh = context_menu_height(&m.items);
+                                let in_main = mx >= m.x && mx < m.x + mw && my >= m.y && my < m.y + mh;
+                                let in_sub = if let Some((kind, _)) = m.submenu_selected {
+                                    kind.anchor(m, fonts).map(|(sx, sy, sw, sh)| {
+                                        mx >= sx && mx < sx + sw && my >= sy && my < sy + sh
+                                    }).unwrap_or(false)
+                                } else if let Some(kind) = new_active {
+                                    kind.anchor(m, fonts).map(|(sx, sy, sw, sh)| {
+                                        mx >= sx && mx < sx + sw && my >= sy && my < sy + sh
+                                    }).unwrap_or(false)
+                                } else {
+                                    false
+                                };
+                                in_main || in_sub
+                            })
+                            .unwrap_or(false);
+                        (new_active, inside)
                     };
                     let mut s = self.shared.state.lock().unwrap();
                     if let Some(m) = s.context_menu.as_mut() {
                         m.active_submenu = new_active;
-                        // The user is steering with the mouse now — hand
-                        // control back to hover so a stale keyboard
-                        // selection doesn't outshine the cursor.
-                        m.selected = None;
-                        m.submenu_selected = None;
+                        // Only hand control back to mouse when the cursor
+                        // actually enters the menu's hit area. Otherwise
+                        // a tiny mouse jitter (or just the pointer
+                        // sitting where the menu was opened from) would
+                        // clobber the keyboard's selection.
+                        if mouse_in_menu {
+                            m.selected = None;
+                            m.submenu_selected = None;
+                        }
                     }
                     drop(s);
                     self.request_redraw();
@@ -1857,6 +1882,10 @@ impl App {
         s.scroll = 0.0;
         s.sel_anchor = None;
         s.sel_head = None;
+        // Park the read cursor at the top of the new doc so keyboard
+        // navigation has a starting line without the user having to
+        // "wake" the cursor first.
+        s.read_cursor = Some(0.0);
         // Expand every ancestor folder up to the tree root so the newly
         // active file is visible (and marked) in the sidebar.
         if let Some(tree) = &mut s.tree {
@@ -2535,6 +2564,17 @@ impl App {
     }
 
     fn draw(&mut self) {
+        // Compute baselines before locking the surface so we can snap
+        // the read cursor to a real line for display without a borrow
+        // conflict against `self.surface.as_mut()` below.
+        let cursor_display_y: Option<f32> = self.shared.state.lock().unwrap().read_cursor.map(|cy| {
+            let baselines = self.current_baselines();
+            baselines
+                .iter()
+                .min_by(|a, b| (**a - cy).abs().partial_cmp(&(**b - cy).abs()).unwrap())
+                .copied()
+                .unwrap_or(cy)
+        });
         let (Some(window), Some(surface)) = (&self.window, self.surface.as_mut()) else {
             return;
         };
@@ -2582,9 +2622,12 @@ impl App {
         // current line's baseline. Only drawn when the user has actually
         // started keyboard navigation. Anchored to the text column's
         // left edge so the caret tracks alongside the text when the
-        // user slides the column with Ctrl+Shift+←/→.
-        if let Some(cursor_y) = snap.read_cursor {
-            let screen_y = cursor_y - snap.scroll;
+        // user slides the column with Ctrl+Shift+←/→. The y is snapped
+        // to the nearest real baseline so a freshly-opened doc (where
+        // the cursor parks at 0.0) draws the caret on the first line of
+        // text instead of off-screen above the page.
+        if let Some(display_y) = cursor_display_y {
+            let screen_y = display_y - snap.scroll;
             let lh = snap.theme.body_size * snap.theme.line_height_mult;
             let top = (screen_y - lh + 2.0).round() as i32;
             let height = (lh * 0.95) as i32;
@@ -2703,6 +2746,7 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
             s.source = source;
             s.source_path = Some(path.clone());
             s.scroll = 0.0;
+            s.read_cursor = Some(0.0);
         }
         HitAction::Toggle(path) => {
             let mut s = shared.state.lock().unwrap();
@@ -2855,7 +2899,11 @@ pub fn run(opts: WindowOptions) -> ExitCode {
             quick_open: None,
             quick_open_seq: 0,
             mermaid_overrides: std::collections::HashMap::new(),
-            read_cursor: None,
+            // Park the cursor at the top so keyboard nav has a starting
+            // line on first launch without the user having to wake it.
+            // `move_read_cursor` snaps to the nearest baseline on the
+            // first ↑/↓.
+            read_cursor: Some(0.0),
         }),
     });
 

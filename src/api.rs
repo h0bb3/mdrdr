@@ -311,6 +311,7 @@ fn do_open(
         s.source = source;
         s.source_path = Some(PathBuf::from(path));
         s.scroll = 0.0;
+        s.read_cursor = Some(0.0);
     }
     let _ = proxy.send_event(UserEvent::Redraw);
     ok_json(stream, &state_json(shared))
