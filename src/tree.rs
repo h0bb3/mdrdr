@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TreeKind {
     Folder,
     Markdown,
@@ -179,6 +179,41 @@ fn is_md(p: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
         .unwrap_or(false)
+}
+
+/// Depth-first search for the first markdown file under `dir`, using the
+/// same "folders first then files, alphabetical, no dotfiles" ordering as
+/// the sidebar. Returns `None` if nothing is found. Used to auto-open
+/// something on startup so `mdrdr <dir>` lands the user on real content.
+pub fn first_markdown_in(dir: &Path) -> Option<PathBuf> {
+    let mut folders: Vec<PathBuf> = Vec::new();
+    let mut files: Vec<PathBuf> = Vec::new();
+    let rd = std::fs::read_dir(dir).ok()?;
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') {
+            continue;
+        }
+        let p = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            folders.push(p);
+        } else if ft.is_file() && is_md(&p) {
+            files.push(p);
+        }
+    }
+    files.sort();
+    if let Some(f) = files.into_iter().next() {
+        return Some(f);
+    }
+    folders.sort();
+    for d in folders {
+        if let Some(f) = first_markdown_in(&d) {
+            return Some(f);
+        }
+    }
+    None
 }
 
 /// Recursively walk `root` and stream batches of markdown files to

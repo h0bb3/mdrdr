@@ -21,8 +21,8 @@ use crate::font::Fonts;
 use crate::images::ImageCache;
 use crate::layout::HitAction;
 use crate::render::{
-    compute_all_hit_targets, extract_selection, hit_test, in_scrollbar_strip,
-    in_sidebar_scrollbar_strip, measure, measure_text_width, render, scrollbar_geom,
+    extract_selection, hit_test, in_scrollbar_strip,
+    in_sidebar_scrollbar_strip, measure, measure_text_width, scrollbar_geom,
     sidebar_content_height, sidebar_scrollbar_geom, RenderInput, SbGeom, Viewport,
 };
 use crate::theme::Theme;
@@ -181,8 +181,59 @@ pub struct QuickOpenUi {
     pub generation: u64,
 }
 
+/// Who wrote a comment message. `User` = typed in mdrdr; `Agent` = posted
+/// back by Claude Code over the API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentAuthor {
+    User,
+    Agent,
+}
+
+impl CommentAuthor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommentAuthor::User => "user",
+            CommentAuthor::Agent => "agent",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CommentMsg {
+    pub author: CommentAuthor,
+    pub text: String,
+}
+
+/// One comment thread anchored to a source line range. The conversation is
+/// the `messages` list, alternating (loosely) between the user and the
+/// agent. In-memory only — cleared when the open file changes.
+#[derive(Debug, Clone)]
+pub struct Comment {
+    pub id: u64,
+    pub line_start: u32,
+    pub line_end: u32,
+    /// Snapshot of the selected text at creation, for context. The live
+    /// document may drift from this once edits land.
+    pub quote: String,
+    pub messages: Vec<CommentMsg>,
+    pub resolved: bool,
+}
+
+impl Comment {
+    /// A thread is awaiting the agent when its newest message is the
+    /// user's (or it has only the opening user message).
+    pub fn pending(&self) -> bool {
+        !self.resolved
+            && matches!(self.messages.last().map(|m| m.author), Some(CommentAuthor::User))
+    }
+}
+
 pub struct AppState {
     pub source: String,
+    /// Monotonic counter bumped each time `source` is replaced. Used as the
+    /// fast equality key for the layout cache — comparing two `u64`s is a
+    /// lot cheaper than hashing a multi-megabyte string on every wheel tick.
+    pub source_version: u64,
     pub source_path: Option<PathBuf>,
     pub scroll: f32,
     pub viewport: Viewport,
@@ -260,12 +311,121 @@ pub struct AppState {
     /// caret in the left margin; ←/→ jumps between section headings;
     /// Ctrl alone opens the context menu at the cursor's position.
     pub read_cursor: Option<f32>,
+
+    /// Comment threads on the current document (right-margin bubbles).
+    /// In-memory; cleared when the open file changes. Claude Code polls
+    /// these over the API and posts replies back.
+    pub comments: Vec<Comment>,
+    /// Monotonic id source for new comments.
+    pub comment_seq: u64,
+    /// Id of the comment whose bubble is expanded / focused, if any.
+    pub active_comment: Option<u64>,
+    /// Open comment composer (None = closed). Reuses the single-line text
+    /// editing model. `target` is `Some(id)` when replying/following-up on
+    /// an existing thread, `None` when creating a new one from a selection.
+    pub comment_compose: Option<CommentCompose>,
+}
+
+/// In-app comment composer state — a single-line input plus what it's
+/// attached to.
+#[derive(Debug, Clone)]
+pub struct CommentCompose {
+    pub text: String,
+    pub cursor: usize,
+    pub anchor: usize,
+    /// New thread anchored to this line range + quote (from the selection
+    /// at open time)…
+    pub line_start: u32,
+    pub line_end: u32,
+    pub quote: String,
+    /// …or a follow-up on an existing thread.
+    pub target: Option<u64>,
 }
 
 pub struct Shared {
     pub fonts: Fonts,
     pub state: Mutex<AppState>,
     pub images: Mutex<ImageCache>,
+    /// Cached layout. Recomputed only when one of the layout-relevant
+    /// inputs changes (source, viewport width, theme mode, zoom, sidebar
+    /// geometry, mermaid overrides, tree). Plain scroll wheel and
+    /// scrollbar drags reuse the cached layout — they only change
+    /// `scroll`, which `draw()` applies as an offset and isn't in the
+    /// key. Wrapping the layout in `Arc` lets us clone the handle out
+    /// from under the cache lock so the long `paint` pass doesn't hold
+    /// the mutex.
+    pub layout_cache: Mutex<LayoutCache>,
+}
+
+/// Single-entry cache; the only previous layout we keep is the
+/// most-recent one. Snapshots are big and the user almost never flips
+/// between two distinct configurations in quick succession.
+pub struct LayoutCache {
+    pub entry: Option<(LayoutKey, std::sync::Arc<crate::layout::Layout>)>,
+}
+
+impl LayoutCache {
+    pub fn new() -> Self {
+        Self { entry: None }
+    }
+}
+
+/// Identity of every input that can change the document's laid-out
+/// geometry. `scroll`, `selection`, `hover_pos`, `search` are
+/// deliberately absent — those affect only the final paint pass and
+/// must not invalidate the cache, otherwise scroll-wheel and
+/// scrollbar-drag would be just as slow as a cold layout.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LayoutKey {
+    pub source_version: u64,
+    pub viewport_w: u32,
+    pub viewport_h: u32,
+    pub sidebar_width_bits: u32,
+    pub sidebar_scroll_bits: u32,
+    pub content_zoom_bits: u32,
+    pub sidebar_zoom_bits: u32,
+    pub text_column_width_bits: u32,
+    pub text_column_offset_x_bits: u32,
+    pub dark: bool,
+    pub mermaid_sig: u64,
+    pub tree_sig: u64,
+    pub active_path: Option<PathBuf>,
+    pub base_dir: Option<PathBuf>,
+}
+
+fn hash_tree(tree: Option<&[crate::tree::TreeEntry]>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match tree {
+        None => 0u8.hash(&mut h),
+        Some(entries) => {
+            1u8.hash(&mut h);
+            entries.len().hash(&mut h);
+            for e in entries {
+                e.path.hash(&mut h);
+                e.depth.hash(&mut h);
+                e.kind.hash(&mut h);
+                e.expanded.hash(&mut h);
+            }
+        }
+    }
+    h.finish()
+}
+
+fn hash_mermaid_overrides(
+    map: &std::collections::HashMap<usize, crate::mermaid::Direction>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut entries: Vec<(usize, crate::mermaid::Direction)> =
+        map.iter().map(|(k, v)| (*k, *v)).collect();
+    entries.sort_by_key(|(k, _)| *k);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    entries.len().hash(&mut h);
+    for (k, d) in entries {
+        k.hash(&mut h);
+        d.hash(&mut h);
+    }
+    h.finish()
 }
 
 impl Shared {
@@ -286,6 +446,8 @@ impl Shared {
         };
         Snapshot {
             source: s.source.clone(),
+            source_version: s.source_version,
+            dark: s.dark,
             source_path: s.source_path.clone(),
             scroll: s.scroll,
             viewport: s.viewport,
@@ -312,12 +474,100 @@ impl Shared {
                     .collect()
             },
             read_cursor: s.read_cursor,
+            comments: s.comments.clone(),
+            active_comment: s.active_comment,
+            comment_compose: s.comment_compose.clone(),
         }
+    }
+
+    /// Return a layout that's valid for the given snapshot, computing it
+    /// only if no live cache entry matches. Cheap on a hit (lock, compare
+    /// a `LayoutKey`, clone an `Arc`); on a miss it runs the full parse +
+    /// layout pass once and stores the result for subsequent draws.
+    ///
+    /// The cache is single-entry: each new key evicts the previous one.
+    /// That's fine for the UI's actual access pattern — the user changes
+    /// the configuration rarely (resize, zoom, theme toggle, file swap)
+    /// and then scrolls many times against the new key.
+    pub fn layout_for(&self, snap: &Snapshot) -> std::sync::Arc<crate::layout::Layout> {
+        let key = build_layout_key(snap);
+        {
+            let cache = self.layout_cache.lock().unwrap();
+            if let Some((k, lay)) = &cache.entry {
+                if *k == key {
+                    return std::sync::Arc::clone(lay);
+                }
+            }
+        }
+        // Cache miss: do the heavy work outside the cache lock so other
+        // observers (which are rare here anyway, but still) aren't held
+        // up. We re-acquire briefly at the end to store the result.
+        let base_dir = snap
+            .source_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf());
+        let input = crate::render::RenderInput {
+            source: &snap.source,
+            viewport: snap.viewport,
+            scroll: snap.scroll,
+            theme: &snap.theme,
+            fonts: &self.fonts,
+            tree: snap.tree_flat.as_deref(),
+            active_path: snap.source_path.as_deref(),
+            base_dir: base_dir.as_deref(),
+            sidebar_width: snap.sidebar_width,
+            sidebar_scroll: snap.sidebar_scroll,
+            content_zoom: snap.content_zoom,
+            sidebar_zoom: snap.sidebar_zoom,
+            selection: None,
+            hover_pos: None,
+            search: None,
+            mermaid_overrides: Some(&snap.mermaid_overrides),
+            text_column_width: snap.text_column_width,
+            text_column_offset_x: snap.text_column_offset_x,
+        };
+        let mut images = self.images.lock().unwrap();
+        let lay = std::sync::Arc::new(crate::render::lay_out(&input, &mut images));
+        drop(images);
+        let mut cache = self.layout_cache.lock().unwrap();
+        cache.entry = Some((key, std::sync::Arc::clone(&lay)));
+        lay
+    }
+}
+
+fn build_layout_key(snap: &Snapshot) -> LayoutKey {
+    let base_dir = snap
+        .source_path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf());
+    LayoutKey {
+        source_version: snap.source_version,
+        viewport_w: snap.viewport.width,
+        viewport_h: snap.viewport.height,
+        sidebar_width_bits: snap.sidebar_width.to_bits(),
+        sidebar_scroll_bits: snap.sidebar_scroll.to_bits(),
+        content_zoom_bits: snap.content_zoom.to_bits(),
+        sidebar_zoom_bits: snap.sidebar_zoom.to_bits(),
+        text_column_width_bits: snap.text_column_width.to_bits(),
+        text_column_offset_x_bits: snap.text_column_offset_x.to_bits(),
+        dark: snap.dark,
+        mermaid_sig: hash_mermaid_overrides(&snap.mermaid_overrides),
+        tree_sig: hash_tree(snap.tree_flat.as_deref()),
+        active_path: snap.source_path.clone(),
+        base_dir,
     }
 }
 
 pub struct Snapshot {
     pub source: String,
+    /// Version of `source` at snapshot time. Used as the layout-cache key.
+    pub source_version: u64,
+    /// Dark/light mode at snapshot time. Kept as a separate bool so the
+    /// layout-cache key can compare cheaply — comparing two `Theme`
+    /// structs would mean comparing every colour field.
+    pub dark: bool,
     pub source_path: Option<PathBuf>,
     pub scroll: f32,
     pub viewport: Viewport,
@@ -342,6 +592,9 @@ pub struct Snapshot {
     /// the current file path.
     pub mermaid_overrides: std::collections::HashMap<usize, crate::mermaid::Direction>,
     pub read_cursor: Option<f32>,
+    pub comments: Vec<Comment>,
+    pub active_comment: Option<u64>,
+    pub comment_compose: Option<CommentCompose>,
 }
 
 struct App {
@@ -752,6 +1005,14 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
+                // 1b. Comment bubble click — focus the thread and open a
+                //     reply composer on it. Bubbles float in the right
+                //     margin over content, so check before content selection.
+                if click_comment_bubble(&self.shared, x, y) {
+                    self.request_redraw();
+                    return;
+                }
+
                 // 2. Sidebar's right-edge drag strip (resize sidebar width).
                 //    Claim this before the scrollbar strip — the resize
                 //    hit region is only 6px around the edge, and would
@@ -1037,6 +1298,23 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                     return;
                 }
+                // Comment composer is modal for keyboard while open.
+                let composing = self.shared.state.lock().unwrap().comment_compose.is_some();
+                if composing {
+                    self.handle_comment_key(&logical_key);
+                    self.request_redraw();
+                    return;
+                }
+                // Plain `c` over an active selection starts a comment thread
+                // on it (no modifier — Ctrl+C still copies).
+                if !self.shortcut_mod()
+                    && !self.modifiers.state().alt_key()
+                    && matches!(logical_key.as_ref(), Key::Character(ch) if ch == "c")
+                    && self.start_comment_from_selection()
+                {
+                    self.request_redraw();
+                    return;
+                }
                 // Ctrl+F / Cmd+F opens the search overlay.
                 // Ctrl+P / Cmd+P opens the quick-open panel.
                 if self.shortcut_mod() {
@@ -1209,8 +1487,16 @@ impl ApplicationHandler<UserEvent> for App {
                     self.handle_quick_open_key(&key, event_loop);
                 } else {
                     let search_active = self.shared.state.lock().unwrap().search.is_some();
+                    let composing = self.shared.state.lock().unwrap().comment_compose.is_some();
                     if search_active {
                         self.handle_search_key(&key);
+                    } else if composing {
+                        self.handle_comment_key(&key);
+                    } else if !ctrl
+                        && !alt
+                        && matches!(key.as_ref(), Key::Character(c) if c == "c")
+                    {
+                        self.start_comment_from_selection();
                     } else if ctrl {
                         // Main-view Ctrl+Arrow / Ctrl+Shift+Arrow column
                         // resize. Only handled here when no modal owns
@@ -1309,6 +1595,135 @@ impl App {
         }
         self.modifiers.state().alt_key()
     }
+
+    /// Open a comment composer anchored to the current text selection.
+    /// Resolves the selection to a source line range (via the cached
+    /// layout) and captures the selected text as the thread's quote.
+    /// Returns false (and does nothing) when there's no selection.
+    fn start_comment_from_selection(&self) -> bool {
+        let snap = self.shared.snapshot();
+        let Some((anchor, head)) = snap.selection else { return false };
+        let lay = self.shared.layout_for(&snap);
+        let Some((ls, le)) = crate::render::selection_line_range(&lay.block_spans, anchor, head)
+        else {
+            return false;
+        };
+        let quote = crate::render::selection_text_from_layout(&lay, anchor, head, &self.shared.fonts);
+        let mut s = self.shared.state.lock().unwrap();
+        s.comment_compose = Some(CommentCompose {
+            text: String::new(),
+            cursor: 0,
+            anchor: 0,
+            line_start: ls,
+            line_end: le,
+            quote,
+            target: None,
+        });
+        // Drop the text selection so its highlight doesn't sit under the bubble.
+        s.sel_anchor = None;
+        s.sel_head = None;
+        true
+    }
+
+    /// Keyboard handling while the comment composer is open. Esc cancels,
+    /// Enter submits, everything else edits the single-line input.
+    fn handle_comment_key(&self, key: &winit::keyboard::Key) {
+        use winit::keyboard::Key;
+        match key.as_ref() {
+            Key::Named(NamedKey::Escape) => {
+                self.shared.state.lock().unwrap().comment_compose = None;
+            }
+            Key::Named(NamedKey::Enter) => self.submit_comment(),
+            Key::Named(NamedKey::Backspace) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(cp) = &mut s.comment_compose {
+                    crate::text_input::backspace(&mut cp.text, &mut cp.cursor, &mut cp.anchor);
+                }
+            }
+            Key::Named(NamedKey::Delete) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(cp) = &mut s.comment_compose {
+                    crate::text_input::delete_forward(&mut cp.text, &mut cp.cursor, &mut cp.anchor);
+                }
+            }
+            Key::Named(NamedKey::Space) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(cp) = &mut s.comment_compose {
+                    crate::text_input::insert_str(&mut cp.text, &mut cp.cursor, &mut cp.anchor, " ");
+                }
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                let sel = self.shift_mod();
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(cp) = &mut s.comment_compose {
+                    crate::text_input::move_left(&cp.text, &mut cp.cursor, &mut cp.anchor, sel);
+                }
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                let sel = self.shift_mod();
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(cp) = &mut s.comment_compose {
+                    crate::text_input::move_right(&cp.text, &mut cp.cursor, &mut cp.anchor, sel);
+                }
+            }
+            Key::Named(NamedKey::Home) => {
+                let sel = self.shift_mod();
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(cp) = &mut s.comment_compose {
+                    crate::text_input::move_home(&mut cp.cursor, &mut cp.anchor, sel);
+                }
+            }
+            Key::Named(NamedKey::End) => {
+                let sel = self.shift_mod();
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(cp) = &mut s.comment_compose {
+                    crate::text_input::move_end(&cp.text, &mut cp.cursor, &mut cp.anchor, sel);
+                }
+            }
+            Key::Character(c) => {
+                let mut s = self.shared.state.lock().unwrap();
+                if let Some(cp) = &mut s.comment_compose {
+                    crate::text_input::insert_str(&mut cp.text, &mut cp.cursor, &mut cp.anchor, c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Commit the composer: append a user message to its target thread, or
+    /// create a new thread anchored to the composer's line range. Blank
+    /// input just closes the composer.
+    fn submit_comment(&self) {
+        let mut s = self.shared.state.lock().unwrap();
+        let Some(cp) = s.comment_compose.take() else { return };
+        let text = cp.text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        match cp.target {
+            Some(id) => {
+                if let Some(c) = s.comments.iter_mut().find(|c| c.id == id) {
+                    c.messages.push(CommentMsg { author: CommentAuthor::User, text });
+                    c.resolved = false;
+                }
+                s.active_comment = Some(id);
+            }
+            None => {
+                s.comment_seq += 1;
+                let id = s.comment_seq;
+                s.comments.push(Comment {
+                    id,
+                    line_start: cp.line_start,
+                    line_end: cp.line_end,
+                    quote: cp.quote,
+                    messages: vec![CommentMsg { author: CommentAuthor::User, text }],
+                    resolved: false,
+                });
+                s.active_comment = Some(id);
+            }
+        }
+    }
+
 
     /// Open the search overlay at the current mouse position (clamped
     /// inside the viewport). Leaves the existing overlay alone if already
@@ -1566,6 +1981,7 @@ impl App {
         let lay = crate::layout::layout(
             crate::layout::LayoutInput {
                 blocks: &blocks,
+                block_lines: None,
                 tree: snap.tree_flat.as_deref(),
                 active_path: snap.source_path.as_deref(),
                 base_dir: base_dir.as_deref(),
@@ -1878,10 +2294,16 @@ impl App {
         let Ok(content) = std::fs::read_to_string(p) else { return };
         let mut s = self.shared.state.lock().unwrap();
         s.source = content;
+        s.source_version = s.source_version.wrapping_add(1);
         s.source_path = Some(p.to_path_buf());
         s.scroll = 0.0;
         s.sel_anchor = None;
         s.sel_head = None;
+        // Comments are per-file and in-memory; drop them on file switch.
+        s.comments.clear();
+        s.comment_seq = 0;
+        s.active_comment = None;
+        s.comment_compose = None;
         // Park the read cursor at the top of the new doc so keyboard
         // navigation has a starting line without the user having to
         // "wake" the cursor first.
@@ -2176,35 +2598,12 @@ impl App {
     }
 
     fn clamp_scroll(&self) {
-        let theme = Theme::light();
-        let (source, vw, vh, base_dir, sidebar_w, content_zoom, tcw, tcox) = {
-            let s = self.shared.state.lock().unwrap();
-            (
-                s.source.clone(),
-                s.viewport.width,
-                s.viewport.height as f32,
-                s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
-                s.sidebar_width,
-                s.content_zoom,
-                s.text_column_width,
-                s.text_column_offset_x,
-            )
-        };
-        let mut images = self.shared.images.lock().unwrap();
-        let doc_h = measure(
-            &source,
-            vw,
-            vh as u32,
-            base_dir.as_deref(),
-            sidebar_w,
-            content_zoom,
-            tcw,
-            tcox,
-            &theme,
-            &self.shared.fonts,
-            &mut images,
-        );
-        drop(images);
+        // Hot path: this fires on every wheel tick and every mouse-move
+        // during scrollbar drag, so reuse the cached layout instead of
+        // re-running `measure` (which is a full parse + layout pass).
+        let snap = self.shared.snapshot();
+        let vh = snap.viewport.height as f32;
+        let doc_h = self.shared.layout_for(&snap).doc_height;
         let max_scroll = (doc_h - vh).max(0.0);
         let mut s = self.shared.state.lock().unwrap();
         if s.scroll > max_scroll {
@@ -2297,31 +2696,7 @@ impl App {
 
     fn current_copy_zones(&self) -> Vec<crate::layout::CopyZone> {
         let snap = self.shared.snapshot();
-        let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
-        let mut images = self.shared.images.lock().unwrap();
-        crate::render::compute_copy_zones(
-            &RenderInput {
-                source: &snap.source,
-                viewport: snap.viewport,
-                scroll: snap.scroll,
-                theme: &snap.theme,
-                fonts: &self.shared.fonts,
-                tree: snap.tree_flat.as_deref(),
-                active_path: snap.source_path.as_deref(),
-                base_dir: base_dir.as_deref(),
-                sidebar_width: snap.sidebar_width,
-                sidebar_scroll: snap.sidebar_scroll,
-                content_zoom: snap.content_zoom,
-                sidebar_zoom: snap.sidebar_zoom,
-                selection: None,
-                hover_pos: None,
-                search: None,
-                mermaid_overrides: Some(&snap.mermaid_overrides),
-            text_column_width: snap.text_column_width,
-            text_column_offset_x: snap.text_column_offset_x,
-            },
-            &mut images,
-        )
+        self.shared.layout_for(&snap).copy_zones.clone()
     }
 
     fn current_selection_text(&self) -> Option<String> {
@@ -2355,36 +2730,22 @@ impl App {
         if text.is_empty() { None } else { Some(text) }
     }
 
-    /// Sorted unique baseline y's for the current document. Same recompute
-    /// pattern as `current_outline` — cheap enough on each ↑/↓ press given
-    /// how the rest of the helpers are written.
+    /// Sorted unique baseline y's for the current document. Pulled out of
+    /// the cached layout so ↑/↓ presses don't trigger a fresh parse.
     fn current_baselines(&self) -> Vec<f32> {
         let snap = self.shared.snapshot();
-        let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
-        let mut images = self.shared.images.lock().unwrap();
-        crate::render::compute_baselines(
-            &RenderInput {
-                source: &snap.source,
-                viewport: snap.viewport,
-                scroll: snap.scroll,
-                theme: &snap.theme,
-                fonts: &self.shared.fonts,
-                tree: snap.tree_flat.as_deref(),
-                active_path: snap.source_path.as_deref(),
-                base_dir: base_dir.as_deref(),
-                sidebar_width: snap.sidebar_width,
-                sidebar_scroll: snap.sidebar_scroll,
-                content_zoom: snap.content_zoom,
-                sidebar_zoom: snap.sidebar_zoom,
-                selection: None,
-                hover_pos: None,
-                search: None,
-                mermaid_overrides: Some(&snap.mermaid_overrides),
-                text_column_width: snap.text_column_width,
-                text_column_offset_x: snap.text_column_offset_x,
-            },
-            &mut images,
-        )
+        let lay = self.shared.layout_for(&snap);
+        let mut ys: Vec<f32> = lay
+            .content_items
+            .iter()
+            .filter_map(|p| match p {
+                crate::layout::Placed::Glyph { baseline, selectable: true, .. } => Some(*baseline),
+                _ => None,
+            })
+            .collect();
+        ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ys.dedup_by(|a, b| (*a - *b).abs() < 0.5);
+        ys
     }
 
     fn current_outline(&self) -> Vec<crate::layout::OutlineEntry> {
@@ -2392,60 +2753,13 @@ impl App {
         if snap.source_path.is_none() {
             return Vec::new();
         }
-        let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
-        let mut images = self.shared.images.lock().unwrap();
-        crate::render::compute_outline(
-            &RenderInput {
-                source: &snap.source,
-                viewport: snap.viewport,
-                scroll: snap.scroll,
-                theme: &snap.theme,
-                fonts: &self.shared.fonts,
-                tree: snap.tree_flat.as_deref(),
-                active_path: snap.source_path.as_deref(),
-                base_dir: base_dir.as_deref(),
-                sidebar_width: snap.sidebar_width,
-                sidebar_scroll: snap.sidebar_scroll,
-                content_zoom: snap.content_zoom,
-                sidebar_zoom: snap.sidebar_zoom,
-                selection: None,
-                hover_pos: None,
-                search: None,
-                mermaid_overrides: Some(&snap.mermaid_overrides),
-            text_column_width: snap.text_column_width,
-            text_column_offset_x: snap.text_column_offset_x,
-            },
-            &mut images,
-        )
+        self.shared.layout_for(&snap).outline.clone()
     }
 
     fn current_hit_targets(&self) -> (Vec<crate::layout::HitTarget>, Vec<crate::layout::HitTarget>) {
         let snap = self.shared.snapshot();
-        let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
-        let mut images = self.shared.images.lock().unwrap();
-        compute_all_hit_targets(
-            &RenderInput {
-                source: &snap.source,
-                viewport: snap.viewport,
-                scroll: snap.scroll,
-                theme: &snap.theme,
-                fonts: &self.shared.fonts,
-                tree: snap.tree_flat.as_deref(),
-                active_path: snap.source_path.as_deref(),
-                base_dir: base_dir.as_deref(),
-                sidebar_width: snap.sidebar_width,
-                sidebar_scroll: snap.sidebar_scroll,
-                content_zoom: snap.content_zoom,
-                sidebar_zoom: snap.sidebar_zoom,
-                selection: None,
-                hover_pos: None,
-                search: None,
-                mermaid_overrides: Some(&snap.mermaid_overrides),
-            text_column_width: snap.text_column_width,
-            text_column_offset_x: snap.text_column_offset_x,
-            },
-            &mut images,
-        )
+        let lay = self.shared.layout_for(&snap);
+        (lay.hit_targets.clone(), lay.content_hit_targets.clone())
     }
 
     /// Measure the sidebar's total content height and clamp
@@ -2493,35 +2807,14 @@ impl App {
     }
 
     fn current_scrollbar_geom(&self) -> Option<SbGeom> {
-        let theme = Theme::light();
-        let (source, viewport, base_dir, sidebar_w, scroll, content_zoom, tcw, tcox) = {
-            let s = self.shared.state.lock().unwrap();
-            (
-                s.source.clone(),
-                s.viewport,
-                s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
-                s.sidebar_width,
-                s.scroll,
-                s.content_zoom,
-                s.text_column_width,
-                s.text_column_offset_x,
-            )
-        };
-        let mut images = self.shared.images.lock().unwrap();
-        let doc_h = measure(
-            &source,
-            viewport.width,
-            viewport.height,
-            base_dir.as_deref(),
-            sidebar_w,
-            content_zoom,
-            tcw,
-            tcox,
-            &theme,
-            &self.shared.fonts,
-            &mut images,
-        );
-        scrollbar_geom(viewport, scroll, doc_h)
+        // Reuse the shared layout cache rather than re-running the full
+        // parse + layout pass: scrollbar drag fires this on every
+        // mouse-move, and a cold layout for the user's larger documents
+        // is enough to back the X11/Wayland write socket up and break
+        // the connection.
+        let snap = self.shared.snapshot();
+        let lay = self.shared.layout_for(&snap);
+        scrollbar_geom(snap.viewport, snap.scroll, lay.doc_height)
     }
 
     fn copy_selection(&self) {
@@ -2589,10 +2882,18 @@ impl App {
             .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
             .unwrap();
 
-        let snap = self.shared.snapshot();
+        let mut snap = self.shared.snapshot();
+        // The viewport size for layout follows the surface, not what the
+        // snapshot inherited from the last event. Force-sync so we cache
+        // against the size we actually paint into.
+        snap.viewport = Viewport { width: w, height: h };
         let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
-        let mut images = self.shared.images.lock().unwrap();
-        let mut fb = render(
+        // Hot path: this returns a cached `Arc<Layout>` whenever the user
+        // is just scrolling, dragging the scrollbar, hovering, or
+        // changing selection — none of which touch the layout key.
+        let lay = self.shared.layout_for(&snap);
+        let mut fb = crate::render::paint(
+            &lay,
             &RenderInput {
                 source: &snap.source,
                 viewport: Viewport { width: w, height: h },
@@ -2615,12 +2916,24 @@ impl App {
                     }
                 }),
                 mermaid_overrides: Some(&snap.mermaid_overrides),
-            text_column_width: snap.text_column_width,
-            text_column_offset_x: snap.text_column_offset_x,
+                text_column_width: snap.text_column_width,
+                text_column_offset_x: snap.text_column_offset_x,
             },
-            &mut images,
         );
-        drop(images);
+
+        // Comment thread bubbles in the right margin. Drawn over content but
+        // under the modal overlays (search / quick-open / context menu).
+        crate::render::draw_comment_bubbles(
+            &mut fb,
+            &lay,
+            Viewport { width: w, height: h },
+            snap.scroll,
+            &snap.theme,
+            &self.shared.fonts,
+            &snap.comments,
+            snap.active_comment,
+            snap.comment_compose.as_ref(),
+        );
 
         // Read cursor — thin vertical caret in the left margin at the
         // current line's baseline. Only drawn when the user has actually
@@ -2679,35 +2992,51 @@ impl App {
     }
 }
 
+/// If screen point (x, y) lands on a comment bubble, focus that thread and
+/// open a reply composer on it. Returns true when a bubble was hit (caller
+/// should stop further click dispatch). Shared by the live mouse handler
+/// and the `/click` API hook so both behave the same.
+pub fn click_comment_bubble(shared: &Arc<Shared>, x: f32, y: f32) -> bool {
+    let snap = shared.snapshot();
+    if snap.comments.is_empty() {
+        return false;
+    }
+    let lay = shared.layout_for(&snap);
+    let rects = crate::render::layout_comment_bubbles(
+        &lay,
+        snap.viewport,
+        snap.scroll,
+        &snap.theme,
+        &shared.fonts,
+        &snap.comments,
+        snap.comment_compose.as_ref(),
+    );
+    let hit = rects
+        .iter()
+        .find(|r| r.id != 0 && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h)
+        .map(|r| r.id);
+    let Some(id) = hit else { return false };
+    let mut s = shared.state.lock().unwrap();
+    s.active_comment = Some(id);
+    let already = matches!(&s.comment_compose, Some(cp) if cp.target == Some(id));
+    if !already {
+        s.comment_compose = Some(CommentCompose {
+            text: String::new(),
+            cursor: 0,
+            anchor: 0,
+            line_start: 0,
+            line_end: 0,
+            quote: String::new(),
+            target: Some(id),
+        });
+    }
+    true
+}
+
 pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
     let snap = shared.snapshot();
-    let base_dir = snap.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
-    let (pinned, content) = {
-        let mut images = shared.images.lock().unwrap();
-        compute_all_hit_targets(
-            &RenderInput {
-                source: &snap.source,
-                viewport: snap.viewport,
-                scroll: snap.scroll,
-                theme: &snap.theme,
-                fonts: &shared.fonts,
-                tree: snap.tree_flat.as_deref(),
-                active_path: snap.source_path.as_deref(),
-                base_dir: base_dir.as_deref(),
-                sidebar_width: snap.sidebar_width,
-                sidebar_scroll: snap.sidebar_scroll,
-                content_zoom: snap.content_zoom,
-                sidebar_zoom: snap.sidebar_zoom,
-                selection: None,
-                hover_pos: None,
-                search: None,
-                mermaid_overrides: Some(&snap.mermaid_overrides),
-            text_column_width: snap.text_column_width,
-            text_column_offset_x: snap.text_column_offset_x,
-            },
-            &mut images,
-        )
-    };
+    let lay = shared.layout_for(&snap);
+    let (pinned, content) = (lay.hit_targets.clone(), lay.content_hit_targets.clone());
     // Pinned targets (tree rows) first — they're in screen coords.
     let raw_action = if let Some(hit) = hit_test(&pinned, x, y) {
         hit.action.clone()
@@ -2748,9 +3077,14 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
             let source = std::fs::read_to_string(path).unwrap_or_default();
             let mut s = shared.state.lock().unwrap();
             s.source = source;
+            s.source_version = s.source_version.wrapping_add(1);
             s.source_path = Some(path.clone());
             s.scroll = 0.0;
             s.read_cursor = Some(0.0);
+            s.comments.clear();
+            s.comment_seq = 0;
+            s.active_comment = None;
+            s.comment_compose = None;
         }
         HitAction::Toggle(path) => {
             let mut s = shared.state.lock().unwrap();
@@ -2874,8 +3208,10 @@ pub fn run(opts: WindowOptions) -> ExitCode {
     let shared = Arc::new(Shared {
         fonts,
         images: Mutex::new(ImageCache::new()),
+        layout_cache: Mutex::new(LayoutCache::new()),
         state: Mutex::new(AppState {
             source,
+            source_version: 1,
             source_path,
             scroll: 0.0,
             viewport,
@@ -2908,6 +3244,10 @@ pub fn run(opts: WindowOptions) -> ExitCode {
             // `move_read_cursor` snaps to the nearest baseline on the
             // first ↑/↓.
             read_cursor: Some(0.0),
+            comments: Vec::new(),
+            comment_seq: 0,
+            active_comment: None,
+            comment_compose: None,
         }),
     });
 
@@ -3946,18 +4286,40 @@ fn draw_submenu_panel(
 fn resolve_open_arg(arg: Option<PathBuf>) -> (String, Option<PathBuf>, Option<FileTree>) {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     match arg {
-        None => (String::new(), None, Some(FileTree::new(cwd))),
+        None => open_dir(cwd),
         Some(p) => {
             let p = p.canonicalize().unwrap_or(p);
             if p.is_dir() {
-                (String::new(), None, Some(FileTree::new(p)))
+                open_dir(p)
             } else if p.is_file() {
                 let src = std::fs::read_to_string(&p).unwrap_or_default();
                 let root = p.parent().map(Path::to_path_buf).unwrap_or(cwd);
                 (src, Some(p), Some(FileTree::new(root)))
             } else {
-                (String::new(), None, Some(FileTree::new(cwd)))
+                open_dir(cwd)
             }
         }
     }
+}
+
+/// Open a directory: build the file tree, hunt for the first markdown file
+/// in it (depth-first, alphabetical), and auto-load that as the initial
+/// document. Falls back to the empty source if there's nothing markdown
+/// under the root. Subdirectories holding the picked file get expanded so
+/// the sidebar reveals where it lives.
+fn open_dir(root: PathBuf) -> (String, Option<PathBuf>, Option<FileTree>) {
+    let mut tree = FileTree::new(root.clone());
+    if let Some(first) = crate::tree::first_markdown_in(&root) {
+        let src = std::fs::read_to_string(&first).unwrap_or_default();
+        let mut cur = first.parent();
+        while let Some(d) = cur {
+            tree.expand(d.to_path_buf());
+            if d == root {
+                break;
+            }
+            cur = d.parent();
+        }
+        return (src, Some(first), Some(tree));
+    }
+    (String::new(), None, Some(tree))
 }

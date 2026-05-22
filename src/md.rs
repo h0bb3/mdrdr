@@ -90,6 +90,14 @@ pub fn count_headings(src: &str) -> usize {
 }
 
 pub fn parse(src: &str) -> Vec<Block> {
+    parse_with_lines(src).0
+}
+
+/// Same as `parse`, but also returns a 1-based inclusive `(start, end)`
+/// source-line span for each top-level block, in the same order as the
+/// returned `Vec<Block>`. Used to map a rendered selection back to exact
+/// source lines so an external editor (Claude Code) can target them.
+pub fn parse_with_lines(src: &str) -> (Vec<Block>, Vec<(u32, u32)>) {
     // Walk source line-by-line *with* byte offsets so task-list parsing can
     // later patch the original file at the exact `[` of the checkbox.
     let mut lines: Vec<&str> = Vec::new();
@@ -101,17 +109,40 @@ pub fn parse(src: &str) -> Vec<Block> {
         lines.push(trimmed);
         pos += chunk.len();
     }
-    parse_lines(&lines, Some(&starts))
+    let mut spans: Vec<(u32, u32)> = Vec::new();
+    let blocks = parse_lines(&lines, Some(&starts), Some(&mut spans));
+    (blocks, spans)
 }
 
 /// `line_starts` is `Some` only when the `lines` slice refers back to the
 /// original source — then it can supply absolute byte offsets for task
 /// list detection. Recursive callers that re-slice owned strings pass
 /// `None`, which disables toggle-in-place for tasks inside blockquotes.
-fn parse_lines(lines: &[&str], line_starts: Option<&[usize]>) -> Vec<Block> {
+///
+/// `spans`, when `Some`, collects a 1-based `(start_line, end_line)` for
+/// every block pushed at this level (top-level only — nested blockquote
+/// content passes `None`). Each loop iteration emits at most one block and
+/// advances `i` to one-past-the-block, so `(blk_start+1, i)` is the block's
+/// inclusive 1-based line span at every `continue`/fall-through point.
+fn parse_lines(
+    lines: &[&str],
+    line_starts: Option<&[usize]>,
+    mut spans: Option<&mut Vec<(u32, u32)>>,
+) -> Vec<Block> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
+        let blk_start = i;
+        let len0 = out.len();
+        macro_rules! rec {
+            () => {
+                if let Some(sp) = spans.as_deref_mut() {
+                    if out.len() > len0 {
+                        sp.push((blk_start as u32 + 1, i as u32));
+                    }
+                }
+            };
+        }
         let line = lines[i];
         let trim = line.trim_start();
 
@@ -122,6 +153,7 @@ fn parse_lines(lines: &[&str], line_starts: Option<&[usize]>) -> Vec<Block> {
             if let Some(close) = first.find("$$") {
                 out.push(Block::DisplayMath(first[..close].trim().to_string()));
                 i += 1;
+                rec!();
                 continue;
             }
             if !first.is_empty() {
@@ -141,6 +173,7 @@ fn parse_lines(lines: &[&str], line_starts: Option<&[usize]>) -> Vec<Block> {
                 i += 1;
             }
             out.push(Block::DisplayMath(body.trim().to_string()));
+            rec!();
             continue;
         }
 
@@ -160,6 +193,7 @@ fn parse_lines(lines: &[&str], line_starts: Option<&[usize]>) -> Vec<Block> {
             } else {
                 out.push(Block::CodeBlock { lang: lang_opt, text: code });
             }
+            rec!();
             continue;
         }
 
@@ -167,12 +201,14 @@ fn parse_lines(lines: &[&str], line_starts: Option<&[usize]>) -> Vec<Block> {
             let rest = trim[(level as usize)..].trim_start().trim_end_matches('#').trim();
             out.push(Block::Heading { level, inlines: parse_inlines(rest) });
             i += 1;
+            rec!();
             continue;
         }
 
         if is_thematic_break(trim) {
             out.push(Block::ThematicBreak);
             i += 1;
+            rec!();
             continue;
         }
 
@@ -193,8 +229,10 @@ fn parse_lines(lines: &[&str], line_starts: Option<&[usize]>) -> Vec<Block> {
             }
             let refs: Vec<&str> = inner_lines.iter().map(|s| s.as_str()).collect();
             // Inner refs are owned Strings — offsets don't map back to the
-            // original source, so task detection is disabled here.
-            out.push(Block::BlockQuote(parse_lines(&refs, None)));
+            // original source, so task detection (and span tracking) is
+            // disabled here.
+            out.push(Block::BlockQuote(parse_lines(&refs, None, None)));
+            rec!();
             continue;
         }
 
@@ -234,6 +272,7 @@ fn parse_lines(lines: &[&str], line_starts: Option<&[usize]>) -> Vec<Block> {
                 }
             }
             out.push(Block::List { ordered, items });
+            rec!();
             continue;
         }
 
@@ -264,6 +303,7 @@ fn parse_lines(lines: &[&str], line_starts: Option<&[usize]>) -> Vec<Block> {
                         i += 1;
                     }
                     out.push(Block::Table { header: header_inlines, align, rows });
+                    rec!();
                     continue;
                 }
             }
@@ -290,6 +330,7 @@ fn parse_lines(lines: &[&str], line_starts: Option<&[usize]>) -> Vec<Block> {
         if !buf.is_empty() {
             out.push(Block::Paragraph(parse_inlines(&buf)));
         }
+        rec!();
     }
     out
 }
@@ -620,4 +661,30 @@ fn utf8_len(first: u8) -> usize {
 
 fn is_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_line_spans_match_source() {
+        // 1:# Title 2:blank 3-4:paragraph 5:blank 6-8:code 9:blank 10-11:list
+        let src = "# Title\n\npara one\nstill para\n\n```\ncode\n```\n\n- a\n- b\n";
+        let (blocks, spans) = parse_with_lines(src);
+        assert_eq!(blocks.len(), spans.len(), "one span per block");
+        assert_eq!(spans[0], (1, 1), "heading");
+        assert_eq!(spans[1], (3, 4), "paragraph spans both lines");
+        assert_eq!(spans[2], (6, 8), "code fence incl. both ``` lines");
+        assert_eq!(spans[3], (10, 11), "list spans both items");
+    }
+
+    #[test]
+    fn spans_disabled_by_default_parse() {
+        // parse() must still work and produce the same blocks.
+        let src = "# A\n\nb\n";
+        let blocks = parse(src);
+        let (blocks2, _) = parse_with_lines(src);
+        assert_eq!(blocks.len(), blocks2.len());
+    }
 }

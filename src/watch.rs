@@ -50,6 +50,7 @@ pub fn spawn(shared: Arc<Shared>, proxy: EventLoopProxy<UserEvent>) {
                     let mut s = shared.state.lock().unwrap();
                     if s.source_path.as_deref() == Some(path.as_path()) {
                         s.source = new_source;
+                        s.source_version = s.source_version.wrapping_add(1);
                     }
                 }
                 let _ = proxy.send_event(UserEvent::Redraw);

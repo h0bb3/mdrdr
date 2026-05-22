@@ -172,6 +172,22 @@ pub struct Layout {
     pub sidebar_content_height: f32,
     /// Headings discovered during content layout, in document order.
     pub outline: Vec<OutlineEntry>,
+    /// Vertical extent (document-y) of each top-level content block paired
+    /// with its source line range. Lets a rendered selection resolve back
+    /// to exact source lines. Empty unless `LayoutInput.block_lines` was
+    /// supplied (only the cached render path does so).
+    pub block_spans: Vec<BlockSpan>,
+}
+
+/// Maps a top-level block's on-screen vertical extent to its source lines.
+/// `y0`/`y1` are document-y (pre-scroll, same space as glyph baselines);
+/// `line_start`/`line_end` are 1-based inclusive source line numbers.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockSpan {
+    pub y0: f32,
+    pub y1: f32,
+    pub line_start: u32,
+    pub line_end: u32,
 }
 
 #[derive(Copy, Clone)]
@@ -215,6 +231,10 @@ pub const SIDEBAR_WIDTH_DEFAULT: f32 = 260.0;
 
 pub struct LayoutInput<'a> {
     pub blocks: &'a [Block],
+    /// 1-based `(start, end)` source line span for each block in `blocks`
+    /// (same order). `Some` only on the cached render path that needs to
+    /// resolve selections back to source lines; `None` everywhere else.
+    pub block_lines: Option<&'a [(u32, u32)]>,
     pub tree: Option<&'a [TreeEntry]>,
     pub active_path: Option<&'a Path>,
     pub base_dir: Option<&'a Path>,
@@ -285,6 +305,7 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
     let mut content_hit_targets: Vec<HitTarget> = Vec::new();
     let mut copy_zones: Vec<CopyZone> = Vec::new();
     let mut outline: Vec<OutlineEntry> = Vec::new();
+    let mut block_spans: Vec<BlockSpan> = Vec::new();
     let doc_height = {
         let mut ctx = Ctx {
             items: &mut content_items,
@@ -301,7 +322,7 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
             mermaid_idx: 0,
             mermaid_overrides: input.mermaid_overrides,
         };
-        for b in input.blocks {
+        for (bi, b) in input.blocks.iter().enumerate() {
             // Top-level blocks pick their layout column based on type.
             // The *left* edge always follows the text column so an
             // offset slide carries every element with it; only the
@@ -314,7 +335,11 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
             // column the outer container picked.
             ctx.content_left = text_left;
             ctx.content_right = if is_text_block(b) { text_right } else { content_right };
+            let y0 = ctx.y;
             ctx.block(b, 0.0);
+            if let Some(&(line_start, line_end)) = input.block_lines.and_then(|ls| ls.get(bi)) {
+                block_spans.push(BlockSpan { y0, y1: ctx.y, line_start, line_end });
+            }
         }
         ctx.y + content_theme.margin_y
     };
@@ -368,6 +393,7 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
         sidebar_width,
         sidebar_content_height,
         outline,
+        block_spans,
     }
 }
 

@@ -302,11 +302,27 @@ pub struct SearchHighlights<'a> {
     pub current: Option<usize>,
 }
 
+/// Full pipeline: parse + layout + draw. Convenient for callers that
+/// don't keep a layout cache around (the headless `render` subcommand,
+/// the HTTP `/screenshot` endpoint, tests).
 pub fn render(input: &RenderInput, images: &mut ImageCache) -> Framebuffer {
-    let blocks = parse(input.source);
-    let lay = layout(
+    let lay = lay_out(input, images);
+    paint(&lay, input)
+}
+
+/// Parse the source and compute layout. This is the expensive part —
+/// every mermaid block runs its own layout pass, every table measures
+/// its cells, every code block does its own wrapping. Callers that
+/// redraw on scroll should cache the resulting `Layout` and only
+/// re-call when one of the layout-relevant inputs (source, viewport
+/// width, zoom, sidebar geometry, theme mode, tree, mermaid overrides)
+/// changes — `scroll` itself does not invalidate the layout.
+pub fn lay_out(input: &RenderInput, images: &mut ImageCache) -> Layout {
+    let (blocks, block_lines) = crate::md::parse_with_lines(input.source);
+    layout(
         LayoutInput {
             blocks: &blocks,
+            block_lines: Some(&block_lines),
             tree: input.tree,
             active_path: input.active_path,
             base_dir: input.base_dir,
@@ -323,9 +339,15 @@ pub fn render(input: &RenderInput, images: &mut ImageCache) -> Framebuffer {
             text_column_offset_x: input.text_column_offset_x,
         },
         images,
-    );
+    )
+}
+
+/// Draw the pre-computed layout into a fresh framebuffer at the given
+/// scroll offset. Cheap relative to `lay_out` — runs the cached items
+/// through their rasterizers but does not re-parse or re-layout.
+pub fn paint(lay: &Layout, input: &RenderInput) -> Framebuffer {
     draw(
-        &lay,
+        lay,
         input.viewport,
         input.scroll,
         input.theme,
@@ -354,6 +376,7 @@ pub fn measure(
     let lay = layout(
         LayoutInput {
             blocks: &blocks,
+            block_lines: None,
             tree: None,
             active_path: None,
             base_dir,
@@ -497,6 +520,7 @@ pub fn compute_all_hit_targets(
     let lay = layout(
         LayoutInput {
             blocks: &blocks,
+            block_lines: None,
             tree: input.tree,
             active_path: input.active_path,
             base_dir: input.base_dir,
@@ -525,6 +549,7 @@ pub fn compute_copy_zones(input: &RenderInput, images: &mut ImageCache) -> Vec<C
     let lay = layout(
         LayoutInput {
             blocks: &blocks,
+            block_lines: None,
             tree: input.tree,
             active_path: input.active_path,
             base_dir: input.base_dir,
@@ -555,6 +580,7 @@ pub fn compute_baselines(input: &RenderInput, images: &mut ImageCache) -> Vec<f3
     let lay = layout(
         LayoutInput {
             blocks: &blocks,
+            block_lines: None,
             tree: input.tree,
             active_path: input.active_path,
             base_dir: input.base_dir,
@@ -593,6 +619,7 @@ pub fn compute_outline(input: &RenderInput, images: &mut ImageCache) -> Vec<Outl
     let lay = layout(
         LayoutInput {
             blocks: &blocks,
+            block_lines: None,
             tree: input.tree,
             active_path: input.active_path,
             base_dir: input.base_dir,
@@ -789,6 +816,7 @@ pub fn extract_selection(
     let lay = layout(
         LayoutInput {
             blocks: &blocks,
+            block_lines: None,
             tree: input.tree,
             active_path: input.active_path,
             base_dir: input.base_dir,
@@ -807,6 +835,44 @@ pub fn extract_selection(
         images,
     );
     Some(build_selection_text(&lay.content_items, anchor, head, input.fonts))
+}
+
+/// Map a selection (anchor/head in document-y) to the inclusive 1-based
+/// source line range it touches, by unioning the line spans of every
+/// block whose vertical extent overlaps the selection's y-range. Returns
+/// `None` if the selection lands entirely in inter-block whitespace or
+/// `block_spans` is empty. A zero-height selection (a bare click) resolves
+/// to the single block under the cursor.
+pub fn selection_line_range(
+    block_spans: &[crate::layout::BlockSpan],
+    anchor: (f32, f32),
+    head: (f32, f32),
+) -> Option<(u32, u32)> {
+    let y_lo = anchor.1.min(head.1);
+    let y_hi = anchor.1.max(head.1);
+    let mut start: Option<u32> = None;
+    let mut end: Option<u32> = None;
+    for s in block_spans {
+        // Half-pixel slop so a selection that just grazes a block edge
+        // still counts it.
+        let overlaps = s.y1 >= y_lo - 0.5 && s.y0 <= y_hi + 0.5;
+        if overlaps {
+            start = Some(start.map_or(s.line_start, |v| v.min(s.line_start)));
+            end = Some(end.map_or(s.line_end, |v| v.max(s.line_end)));
+        }
+    }
+    Some((start?, end?))
+}
+
+/// Extract the selected text straight from a pre-computed layout (no
+/// re-layout). Used by the API alongside `selection_line_range`.
+pub fn selection_text_from_layout(
+    lay: &Layout,
+    anchor: (f32, f32),
+    head: (f32, f32),
+    fonts: &Fonts,
+) -> String {
+    build_selection_text(&lay.content_items, anchor, head, fonts)
 }
 
 fn build_selection_text(
@@ -891,6 +957,34 @@ fn draw_items(
                     continue;
                 }
                 let f = pick_font(fonts, *font);
+                // Pure-colour geometric emoji (🟢🟡🔴⬜ etc.) — fontdue's mono
+                // emoji font collapses them all to the same gray blob, so we
+                // draw a coloured primitive instead, sized to the glyph's
+                // advance so it lines up with surrounding text.
+                if let Some((shape, fill)) = crate::font::color_emoji(*ch) {
+                    let m = f.metrics(*ch, *size);
+                    let extent = m.advance_width.max(*size * 0.85);
+                    // Centre the shape on the visual midline of an emoji glyph:
+                    // roughly 0.35 em above the baseline.
+                    let cx = *x + extent / 2.0;
+                    let cy = screen_baseline - *size * 0.35;
+                    let half = extent * 0.42;
+                    match shape {
+                        crate::font::ColorEmojiShape::Circle => {
+                            fill_ellipse(fb, cx, cy, half, half, fill);
+                        }
+                        crate::font::ColorEmojiShape::Square => {
+                            fb.fill_rect(
+                                (cx - half) as i32,
+                                (cy - half) as i32,
+                                (half * 2.0) as i32,
+                                (half * 2.0) as i32,
+                                fill,
+                            );
+                        }
+                    }
+                    continue;
+                }
                 let (metrics, bitmap) = f.rasterize(*ch, *size);
                 if metrics.width == 0 || metrics.height == 0 {
                     continue;
@@ -1137,4 +1231,334 @@ fn blit_image_scaled(
             fb.blend(dx + px, dy + py, [r, g, b, 255], a);
         }
     }
+}
+
+// ───── comment thread bubbles (right margin) ─────────────────────────────────
+
+/// Word-wrap `text` to `max_w` pixels in `font`/`size`. Splits on existing
+/// newlines first, then greedily on spaces. Over-long single words overflow
+/// rather than hard-breaking — fine for chat-style prose.
+fn wrap_text(text: &str, font: &fontdue::Font, size: f32, max_w: f32) -> Vec<String> {
+    let space_w = font.metrics(' ', size).advance_width;
+    let mut out = Vec::new();
+    for raw in text.split('\n') {
+        let mut cur = String::new();
+        let mut cur_w = 0.0f32;
+        for word in raw.split(' ').filter(|w| !w.is_empty()) {
+            let ww: f32 = word.chars().map(|c| font.metrics(c, size).advance_width).sum();
+            let add = if cur.is_empty() { ww } else { cur_w + space_w + ww };
+            if !cur.is_empty() && add > max_w {
+                out.push(std::mem::take(&mut cur));
+                cur_w = 0.0;
+            }
+            if !cur.is_empty() {
+                cur.push(' ');
+                cur_w += space_w;
+            }
+            cur.push_str(word);
+            cur_w += ww;
+        }
+        out.push(cur);
+    }
+    out
+}
+
+/// Document-y of the top of the block containing `line` (1-based), using the
+/// layout's block spans. Falls back to the nearest block by line distance so
+/// a comment whose anchor drifted slightly after edits still finds a home.
+fn block_y_for_line(lay: &Layout, line: u32) -> Option<f32> {
+    if lay.block_spans.is_empty() {
+        return None;
+    }
+    let mut best: Option<(&crate::layout::BlockSpan, u32)> = None;
+    for s in &lay.block_spans {
+        if line >= s.line_start && line <= s.line_end {
+            return Some(s.y0);
+        }
+        let dist = if line < s.line_start { s.line_start - line } else { line - s.line_end };
+        if best.map(|(_, d)| dist < d).unwrap_or(true) {
+            best = Some((s, dist));
+        }
+    }
+    best.map(|(s, _)| s.y0)
+}
+
+const BUBBLE_W: f32 = 256.0;
+const BUBBLE_PAD: f32 = 9.0;
+const BUBBLE_GAP: f32 = 8.0;
+const BUBBLE_MARGIN: f32 = 12.0;
+
+/// Screen-x of the bubble column's left edge for a given viewport.
+pub fn bubble_column_x(viewport_w: u32) -> f32 {
+    viewport_w as f32 - BUBBLE_W - BUBBLE_MARGIN
+}
+
+/// One laid-out bubble: where it sits on screen and which comment it shows.
+/// `id == 0` marks the live composer rather than a stored thread.
+#[derive(Debug, Clone, Copy)]
+pub struct BubbleRect {
+    pub id: u64,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// Lay out (but don't draw) the right-margin bubbles for the given comments
+/// and optional live composer. Returns each bubble's on-screen rect, in the
+/// same draw/stack order, so the caller can hit-test clicks. Bubbles stack
+/// downward from their anchor line, never overlapping.
+pub fn layout_comment_bubbles(
+    lay: &Layout,
+    viewport: Viewport,
+    scroll: f32,
+    theme: &Theme,
+    fonts: &Fonts,
+    comments: &[crate::window::Comment],
+    compose: Option<&crate::window::CommentCompose>,
+) -> Vec<BubbleRect> {
+    let size = theme.body_size * 0.82;
+    let tag_size = size * 0.92;
+    let line_h = size * 1.3;
+    let inner_w = BUBBLE_W - BUBBLE_PAD * 2.0;
+    let x = bubble_column_x(viewport.width);
+
+    // Build the ordered list of (id, anchor_line, body_height) entries.
+    struct Entry {
+        id: u64,
+        anchor_line: u32,
+        h: f32,
+    }
+    let body = &fonts.body;
+
+    // Height of a single composer block (tag line + wrapped input lines).
+    let composer_h = |cp: &crate::window::CommentCompose| -> f32 {
+        let lines = wrap_text(&cp.text, body, size, inner_w).len().max(1);
+        line_h * 0.35 + tag_size * 1.2 + lines as f32 * line_h
+    };
+    // Height of a thread bubble: its messages plus, optionally, an open
+    // reply composer attached to it.
+    let messages_h = |msgs: &[&str]| -> f32 {
+        let mut h = BUBBLE_PAD;
+        for (i, text) in msgs.iter().enumerate() {
+            if i > 0 {
+                h += line_h * 0.35;
+            }
+            h += tag_size * 1.2;
+            h += wrap_text(text, body, size, inner_w).len().max(1) as f32 * line_h;
+        }
+        h
+    };
+
+    let mut entries: Vec<Entry> = Vec::new();
+    for c in comments {
+        let msgs: Vec<&str> = c.messages.iter().map(|m| m.text.as_str()).collect();
+        let mut h = messages_h(&msgs);
+        if let Some(cp) = compose {
+            if cp.target == Some(c.id) {
+                h += composer_h(cp);
+            }
+        }
+        entries.push(Entry { id: c.id, anchor_line: c.line_start, h: h + BUBBLE_PAD });
+    }
+    if let Some(cp) = compose {
+        // A new (unattached) thread gets its own composer bubble.
+        if cp.target.is_none() {
+            let h = BUBBLE_PAD + tag_size * 1.2 + wrap_text(&cp.text, body, size, inner_w).len().max(1) as f32 * line_h + BUBBLE_PAD;
+            entries.push(Entry { id: 0, anchor_line: cp.line_start, h });
+        }
+    }
+
+    // Stack by anchor line, top-down, no overlap.
+    entries.sort_by_key(|e| e.anchor_line);
+    let mut rects = Vec::new();
+    let mut next_top = f32::MIN;
+    for e in &entries {
+        let Some(anchor_doc_y) = block_y_for_line(lay, e.anchor_line) else { continue };
+        let want = anchor_doc_y - scroll;
+        let top = want.max(next_top + BUBBLE_GAP).max(BUBBLE_MARGIN);
+        rects.push(BubbleRect { id: e.id, x, y: top, w: BUBBLE_W, h: e.h });
+        next_top = top + e.h;
+    }
+    rects
+}
+
+/// Draw the right-margin comment bubbles. Highlights the active thread's
+/// commented line range in the text column, draws each thread's
+/// conversation, and renders the live composer's input + caret.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_comment_bubbles(
+    fb: &mut Framebuffer,
+    lay: &Layout,
+    viewport: Viewport,
+    scroll: f32,
+    theme: &Theme,
+    fonts: &Fonts,
+    comments: &[crate::window::Comment],
+    active: Option<u64>,
+    compose: Option<&crate::window::CommentCompose>,
+) {
+    if comments.is_empty() && compose.is_none() {
+        return;
+    }
+    let size = theme.body_size * 0.82;
+    let tag_size = size * 0.92;
+    let line_h = size * 1.3;
+    let inner_w = BUBBLE_W - BUBBLE_PAD * 2.0;
+    let vh = viewport.height as f32;
+    let body = &fonts.body;
+    let bold = &fonts.bold;
+
+    let panel_bg: Rgba = if theme_is_dark(theme) { [44, 48, 56, 245] } else { [252, 250, 244, 250] };
+    let user_tag: Rgba = theme.muted;
+    let agent_tag: Rgba = theme.accent;
+
+    // Highlight the active thread's commented lines in the text column.
+    if let Some(aid) = active {
+        if let Some(c) = comments.iter().find(|c| c.id == aid) {
+            let y0 = block_y_for_line(lay, c.line_start);
+            let y1 = block_y_for_line(lay, c.line_end);
+            if let (Some(y0), Some(y1)) = (y0, y1) {
+                let sy0 = y0 - scroll;
+                let sy1 = (y1 - scroll).max(sy0 + line_h);
+                let hl: Rgba = [theme.accent[0], theme.accent[1], theme.accent[2], 36];
+                let left = lay.sidebar_width as i32;
+                let w = (bubble_column_x(viewport.width) - lay.sidebar_width - BUBBLE_GAP) as i32;
+                fb.fill_rect(left, sy0 as i32, w.max(1), (sy1 - sy0).max(line_h) as i32, hl);
+            }
+        }
+    }
+
+    let rects = layout_comment_bubbles(lay, viewport, scroll, theme, fonts, comments, compose);
+
+    for r in &rects {
+        if r.y + r.h < 0.0 || r.y > vh {
+            continue;
+        }
+        let is_active = active == Some(r.id) || (r.id == 0);
+        // Panel + border.
+        fill_round_rect(fb, r.x, r.y, r.w, r.h, 8.0, panel_bg);
+        let border: Rgba = if is_active { theme.accent } else { theme.muted };
+        stroke_round_rect(fb, r.x, r.y, r.w, r.h, 8.0, border);
+
+        let mut cy = r.y + BUBBLE_PAD;
+        let tx = r.x + BUBBLE_PAD;
+
+        if r.id == 0 {
+            // Live composer for a new thread.
+            if let Some(cp) = compose {
+                draw_tag(fb, bold, tag_size, tx, cy + tag_size, "New comment", agent_tag);
+                cy += tag_size * 1.2;
+                draw_input_line(fb, body, size, tx, cy, inner_w, line_h, &cp.text, cp.cursor, theme);
+            }
+            continue;
+        }
+
+        let Some(c) = comments.iter().find(|c| c.id == r.id) else { continue };
+        for (i, m) in c.messages.iter().enumerate() {
+            if i > 0 {
+                cy += line_h * 0.35;
+            }
+            let (tag, col) = match m.author {
+                crate::window::CommentAuthor::User => ("You", user_tag),
+                crate::window::CommentAuthor::Agent => ("Claude", agent_tag),
+            };
+            draw_tag(fb, bold, tag_size, tx, cy + tag_size, tag, col);
+            cy += tag_size * 1.2;
+            for line in wrap_text(&m.text, body, size, inner_w) {
+                draw_text_line(fb, body, size, tx, cy + size, &line, theme.fg);
+                cy += line_h;
+            }
+        }
+        // Composer following up on this thread.
+        if let Some(cp) = compose {
+            if cp.target == Some(c.id) {
+                cy += line_h * 0.35;
+                draw_tag(fb, bold, tag_size, tx, cy + tag_size, "Reply", agent_tag);
+                cy += tag_size * 1.2;
+                draw_input_line(fb, body, size, tx, cy, inner_w, line_h, &cp.text, cp.cursor, theme);
+            }
+        }
+    }
+}
+
+fn theme_is_dark(theme: &Theme) -> bool {
+    // Cheap luminance check on the background.
+    (theme.bg[0] as u32 + theme.bg[1] as u32 + theme.bg[2] as u32) < 384
+}
+
+fn draw_tag(fb: &mut Framebuffer, font: &fontdue::Font, size: f32, x: f32, baseline: f32, text: &str, color: Rgba) {
+    let mut cx = x;
+    for ch in text.chars() {
+        fb.draw_glyph(font, ch, size, cx, baseline, color);
+        cx += font.metrics(ch, size).advance_width;
+    }
+}
+
+fn draw_text_line(fb: &mut Framebuffer, font: &fontdue::Font, size: f32, x: f32, baseline: f32, text: &str, color: Rgba) {
+    let mut cx = x;
+    for ch in text.chars() {
+        fb.draw_glyph(font, ch, size, cx, baseline, color);
+        cx += font.metrics(ch, size).advance_width;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_input_line(
+    fb: &mut Framebuffer,
+    font: &fontdue::Font,
+    size: f32,
+    x: f32,
+    top: f32,
+    max_w: f32,
+    line_h: f32,
+    text: &str,
+    cursor: usize,
+    theme: &Theme,
+) {
+    // Wrap the in-progress text and draw it; place a caret after `cursor`
+    // chars (counted across wrapped lines).
+    let wrapped = wrap_text(text, font, size, max_w);
+    let baseline0 = top + size;
+    let mut drawn = 0usize;
+    let mut caret_drawn = false;
+    let mut y = baseline0;
+    for line in &wrapped {
+        let mut cx = x;
+        for ch in line.chars() {
+            if !caret_drawn && drawn == cursor {
+                fb.fill_rect(cx as i32, (y - size) as i32, 2, (size * 1.2) as i32, theme.accent);
+                caret_drawn = true;
+            }
+            fb.draw_glyph(font, ch, size, cx, y, theme.fg);
+            cx += font.metrics(ch, size).advance_width;
+            drawn += 1;
+        }
+        // account for the space that wrap dropped between lines
+        if !caret_drawn && drawn == cursor {
+            fb.fill_rect(cx as i32, (y - size) as i32, 2, (size * 1.2) as i32, theme.accent);
+            caret_drawn = true;
+        }
+        y += line_h;
+    }
+    if !caret_drawn {
+        // Empty input or caret past end: draw at the start of the last line.
+        let cx = x;
+        let cy = baseline0 + (wrapped.len().saturating_sub(1)) as f32 * line_h;
+        fb.fill_rect(cx as i32, (cy - size) as i32, 2, (size * 1.2) as i32, theme.accent);
+    }
+}
+
+/// 1px rounded-rect outline (four sides + corner pixels approximated by the
+/// fill of a slightly inset round rect would be heavier; a plain rect frame
+/// with clipped corners reads fine at this size).
+fn stroke_round_rect(fb: &mut Framebuffer, x: f32, y: f32, w: f32, h: f32, _r: f32, color: Rgba) {
+    let xi = x as i32;
+    let yi = y as i32;
+    let wi = w as i32;
+    let hi = h as i32;
+    fb.fill_rect(xi, yi, wi, 1, color);
+    fb.fill_rect(xi, yi + hi - 1, wi, 1, color);
+    fb.fill_rect(xi, yi, 1, hi, color);
+    fb.fill_rect(xi + wi - 1, yi, 1, hi, color);
 }

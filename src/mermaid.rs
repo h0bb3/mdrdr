@@ -2,11 +2,15 @@
 //!   graph TD|TB|LR|RL
 //!   node shapes: A, A[label], A(label), A((label))
 //!   edges:      A --> B, A --- B, A -->|label| B, chained: A --> B --> C
+//!   dotted:     A -.-> B, A -.- B (and bi-/reverse forms)
+//!   grouping:   subgraph ID["Label"] … end  (nested ok)
+//!   styling:    style ID fill:#rrggbb,color:#rrggbb  (works on nodes and subgraphs)
 //!
 //! Layout is longest-path layering with fixed row/col sizes. Good enough for
-//! the trees and pipelines that actually show up in notes.
+//! the trees and pipelines that actually show up in notes. Subgraphs are
+//! laid out internally first, then placed as super-nodes in the outer graph.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use fontdue::Font;
 
@@ -90,6 +94,33 @@ struct Edge {
     to: String,
     label: Option<String>,
     kind: EdgeKind,
+    /// `-.->`, `-.-`, etc. Drawn dashed.
+    dotted: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct StyleOverride {
+    fill: Option<Rgba>,
+    text: Option<Rgba>,
+}
+
+#[derive(Debug)]
+struct Subgraph {
+    id: String,
+    label: String,
+    /// Direct child node ids (declaration order).
+    child_nodes: Vec<String>,
+    /// Indices into `Graph.subgraphs` of direct child subgraphs.
+    child_groups: Vec<usize>,
+    /// Index of parent subgraph, if any.
+    parent: Option<usize>,
+    // Computed by layout (final absolute coordinates):
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    /// Header (label strip) height — children sit below this within the container.
+    header_h: f32,
 }
 
 struct Graph {
@@ -97,6 +128,13 @@ struct Graph {
     nodes: HashMap<String, Node>,
     order: Vec<String>,
     edges: Vec<Edge>,
+    subgraphs: Vec<Subgraph>,
+    /// node id → index into `subgraphs`
+    node_to_group: HashMap<String, usize>,
+    /// subgraph id → index into `subgraphs`
+    group_id_to_index: HashMap<String, usize>,
+    /// id (node or subgraph) → style overrides
+    styles: HashMap<String, StyleOverride>,
 }
 
 pub struct MermaidRender {
@@ -137,6 +175,11 @@ fn parse(src: &str) -> Option<Graph> {
     let mut nodes: HashMap<String, Node> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
+    let mut subgraphs: Vec<Subgraph> = Vec::new();
+    let mut group_id_to_index: HashMap<String, usize> = HashMap::new();
+    let mut node_to_group: HashMap<String, usize> = HashMap::new();
+    let mut styles: HashMap<String, StyleOverride> = HashMap::new();
+    let mut sg_stack: Vec<usize> = Vec::new();
 
     let mut saw_header = false;
     for raw in src.lines() {
@@ -155,12 +198,157 @@ fn parse(src: &str) -> Option<Graph> {
                 return None;
             }
         }
-        parse_line(line, &mut nodes, &mut order, &mut edges);
+
+        let lower_first = line
+            .split(|c: char| c.is_whitespace() || c == '[' || c == '"')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        // Block-structure keywords.
+        if lower_first == "subgraph" {
+            let rest = line["subgraph".len()..].trim();
+            let (id, label) = parse_subgraph_header(rest);
+            let parent = sg_stack.last().copied();
+            let idx = subgraphs.len();
+            if let Some(p) = parent {
+                subgraphs[p].child_groups.push(idx);
+            }
+            subgraphs.push(Subgraph {
+                id: id.clone(),
+                label,
+                child_nodes: Vec::new(),
+                child_groups: Vec::new(),
+                parent,
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+                header_h: 0.0,
+            });
+            group_id_to_index.insert(id, idx);
+            sg_stack.push(idx);
+            continue;
+        }
+        if lower_first == "end" {
+            sg_stack.pop();
+            continue;
+        }
+        if lower_first == "style" {
+            parse_style_line(&line["style".len()..], &mut styles);
+            continue;
+        }
+        // Ignore directives we don't visualise; keep them from being parsed
+        // as nodes.
+        if matches!(
+            lower_first.as_str(),
+            "classdef" | "class" | "linkstyle" | "click" | "direction"
+        ) {
+            continue;
+        }
+
+        let new_ids = parse_line(line, &mut nodes, &mut order, &mut edges);
+        if let Some(&current) = sg_stack.last() {
+            for id in new_ids {
+                // Don't assign subgraph-id pseudo-nodes (e.g. cross-subgraph
+                // edge endpoints) to a group — they'll be filtered out below.
+                if !group_id_to_index.contains_key(&id) {
+                    node_to_group.entry(id.clone()).or_insert(current);
+                    if !subgraphs[current].child_nodes.contains(&id) {
+                        subgraphs[current].child_nodes.push(id);
+                    }
+                }
+            }
+        }
     }
     if !saw_header {
         return None;
     }
-    Some(Graph { direction, nodes, order, edges })
+
+    // Edge endpoints that name a subgraph (e.g. `EMSX <--> NovaCore`) end up
+    // as bogus nodes in `nodes` / `order`. Strip them; the renderer routes
+    // those edges through the subgraph container instead.
+    let group_ids: HashSet<String> = group_id_to_index.keys().cloned().collect();
+    nodes.retain(|id, _| !group_ids.contains(id));
+    order.retain(|id| !group_ids.contains(id));
+
+    Some(Graph {
+        direction,
+        nodes,
+        order,
+        edges,
+        subgraphs,
+        node_to_group,
+        group_id_to_index,
+        styles,
+    })
+}
+
+/// `ID["Label"]`, `ID[Label]`, `ID`, `"Label"`. Whitespace-trimmed.
+fn parse_subgraph_header(rest: &str) -> (String, String) {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        // Mermaid allows anonymous subgraphs; synthesise an id.
+        return (String::from("__anon"), String::new());
+    }
+    if let Some(open) = rest.find('[') {
+        let id = rest[..open].trim().to_string();
+        let close = rest.rfind(']').unwrap_or(rest.len());
+        let inner = rest[open + 1..close].trim();
+        let unquoted = inner.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(inner);
+        let label = normalise_label(unquoted);
+        let id = if id.is_empty() { label.clone() } else { id };
+        return (id, label);
+    }
+    if let Some(stripped) = rest.strip_prefix('"') {
+        if let Some(end) = stripped.find('"') {
+            let label = stripped[..end].to_string();
+            return (label.clone(), label);
+        }
+    }
+    // Bare id.
+    let id = rest.to_string();
+    (id.clone(), id)
+}
+
+fn parse_style_line(rest: &str, styles: &mut HashMap<String, StyleOverride>) {
+    let rest = rest.trim();
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let Some(id) = parts.next() else { return };
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return;
+    }
+    let props = parts.next().unwrap_or("");
+    let mut style = StyleOverride::default();
+    for prop in props.split(',') {
+        let prop = prop.trim();
+        if let Some(v) = prop.strip_prefix("fill:") {
+            style.fill = parse_hex_color(v.trim());
+        } else if let Some(v) = prop.strip_prefix("color:") {
+            style.text = parse_hex_color(v.trim());
+        }
+    }
+    styles.insert(id, style);
+}
+
+fn parse_hex_color(s: &str) -> Option<Rgba> {
+    let s = s.trim().trim_start_matches('#');
+    match s.len() {
+        6 => {
+            let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+            Some([r, g, b, 255])
+        }
+        3 => {
+            let r = u8::from_str_radix(&s[0..1], 16).ok()? * 17;
+            let g = u8::from_str_radix(&s[1..2], 16).ok()? * 17;
+            let b = u8::from_str_radix(&s[2..3], 16).ok()? * 17;
+            Some([r, g, b, 255])
+        }
+        _ => None,
+    }
 }
 
 fn parse_header(line: &str) -> Option<Direction> {
@@ -181,16 +369,20 @@ fn parse_header(line: &str) -> Option<Direction> {
     None
 }
 
+/// Returns the node ids that were newly created (so the caller can assign
+/// them to the currently-open subgraph). Ids that already existed are
+/// not returned — they keep their original subgraph membership.
 fn parse_line(
     line: &str,
     nodes: &mut HashMap<String, Node>,
     order: &mut Vec<String>,
     edges: &mut Vec<Edge>,
-) {
+) -> Vec<String> {
     let bytes = line.as_bytes();
     let mut i = 0;
     let mut prev: Option<String> = None;
-    let mut pending_arrow: Option<(EdgeKind, Option<String>)> = None;
+    let mut pending_arrow: Option<(EdgeKind, bool, Option<String>)> = None;
+    let mut new_ids: Vec<String> = Vec::new();
 
     while i < bytes.len() {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
@@ -200,7 +392,7 @@ fn parse_line(
             break;
         }
         // Try to parse an arrow.
-        if let Some((kind, after)) = read_arrow(bytes, i) {
+        if let Some((kind, dotted, after)) = read_arrow(bytes, i) {
             let mut j = after;
             // Optional |label|
             let mut label: Option<String> = None;
@@ -212,7 +404,7 @@ fn parse_line(
                 label = Some(normalise_label(&line[start..j]));
                 if j < bytes.len() { j += 1; }
             }
-            pending_arrow = Some((kind, label));
+            pending_arrow = Some((kind, dotted, label));
             i = j;
             continue;
         }
@@ -232,6 +424,7 @@ fn parse_line(
                     },
                 );
                 order.push(id.clone());
+                new_ids.push(id.clone());
             } else if let Some(l) = label {
                 // Upgrade label / shape if re-declared with content.
                 if let Some(n) = nodes.get_mut(&id) {
@@ -239,8 +432,8 @@ fn parse_line(
                     n.shape = shape_kind;
                 }
             }
-            if let (Some(p), Some((kind, lab))) = (prev.as_ref(), pending_arrow.take()) {
-                edges.push(Edge { from: p.clone(), to: id.clone(), label: lab, kind });
+            if let (Some(p), Some((kind, dotted, lab))) = (prev.as_ref(), pending_arrow.take()) {
+                edges.push(Edge { from: p.clone(), to: id.clone(), label: lab, kind, dotted });
             }
             prev = Some(id);
             i = end;
@@ -250,21 +443,50 @@ fn parse_line(
         // Nothing matched — skip one byte to avoid infinite loop.
         i += 1;
     }
+    new_ids
 }
 
-fn read_arrow(b: &[u8], i: usize) -> Option<(EdgeKind, usize)> {
-    // Longest first so `<-->` isn't shortened to `-->`.
-    if b.len() >= i + 4 && &b[i..i + 4] == b"<-->" {
-        return Some((EdgeKind::BiArrow, i + 4));
+fn read_arrow(b: &[u8], i: usize) -> Option<(EdgeKind, bool, usize)> {
+    // Longest first so `<-->` isn't shortened to `-->`, and dotted variants
+    // (which contain `.`) aren't shortened to their solid cousins.
+    let m = |pat: &[u8]| -> Option<usize> {
+        if b.len() >= i + pat.len() && &b[i..i + pat.len()] == pat {
+            Some(i + pat.len())
+        } else {
+            None
+        }
+    };
+    // Dotted: `-.->` and `<-.->`/`<-.-`/`-.-`. Mermaid also allows extra
+    // dots (`-..->`, `-...->`) for visual length; treat all as the same
+    // shape so the dot-count doesn't change semantics.
+    for (pat, kind) in [
+        (b"<-...->".as_slice(), EdgeKind::BiArrow),
+        (b"<-..->".as_slice(), EdgeKind::BiArrow),
+        (b"<-.->".as_slice(), EdgeKind::BiArrow),
+        (b"-...->".as_slice(), EdgeKind::Arrow),
+        (b"-..->".as_slice(), EdgeKind::Arrow),
+        (b"-.->".as_slice(), EdgeKind::Arrow),
+        (b"<-...-".as_slice(), EdgeKind::ReverseArrow),
+        (b"<-..-".as_slice(), EdgeKind::ReverseArrow),
+        (b"<-.-".as_slice(), EdgeKind::ReverseArrow),
+        (b"-...-".as_slice(), EdgeKind::Line),
+        (b"-..-".as_slice(), EdgeKind::Line),
+        (b"-.-".as_slice(), EdgeKind::Line),
+    ] {
+        if let Some(end) = m(pat) {
+            return Some((kind, true, end));
+        }
     }
-    if b.len() >= i + 3 && &b[i..i + 3] == b"<--" {
-        return Some((EdgeKind::ReverseArrow, i + 3));
-    }
-    if b.len() >= i + 3 && &b[i..i + 3] == b"-->" {
-        return Some((EdgeKind::Arrow, i + 3));
-    }
-    if b.len() >= i + 3 && &b[i..i + 3] == b"---" {
-        return Some((EdgeKind::Line, i + 3));
+    // Solid: longest first.
+    for (pat, kind) in [
+        (b"<-->".as_slice(), EdgeKind::BiArrow),
+        (b"<--".as_slice(), EdgeKind::ReverseArrow),
+        (b"-->".as_slice(), EdgeKind::Arrow),
+        (b"---".as_slice(), EdgeKind::Line),
+    ] {
+        if let Some(end) = m(pat) {
+            return Some((kind, false, end));
+        }
     }
     None
 }
@@ -285,34 +507,47 @@ fn read_node(b: &[u8], i: usize) -> Option<(String, (Shape, Option<String>), usi
                 let lab_start = j + 1;
                 let mut k = lab_start;
                 while k < b.len() && b[k] != b']' { k += 1; }
-                let label = normalise_label(std::str::from_utf8(&b[lab_start..k]).ok()?);
+                let label = clean_label(std::str::from_utf8(&b[lab_start..k]).ok()?);
                 return Some((id, (Shape::Rect, Some(label)), (k + 1).min(b.len())));
             }
             b'{' => {
                 let lab_start = j + 1;
                 let mut k = lab_start;
                 while k < b.len() && b[k] != b'}' { k += 1; }
-                let label = normalise_label(std::str::from_utf8(&b[lab_start..k]).ok()?);
+                let label = clean_label(std::str::from_utf8(&b[lab_start..k]).ok()?);
                 return Some((id, (Shape::Diamond, Some(label)), (k + 1).min(b.len())));
             }
             b'(' if j + 1 < b.len() && b[j + 1] == b'(' => {
                 let lab_start = j + 2;
                 let mut k = lab_start;
                 while k + 1 < b.len() && !(b[k] == b')' && b[k + 1] == b')') { k += 1; }
-                let label = normalise_label(std::str::from_utf8(&b[lab_start..k]).ok()?);
+                let label = clean_label(std::str::from_utf8(&b[lab_start..k]).ok()?);
                 return Some((id, (Shape::Circle, Some(label)), (k + 2).min(b.len())));
             }
             b'(' => {
                 let lab_start = j + 1;
                 let mut k = lab_start;
                 while k < b.len() && b[k] != b')' { k += 1; }
-                let label = normalise_label(std::str::from_utf8(&b[lab_start..k]).ok()?);
+                let label = clean_label(std::str::from_utf8(&b[lab_start..k]).ok()?);
                 return Some((id, (Shape::Rounded, Some(label)), (k + 1).min(b.len())));
             }
             _ => {}
         }
     }
     Some((id, (Shape::Rect, None), j))
+}
+
+/// Mermaid allows wrapping a label in double quotes so it can contain
+/// brackets/parens/spaces (`A["Step (one)"]`). The quotes are syntax, not
+/// content — strip them before normalising line breaks.
+fn clean_label(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let unquoted = if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    normalise_label(unquoted)
 }
 
 fn is_id_byte(b: u8) -> bool {
@@ -369,11 +604,263 @@ fn measure_label(text: &str, size: f32, font: &Font) -> (f32, f32) {
     (max_w, h)
 }
 
+/// Layered placement of a flat set of units. Computes (x, y) positions and
+/// layer indices. Unscaled. Used for both each subgraph's internal layout
+/// and for the top-level layout (treating each subgraph as a super-node).
+fn place_layered(
+    unit_ids: &[String],
+    sizes: &HashMap<String, (f32, f32)>,
+    edges: &[&Edge],
+    direction: Direction,
+    font: &Font,
+    label_size: f32,
+    h_gap: f32,
+    v_gap: f32,
+) -> (HashMap<String, (f32, f32)>, HashMap<String, usize>, f32, f32) {
+    // Layer assignment: longest path from sources using only edges that go
+    // forward in declaration order (back-edges don't influence layers).
+    let mut idx_of: HashMap<&str, usize> = HashMap::new();
+    for (i, id) in unit_ids.iter().enumerate() {
+        idx_of.insert(id.as_str(), i);
+    }
+    let mut preds: HashMap<String, Vec<String>> = HashMap::new();
+    for id in unit_ids {
+        preds.insert(id.clone(), Vec::new());
+    }
+    for e in edges {
+        let (Some(&fi), Some(&ti)) = (idx_of.get(e.from.as_str()), idx_of.get(e.to.as_str())) else { continue };
+        if fi < ti {
+            preds.entry(e.to.clone()).or_default().push(e.from.clone());
+        }
+    }
+    let mut layer: HashMap<String, usize> = HashMap::new();
+    let mut changed = true;
+    let mut guard = 0;
+    while changed && guard < unit_ids.len() * 2 + 5 {
+        changed = false;
+        for id in unit_ids {
+            let l = preds
+                .get(id)
+                .map(|ps| ps.iter().map(|p| *layer.get(p).unwrap_or(&0) + 1).max().unwrap_or(0))
+                .unwrap_or(0);
+            let cur = *layer.get(id).unwrap_or(&0);
+            if l != cur && (cur == 0 || l > cur) {
+                layer.insert(id.clone(), l);
+                changed = true;
+            }
+        }
+        guard += 1;
+    }
+    for id in unit_ids {
+        layer.entry(id.clone()).or_insert(0);
+    }
+
+    // Group by layer in declaration order.
+    let mut per_layer: Vec<Vec<String>> = Vec::new();
+    for id in unit_ids {
+        let l = *layer.get(id).unwrap_or(&0);
+        while per_layer.len() <= l {
+            per_layer.push(Vec::new());
+        }
+        per_layer[l].push(id.clone());
+    }
+
+    let mut positions: HashMap<String, (f32, f32)> = HashMap::new();
+    let (mut total_w, mut total_h) = (0.0f32, 0.0f32);
+
+    match direction {
+        Direction::TopBottom | Direction::BottomTop => {
+            let row_heights: Vec<f32> = per_layer
+                .iter()
+                .map(|row| row.iter().map(|id| sizes.get(id).map(|s| s.1).unwrap_or(0.0)).fold(0.0f32, f32::max))
+                .collect();
+            let row_widths: Vec<f32> = per_layer
+                .iter()
+                .map(|row| {
+                    let ws: f32 = row.iter().map(|id| sizes.get(id).map(|s| s.0).unwrap_or(0.0)).sum();
+                    let gaps = h_gap * (row.len().saturating_sub(1)) as f32;
+                    ws + gaps
+                })
+                .collect();
+            let max_w = row_widths.iter().fold(0.0f32, |a, &b| a.max(b));
+            total_w = max_w.max(1.0);
+
+            let gap_n = per_layer.len().saturating_sub(1);
+            let mut gap_h: Vec<f32> = vec![v_gap; gap_n];
+            let lbl_size = label_size * 0.75;
+            let chip_pad = 4.0;
+            let breathing = 28.0;
+            for e in edges {
+                let Some(lab) = e.label.as_deref() else { continue };
+                let (_lw, lh) = measure_label(lab, lbl_size, font);
+                let from_layer = *layer.get(&e.from).unwrap_or(&0);
+                let to_layer = *layer.get(&e.to).unwrap_or(&0);
+                if to_layer > from_layer && from_layer < gap_h.len() {
+                    let need = lh + chip_pad * 2.0 + breathing * 2.0;
+                    if need > gap_h[from_layer] {
+                        gap_h[from_layer] = need;
+                    }
+                }
+            }
+
+            let mut y = 0.0;
+            for (i, row) in per_layer.iter().enumerate() {
+                let row_w = row_widths[i];
+                let mut x = (total_w - row_w) / 2.0;
+                let row_h = row_heights[i];
+                for id in row {
+                    let (uw, uh) = sizes.get(id).copied().unwrap_or((0.0, 0.0));
+                    positions.insert(id.clone(), (x, y + (row_h - uh) / 2.0));
+                    x += uw + h_gap;
+                }
+                y += row_h;
+                if i + 1 < per_layer.len() {
+                    y += gap_h[i];
+                }
+            }
+            total_h = y;
+        }
+        Direction::LeftRight | Direction::RightLeft => {
+            let col_widths: Vec<f32> = per_layer
+                .iter()
+                .map(|col| col.iter().map(|id| sizes.get(id).map(|s| s.0).unwrap_or(0.0)).fold(0.0f32, f32::max))
+                .collect();
+            let col_heights: Vec<f32> = per_layer
+                .iter()
+                .map(|col| {
+                    let hs: f32 = col.iter().map(|id| sizes.get(id).map(|s| s.1).unwrap_or(0.0)).sum();
+                    let gaps = v_gap * (col.len().saturating_sub(1)) as f32;
+                    hs + gaps
+                })
+                .collect();
+            let max_h = col_heights.iter().fold(0.0f32, |a, &b| a.max(b));
+            total_h = max_h.max(1.0);
+
+            let gap_n = per_layer.len().saturating_sub(1);
+            let mut gap_w: Vec<f32> = vec![h_gap; gap_n];
+            let lbl_size = label_size * 0.75;
+            let chip_pad = 4.0;
+            let breathing = 28.0;
+            for e in edges {
+                let Some(lab) = e.label.as_deref() else { continue };
+                let (lw, _lh) = measure_label(lab, lbl_size, font);
+                let from_layer = *layer.get(&e.from).unwrap_or(&0);
+                let to_layer = *layer.get(&e.to).unwrap_or(&0);
+                if to_layer > from_layer && from_layer < gap_w.len() {
+                    let need = lw + chip_pad * 2.0 + breathing * 2.0;
+                    if need > gap_w[from_layer] {
+                        gap_w[from_layer] = need;
+                    }
+                }
+            }
+
+            let mut x = 0.0;
+            for (i, col) in per_layer.iter().enumerate() {
+                let col_h = col_heights[i];
+                let mut y = (total_h - col_h) / 2.0;
+                let col_w = col_widths[i];
+                for id in col {
+                    let (uw, uh) = sizes.get(id).copied().unwrap_or((0.0, 0.0));
+                    positions.insert(id.clone(), (x + (col_w - uw) / 2.0, y));
+                    y += uh + v_gap;
+                }
+                x += col_w;
+                if i + 1 < per_layer.len() {
+                    x += gap_w[i];
+                }
+            }
+            total_w = x;
+        }
+        Direction::Diagonal => {
+            // Tight diagonal: each node's top-left sits at the running sum of
+            // the previous nodes' sizes plus a small bend gap, so adjacent
+            // boxes nearly touch corner-to-corner instead of all sharing a
+            // max-of-everyone cell. The gap exists to host the L-elbow of
+            // the edge connecting them — wide enough to read, narrow enough
+            // not to waste a wedge of canvas per cell.
+            let diag_gap: f32 = 8.0;
+            let mut x_acc = 0.0f32;
+            let mut y_acc = 0.0f32;
+            for id in unit_ids {
+                let (uw, uh) = sizes.get(id).copied().unwrap_or((0.0, 0.0));
+                positions.insert(id.clone(), (x_acc, y_acc));
+                x_acc += uw + diag_gap;
+                y_acc += uh + diag_gap;
+            }
+            total_w = (x_acc - diag_gap).max(0.0);
+            total_h = (y_acc - diag_gap).max(0.0);
+        }
+    }
+
+    (positions, layer, total_w, total_h)
+}
+
+/// Outgoing anchor on a bbox `(bx, by, bw, bh)`, scaled by `scale`.
+fn anchor_bbox_out(bx: f32, by: f32, bw: f32, bh: f32, dir: &Direction, scale: f32) -> (f32, f32) {
+    match dir {
+        Direction::TopBottom => ((bx + bw / 2.0) * scale, (by + bh) * scale),
+        Direction::BottomTop => ((bx + bw / 2.0) * scale, by * scale),
+        Direction::LeftRight => ((bx + bw) * scale, (by + bh / 2.0) * scale),
+        Direction::RightLeft => (bx * scale, (by + bh / 2.0) * scale),
+        Direction::Diagonal => ((bx + bw / 2.0) * scale, (by + bh / 2.0) * scale),
+    }
+}
+
+fn anchor_bbox_in(bx: f32, by: f32, bw: f32, bh: f32, dir: &Direction, scale: f32) -> (f32, f32) {
+    match dir {
+        Direction::TopBottom => ((bx + bw / 2.0) * scale, by * scale),
+        Direction::BottomTop => ((bx + bw / 2.0) * scale, (by + bh) * scale),
+        Direction::LeftRight => (bx * scale, (by + bh / 2.0) * scale),
+        Direction::RightLeft => ((bx + bw) * scale, (by + bh / 2.0) * scale),
+        Direction::Diagonal => ((bx + bw / 2.0) * scale, (by + bh / 2.0) * scale),
+    }
+}
+
+/// Approximate dashed line at an arbitrary angle. Splits the segment into
+/// short dash+gap runs along its direction vector.
+fn emit_dashed_seg(
+    items: &mut Vec<Placed>,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    thickness: f32,
+    color: Rgba,
+) {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len <= 0.001 {
+        return;
+    }
+    let ux = dx / len;
+    let uy = dy / len;
+    let dash: f32 = 6.0;
+    let gap: f32 = 4.0;
+    let mut t = 0.0f32;
+    while t < len {
+        let end = (t + dash).min(len);
+        items.push(Placed::Line {
+            x1: x0 + ux * t,
+            y1: y0 + uy * t,
+            x2: x0 + ux * end,
+            y2: y0 + uy * end,
+            thickness,
+            color,
+        });
+        t = end + gap;
+    }
+}
+
 fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> MermaidRender {
     let pad_x = 14.0;
     let pad_y = 10.0;
     let min_w = 80.0;
     let label_size = theme.body_size * 0.9;
+    let sg_label_size = theme.body_size;
+    let sg_pad = 16.0;
+    let h_gap = 40.0;
+    let v_gap = 50.0;
     let font = &fonts.body;
 
     // 1. Measure nodes.
@@ -394,192 +881,229 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
         }
     }
 
-    // 2. Layers via longest-path from sources.
-    let layers = assign_layers(&graph);
+    // 2. For each subgraph (deepest first), compute its internal layout and
+    //    container bbox. Child positions are stored as offsets *relative to
+    //    the subgraph's inner origin* in `internal_pos`; we'll translate to
+    //    absolute coords after the top-level layout fixes each subgraph's
+    //    position.
+    // Subgraphs inherit the outer flow direction. Diagonal cascades through so
+    // children of a diagonal flowchart also tile on the diagonal of their
+    // container; BT/RL flip only at the top level (children stay TB/LR — the
+    // BT/RL flip is applied to top-level units after placement, not to the
+    // intra-subgraph layout).
+    let inner_dir = match graph.direction {
+        Direction::Diagonal => Direction::Diagonal,
+        Direction::BottomTop | Direction::TopBottom => Direction::TopBottom,
+        Direction::LeftRight | Direction::RightLeft => Direction::LeftRight,
+    };
 
-    // 3. Group nodes by layer in insertion order.
-    let mut per_layer: Vec<Vec<String>> = Vec::new();
-    for id in &graph.order {
-        let l = *layers.get(id).unwrap_or(&0);
-        while per_layer.len() <= l {
-            per_layer.push(Vec::new());
+    let mut depths: Vec<(usize, usize)> = (0..graph.subgraphs.len())
+        .map(|i| {
+            let mut d = 0;
+            let mut cur = graph.subgraphs[i].parent;
+            while let Some(p) = cur {
+                d += 1;
+                cur = graph.subgraphs[p].parent;
+            }
+            (d, i)
+        })
+        .collect();
+    depths.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut internal_pos: HashMap<String, (f32, f32)> = HashMap::new();
+    let mut internal_extent: HashMap<usize, (f32, f32)> = HashMap::new();
+
+    for (_, sg_idx) in &depths {
+        let sg_idx = *sg_idx;
+        let mut unit_ids: Vec<String> = Vec::new();
+        let mut sizes: HashMap<String, (f32, f32)> = HashMap::new();
+        for nid in graph.subgraphs[sg_idx].child_nodes.clone() {
+            if let Some(n) = graph.nodes.get(&nid) {
+                unit_ids.push(nid.clone());
+                sizes.insert(nid.clone(), (n.w, n.h));
+            }
         }
-        per_layer[l].push(id.clone());
-    }
-
-    // 4. Place.
-    let h_gap = 40.0;
-    let v_gap = 50.0;
-
-    let (mut total_w, mut total_h) = (0.0f32, 0.0f32);
-    match graph.direction {
-        Direction::TopBottom | Direction::BottomTop => {
-            // Each layer is a row. Compute each row's total width and row height.
-            let row_heights: Vec<f32> = per_layer
-                .iter()
-                .map(|row| {
-                    row.iter()
-                        .map(|id| graph.nodes.get(id).map(|n| n.h).unwrap_or(0.0))
-                        .fold(0.0f32, f32::max)
-                })
-                .collect();
-            let row_widths: Vec<f32> = per_layer
-                .iter()
-                .map(|row| {
-                    let ws: f32 = row
-                        .iter()
-                        .map(|id| graph.nodes.get(id).map(|n| n.w).unwrap_or(0.0))
-                        .sum();
-                    let gaps = h_gap * (row.len().saturating_sub(1)) as f32;
-                    ws + gaps
-                })
-                .collect();
-            let max_w = row_widths.iter().fold(0.0f32, |a, &b| a.max(b));
-            total_w = max_w.max(1.0);
-
-            // Inter-row gaps: widen to fit the tallest label (multi-line
-            // labels can exceed the default v_gap) plus breathing room so
-            // the chip doesn't butt against the arrowhead or node.
-            let gap_n = per_layer.len().saturating_sub(1);
-            let mut gap_h: Vec<f32> = vec![v_gap; gap_n];
-            let lbl_size = label_size * 0.75;
-            let chip_pad = 4.0;
-            let breathing = 28.0;
-            for e in &graph.edges {
-                let Some(lab) = e.label.as_deref() else { continue };
-                let (_lw, lh) = measure_label(lab, lbl_size, font);
-                let from_layer = *layers.get(&e.from).unwrap_or(&0);
-                let to_layer = *layers.get(&e.to).unwrap_or(&0);
-                if to_layer > from_layer && from_layer < gap_h.len() {
-                    let need = lh + chip_pad * 2.0 + breathing * 2.0;
-                    if need > gap_h[from_layer] {
-                        gap_h[from_layer] = need;
-                    }
-                }
-            }
-
-            let mut y = 0.0;
-            for (i, row) in per_layer.iter().enumerate() {
-                let row_w = row_widths[i];
-                let mut x = (total_w - row_w) / 2.0;
-                let row_h = row_heights[i];
-                for id in row {
-                    if let Some(n) = graph.nodes.get_mut(id) {
-                        n.x = x;
-                        n.y = y + (row_h - n.h) / 2.0;
-                        x += n.w + h_gap;
-                    }
-                }
-                y += row_h;
-                if i + 1 < per_layer.len() {
-                    y += gap_h[i];
-                }
-            }
-            total_h = y;
+        let child_groups = graph.subgraphs[sg_idx].child_groups.clone();
+        for cgi in child_groups {
+            let cg = &graph.subgraphs[cgi];
+            unit_ids.push(cg.id.clone());
+            sizes.insert(cg.id.clone(), (cg.w, cg.h));
         }
-        Direction::LeftRight | Direction::RightLeft => {
-            let col_widths: Vec<f32> = per_layer
-                .iter()
-                .map(|col| col.iter().map(|id| graph.nodes.get(id).map(|n| n.w).unwrap_or(0.0)).fold(0.0f32, f32::max))
-                .collect();
-            let col_heights: Vec<f32> = per_layer
-                .iter()
-                .map(|col| {
-                    let hs: f32 = col.iter().map(|id| graph.nodes.get(id).map(|n| n.h).unwrap_or(0.0)).sum();
-                    let gaps = v_gap * (col.len().saturating_sub(1)) as f32;
-                    hs + gaps
-                })
-                .collect();
-            let max_h = col_heights.iter().fold(0.0f32, |a, &b| a.max(b));
-            total_h = max_h.max(1.0);
 
-            // Each inter-column gap gets widened to fit the max label width
-            // of any labelled edge that starts in that column, so the arrow
-            // line is long enough to host the label without clipping the
-            // next node. Unlabelled edges keep the default gap.
-            let gap_n = per_layer.len().saturating_sub(1);
-            let mut gap_w: Vec<f32> = vec![h_gap; gap_n];
-            let lbl_size = label_size * 0.75;
-            let chip_pad = 4.0;
-            // Arrow has to span: node edge → chip start → chip → chip end →
-            // arrowhead + node. We want generous breathing room on both sides
-            // of the chip so the arrowhead and source node don't crowd the
-            // label.
-            let breathing = 28.0;
-            for e in &graph.edges {
-                let Some(lab) = e.label.as_deref() else { continue };
-                let (lw, _lh) = measure_label(lab, lbl_size, font);
-                let from_layer = *layers.get(&e.from).unwrap_or(&0);
-                let to_layer = *layers.get(&e.to).unwrap_or(&0);
-                if to_layer > from_layer && from_layer < gap_w.len() {
-                    let need = lw + chip_pad * 2.0 + breathing * 2.0;
-                    if need > gap_w[from_layer] {
-                        gap_w[from_layer] = need;
-                    }
-                }
-            }
+        let unit_set: HashSet<String> = unit_ids.iter().cloned().collect();
+        let internal_edges: Vec<&Edge> = graph
+            .edges
+            .iter()
+            .filter(|e| unit_set.contains(&e.from) && unit_set.contains(&e.to))
+            .collect();
 
-            let mut x = 0.0;
-            for (i, col) in per_layer.iter().enumerate() {
-                let col_h = col_heights[i];
-                let mut y = (total_h - col_h) / 2.0;
-                let col_w = col_widths[i];
-                for id in col {
-                    if let Some(n) = graph.nodes.get_mut(id) {
-                        n.x = x + (col_w - n.w) / 2.0;
-                        n.y = y;
-                        y += n.h + v_gap;
-                    }
-                }
-                x += col_w;
-                if i + 1 < per_layer.len() {
-                    x += gap_w[i];
-                }
-            }
-            total_w = x;
-        }
-        Direction::Diagonal => {
-            // N nodes in declaration order sit on the main diagonal of an
-            // N×N grid. Each cell is a uniform max-of-all-nodes box so
-            // forward (upper-right) and back (lower-left) edges route
-            // cleanly through the triangles without crossing.
-            let cell_w = graph.nodes.values().map(|n| n.w).fold(0.0f32, f32::max);
-            let cell_h = graph.nodes.values().map(|n| n.h).fold(0.0f32, f32::max);
-            let n = graph.order.len().max(1);
-            let step_x = cell_w + h_gap;
-            let step_y = cell_h + v_gap;
-            for (i, id) in graph.order.iter().enumerate() {
-                if let Some(node) = graph.nodes.get_mut(id) {
-                    node.x = i as f32 * step_x + (cell_w - node.w) / 2.0;
-                    node.y = i as f32 * step_y + (cell_h - node.h) / 2.0;
-                }
-            }
-            total_w = n as f32 * step_x - h_gap;
-            total_h = n as f32 * step_y - v_gap;
-        }
-    }
+        let (positions, _layers, inner_w, inner_h) =
+            place_layered(&unit_ids, &sizes, &internal_edges, inner_dir, font, label_size, h_gap, v_gap);
 
-    // BT / RL are just TB / LR with the long axis mirrored. Mirroring the
-    // *node positions* here (not the emitted primitives later) keeps labels
-    // readable — each node's internal text still stacks top-to-bottom and
-    // fits inside its rect.
-    if graph.direction.is_flipped() {
-        if graph.direction.is_vertical() {
-            for (_, n) in graph.nodes.iter_mut() {
-                n.y = total_h - n.y - n.h;
-            }
+        let header_h = if graph.subgraphs[sg_idx].label.is_empty() {
+            sg_pad
         } else {
-            for (_, n) in graph.nodes.iter_mut() {
-                n.x = total_w - n.x - n.w;
+            sg_label_size * 1.3 + 12.0
+        };
+        let (lbl_w, _) = measure_label(&graph.subgraphs[sg_idx].label, sg_label_size, font);
+        let min_outer_w = lbl_w + sg_pad * 4.0;
+        let outer_w = (inner_w + sg_pad * 2.0).max(min_outer_w).max(min_w * 1.5);
+        let outer_h = header_h + inner_h + sg_pad * 2.0;
+
+        graph.subgraphs[sg_idx].w = outer_w;
+        graph.subgraphs[sg_idx].h = outer_h;
+        graph.subgraphs[sg_idx].header_h = header_h;
+        internal_extent.insert(sg_idx, (inner_w, inner_h));
+
+        // Centre the inner layout horizontally inside the container when
+        // the container ended up wider than the strict content width (e.g.,
+        // because the label needed more room).
+        let extra_left = ((outer_w - sg_pad * 2.0) - inner_w) / 2.0;
+        for (id, (px, py)) in positions {
+            internal_pos.insert(id, (px + extra_left, py));
+        }
+    }
+
+    // 3. Top-level units = top-level subgraphs + nodes that aren't inside
+    //    any subgraph. Order follows declaration order from `graph.order`,
+    //    falling back to `graph.subgraphs` for top-level subgraphs whose
+    //    children don't appear in `graph.order` (rare).
+    let top_level_of = |id: &str, g: &Graph| -> Option<String> {
+        if let Some(&sg_idx) = g.node_to_group.get(id) {
+            let mut cur = sg_idx;
+            while let Some(p) = g.subgraphs[cur].parent {
+                cur = p;
+            }
+            Some(g.subgraphs[cur].id.clone())
+        } else if let Some(&sg_idx) = g.group_id_to_index.get(id) {
+            let mut cur = sg_idx;
+            while let Some(p) = g.subgraphs[cur].parent {
+                cur = p;
+            }
+            Some(g.subgraphs[cur].id.clone())
+        } else if g.nodes.contains_key(id) {
+            Some(id.to_string())
+        } else {
+            None
+        }
+    };
+
+    let mut top_unit_ids: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for id in &graph.order {
+        if let Some(tl) = top_level_of(id, &graph) {
+            if seen.insert(tl.clone()) {
+                top_unit_ids.push(tl);
+            }
+        }
+    }
+    for sg in &graph.subgraphs {
+        if sg.parent.is_none() && seen.insert(sg.id.clone()) {
+            top_unit_ids.push(sg.id.clone());
+        }
+    }
+
+    let mut top_sizes: HashMap<String, (f32, f32)> = HashMap::new();
+    for id in &top_unit_ids {
+        if let Some(&sg_idx) = graph.group_id_to_index.get(id) {
+            let sg = &graph.subgraphs[sg_idx];
+            top_sizes.insert(id.clone(), (sg.w, sg.h));
+        } else if let Some(n) = graph.nodes.get(id) {
+            top_sizes.insert(id.clone(), (n.w, n.h));
+        }
+    }
+
+    // Project edges to the top level: each endpoint becomes its top-level
+    // container id. Edges that collapse to the same top-level unit (i.e.,
+    // both endpoints live inside the same subgraph) don't influence the
+    // top-level layout.
+    let top_set: HashSet<String> = top_unit_ids.iter().cloned().collect();
+    let projected_edges: Vec<Edge> = graph
+        .edges
+        .iter()
+        .filter_map(|e| {
+            let tlf = top_level_of(&e.from, &graph)?;
+            let tlt = top_level_of(&e.to, &graph)?;
+            if tlf == tlt || !top_set.contains(&tlf) || !top_set.contains(&tlt) {
+                return None;
+            }
+            Some(Edge {
+                from: tlf,
+                to: tlt,
+                label: e.label.clone(),
+                kind: e.kind,
+                dotted: e.dotted,
+            })
+        })
+        .collect();
+    let projected_refs: Vec<&Edge> = projected_edges.iter().collect();
+
+    let (mut top_positions, top_layers, total_w, total_h) = place_layered(
+        &top_unit_ids,
+        &top_sizes,
+        &projected_refs,
+        graph.direction,
+        font,
+        label_size,
+        h_gap,
+        v_gap,
+    );
+
+    // BT/RL flip — mirror unit positions along the flow axis (only at the
+    // top level; children inside subgraphs use the inner direction which
+    // never flips, so their relative positions stay valid).
+    if graph.direction.is_flipped() {
+        for (id, p) in top_positions.iter_mut() {
+            let (uw, uh) = top_sizes.get(id).copied().unwrap_or((0.0, 0.0));
+            if graph.direction.is_vertical() {
+                p.1 = total_h - p.1 - uh;
+            } else {
+                p.0 = total_w - p.0 - uw;
             }
         }
     }
 
-    // Fit the diagram to the available width.
-    //   - If it's too wide, scale down so it exactly fits.
-    //   - If it's too narrow, scale up proportionally (capped at 1.6x) so
-    //     the graph actually uses the space. A small graph in a wide window
-    //     looked cramped otherwise.
+    // 4. Commit top-level positions to graph (unscaled absolute coords).
+    for (id, &(x, y)) in &top_positions {
+        if let Some(&sg_idx) = graph.group_id_to_index.get(id) {
+            graph.subgraphs[sg_idx].x = x;
+            graph.subgraphs[sg_idx].y = y;
+        } else if let Some(n) = graph.nodes.get_mut(id) {
+            n.x = x;
+            n.y = y;
+        }
+    }
+
+    // 5. Translate each subgraph's children to absolute coords (root-first
+    //    so a parent's absolute position is set before we touch its kids).
+    let mut root_first: Vec<usize> = depths.iter().map(|(_, i)| *i).collect();
+    root_first.reverse();
+    for sg_idx in root_first {
+        let parent_x = graph.subgraphs[sg_idx].x;
+        let parent_y = graph.subgraphs[sg_idx].y;
+        let header_h = graph.subgraphs[sg_idx].header_h;
+        let inner_x = parent_x + sg_pad;
+        let inner_y = parent_y + header_h;
+        let child_nodes = graph.subgraphs[sg_idx].child_nodes.clone();
+        let child_groups = graph.subgraphs[sg_idx].child_groups.clone();
+        for nid in &child_nodes {
+            if let Some(&(rx, ry)) = internal_pos.get(nid) {
+                if let Some(n) = graph.nodes.get_mut(nid) {
+                    n.x = inner_x + rx;
+                    n.y = inner_y + ry;
+                }
+            }
+        }
+        for cgi in &child_groups {
+            let cid = graph.subgraphs[*cgi].id.clone();
+            if let Some(&(rx, ry)) = internal_pos.get(&cid) {
+                graph.subgraphs[*cgi].x = inner_x + rx;
+                graph.subgraphs[*cgi].y = inner_y + ry;
+            }
+        }
+    }
+
+    // 6. Scale to fit the available width.
     let target = max_width * 0.92;
     let scale = if max_width <= 0.0 || total_w <= 0.0 {
         1.0
@@ -591,101 +1115,215 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
         1.0
     };
 
-    // 5. Emit primitives.
+    // 7. Back-edge lanes at the top level. Internal subgraph edges don't
+    //    use the lane; if there are back-edges *inside* a subgraph, they
+    //    just clip straight through (consistent with the rest of the
+    //    layout's "good enough" approach for the common case).
     let stroke: Rgba = theme.fg;
     let fill: Rgba = theme.code_bg;
     let mut items: Vec<Placed> = Vec::new();
 
-    // Back edges (source layer > target layer) route around the node row
-    // through a lane on the far side, so they don't cut through intermediate
-    // nodes. Multiple back edges stack in lanes 1, 2, 3… so they don't
-    // overlap each other.
     let lane_gap = 18.0 * scale;
-    let mut back_edges: Vec<(usize, f32)> = Vec::new(); // (edge_index, lane_y_or_x)
+    // Edges that must detour around the side instead of running straight
+    // between layers: either they go *backwards* (target above source) or
+    // they *skip* a layer (target more than one layer past source). A
+    // straight line for either would cut through the subgraph(s) sitting in
+    // between. Each gets its own stacked lane so multiple detours don't
+    // overlap. (Adjacent forward edges — the common case — stay straight.)
+    let mut side_edges: Vec<(usize, f32)> = Vec::new();
     {
         let mut lane_idx = 0usize;
-        for (ei, e) in graph.edges.iter().enumerate() {
-            let from_layer = *layers.get(&e.from).unwrap_or(&0);
-            let to_layer = *layers.get(&e.to).unwrap_or(&0);
-            if from_layer > to_layer {
-                back_edges.push((ei, lane_idx as f32));
+        for (ei, e) in projected_edges.iter().enumerate() {
+            let from_layer = *top_layers.get(&e.from).unwrap_or(&0);
+            let to_layer = *top_layers.get(&e.to).unwrap_or(&0);
+            if from_layer > to_layer || to_layer > from_layer + 1 {
+                side_edges.push((ei, lane_idx as f32));
                 lane_idx += 1;
             }
         }
     }
-    let back_lane_depth = back_edges.len() as f32 * lane_gap
-        + if back_edges.is_empty() { 0.0 } else { lane_gap * 2.0 };
+    let back_lane_depth = side_edges.len() as f32 * lane_gap
+        + if side_edges.is_empty() { 0.0 } else { lane_gap * 2.0 };
     let content_h = total_h * scale;
     let content_w = total_w * scale;
-    let total_render_h = content_h + match graph.direction {
-        Direction::LeftRight | Direction::RightLeft | Direction::TopBottom | Direction::BottomTop => back_lane_depth,
-        // Diagonal routes back edges through the lower-left triangle
-        // itself, so no extra lane height is needed.
-        Direction::Diagonal => 0.0,
+    let total_render_h = content_h
+        + match graph.direction {
+            Direction::LeftRight | Direction::RightLeft | Direction::TopBottom | Direction::BottomTop => {
+                back_lane_depth
+            }
+            Direction::Diagonal => 0.0,
+        };
+
+    // Map original edge index → projected edge index (so we can look up
+    // each original edge's back-edge lane).
+    let mut orig_to_projected: HashMap<usize, usize> = HashMap::new();
+    {
+        let mut pj = 0;
+        for (oi, e) in graph.edges.iter().enumerate() {
+            let tlf = top_level_of(&e.from, &graph);
+            let tlt = top_level_of(&e.to, &graph);
+            if let (Some(f), Some(t)) = (tlf, tlt) {
+                if f != t && top_set.contains(&f) && top_set.contains(&t) {
+                    orig_to_projected.insert(oi, pj);
+                    pj += 1;
+                }
+            }
+        }
+    }
+
+    // 8. Emit subgraph containers (root-first so children paint on top of
+    //    nested parents).
+    let mut sg_render_order: Vec<usize> = depths.iter().map(|(_, i)| *i).collect();
+    sg_render_order.reverse();
+    for sg_idx in &sg_render_order {
+        let sg = &graph.subgraphs[*sg_idx];
+        let style = graph.styles.get(&sg.id).copied().unwrap_or_default();
+        // Default background: a subtle tint based on the code bg so the
+        // container is visible even without an explicit `style`.
+        let bg = style.fill.unwrap_or([fill[0], fill[1], fill[2], 70]);
+        let txt = style.text.unwrap_or(stroke);
+        let sx = sg.x * scale;
+        let sy = sg.y * scale;
+        let sw = sg.w * scale;
+        let sh = sg.h * scale;
+        let header_h = sg.header_h * scale;
+        // Background fill.
+        items.push(Placed::Rect { x: sx, y: sy, w: sw, h: sh, color: bg });
+        // Border.
+        let t = 1.5 * scale;
+        items.push(Placed::Rect { x: sx, y: sy, w: sw, h: t, color: stroke });
+        items.push(Placed::Rect { x: sx, y: sy + sh - t, w: sw, h: t, color: stroke });
+        items.push(Placed::Rect { x: sx, y: sy, w: t, h: sh, color: stroke });
+        items.push(Placed::Rect { x: sx + sw - t, y: sy, w: t, h: sh, color: stroke });
+        // Title in the header band.
+        if !sg.label.is_empty() {
+            emit_label_lines(
+                &mut items,
+                &sg.label,
+                font,
+                sg_label_size * scale,
+                sx + sw / 2.0,
+                sy + header_h / 2.0,
+                txt,
+            );
+        }
+    }
+
+    let bbox_of = |id: &str, g: &Graph| -> Option<(f32, f32, f32, f32)> {
+        if let Some(&sg_idx) = g.group_id_to_index.get(id) {
+            let sg = &g.subgraphs[sg_idx];
+            Some((sg.x, sg.y, sg.w, sg.h))
+        } else if let Some(n) = g.nodes.get(id) {
+            Some((n.x, n.y, n.w, n.h))
+        } else {
+            None
+        }
     };
 
-    // Pass 1: edge lines + arrowheads. Forward edges draw straight;
-    // back edges take a polyline around the node row.
+    // 9. Edge lines + arrowheads. We pick the anchor direction by where the
+    //    edge's endpoints live: cross-container edges use the top-level
+    //    direction; edges inside a subgraph use the inner direction.
     for (ei, e) in graph.edges.iter().enumerate() {
-        let (Some(a), Some(b)) = (graph.nodes.get(&e.from), graph.nodes.get(&e.to)) else { continue };
-        let from_layer = *layers.get(&e.from).unwrap_or(&0);
-        let to_layer = *layers.get(&e.to).unwrap_or(&0);
-        let is_back = from_layer > to_layer;
+        let (Some((ax, ay, aw, ah)), Some((bx, by, bw, bh))) =
+            (bbox_of(&e.from, &graph), bbox_of(&e.to, &graph))
+        else {
+            continue;
+        };
+        let from_tl = top_level_of(&e.from, &graph);
+        let to_tl = top_level_of(&e.to, &graph);
+        let cross_container = from_tl != to_tl;
+        let edge_dir = if cross_container { graph.direction } else { inner_dir };
+        let (is_back, is_skip) = if cross_container {
+            let fl = top_layers
+                .get(from_tl.as_deref().unwrap_or(""))
+                .copied()
+                .unwrap_or(0);
+            let tl = top_layers
+                .get(to_tl.as_deref().unwrap_or(""))
+                .copied()
+                .unwrap_or(0);
+            (fl > tl, tl > fl + 1)
+        } else {
+            (false, false)
+        };
+        // Both backwards and layer-skipping edges detour around the side.
+        let is_side = is_back || is_skip;
         let head_at_end = matches!(e.kind, EdgeKind::Arrow | EdgeKind::BiArrow);
         let head_at_start = matches!(e.kind, EdgeKind::ReverseArrow | EdgeKind::BiArrow);
         let thick = 1.5 * scale;
+        let dotted = e.dotted;
 
-        // Diagonal: L-shaped edges through the appropriate triangle. Forward
-        // edges exit the source's right, run rightward to the target's
-        // column, then drop down into the target's top. Back edges exit
-        // left, run to the target's column, then rise into the target's
-        // bottom. Zero crossings, arrows always land on a node face.
-        if matches!(graph.direction, Direction::Diagonal) {
-            let ah = 9.0 * scale;
-            let aw = 6.0 * scale;
+        let line_emit = |items: &mut Vec<Placed>, x1: f32, y1: f32, x2: f32, y2: f32| {
+            if dotted {
+                emit_dashed_seg(items, x1, y1, x2, y2, thick, stroke);
+            } else {
+                items.push(Placed::Line { x1, y1, x2, y2, thickness: thick, color: stroke });
+            }
+        };
+
+        // Diagonal L-paths apply wherever the chosen direction is Diagonal —
+        // both cross-container edges (top-level diagonal flow) and edges
+        // internal to a subgraph that inherited Diagonal from its parent.
+        if matches!(edge_dir, Direction::Diagonal) {
+            let head_h_px = 9.0 * scale;
+            let head_w_px = 6.0 * scale;
             if !is_back {
-                let sx = (a.x + a.w) * scale;
-                let sy = (a.y + a.h / 2.0) * scale;
-                let tx = (b.x + b.w / 2.0) * scale;
-                let ty = b.y * scale;
-                items.push(Placed::Line { x1: sx, y1: sy, x2: tx, y2: sy, thickness: thick, color: stroke });
-                items.push(Placed::Line { x1: tx, y1: sy, x2: tx, y2: ty, thickness: thick, color: stroke });
+                let sx = (ax + aw) * scale;
+                let sy = (ay + ah / 2.0) * scale;
+                let tx = (bx + bw / 2.0) * scale;
+                let ty = by * scale;
+                line_emit(&mut items, sx, sy, tx, sy);
+                line_emit(&mut items, tx, sy, tx, ty);
                 if head_at_end {
                     let tip = (tx, ty);
-                    let base = (tx, ty - ah);
+                    let base = (tx, ty - head_h_px);
                     items.push(Placed::Triangle {
-                        p1: tip, p2: (base.0 + aw, base.1), p3: (base.0 - aw, base.1),
+                        p1: tip,
+                        p2: (base.0 + head_w_px, base.1),
+                        p3: (base.0 - head_w_px, base.1),
                         color: stroke,
                     });
                 }
                 if head_at_start {
+                    // Bidirectional convention: head_at_start points INTO
+                    // the source, base is on the line side (toward end).
+                    // Forward L exits source rightward, so base sits to the
+                    // right of the tip.
                     let tip = (sx, sy);
-                    let base = (sx - ah, sy);
+                    let base = (sx + head_h_px, sy);
                     items.push(Placed::Triangle {
-                        p1: tip, p2: (base.0, base.1 + aw), p3: (base.0, base.1 - aw),
+                        p1: tip,
+                        p2: (base.0, base.1 + head_w_px),
+                        p3: (base.0, base.1 - head_w_px),
                         color: stroke,
                     });
                 }
             } else {
-                let sx = a.x * scale;
-                let sy = (a.y + a.h / 2.0) * scale;
-                let tx = (b.x + b.w / 2.0) * scale;
-                let ty = (b.y + b.h) * scale;
-                items.push(Placed::Line { x1: sx, y1: sy, x2: tx, y2: sy, thickness: thick, color: stroke });
-                items.push(Placed::Line { x1: tx, y1: sy, x2: tx, y2: ty, thickness: thick, color: stroke });
+                let sx = ax * scale;
+                let sy = (ay + ah / 2.0) * scale;
+                let tx = (bx + bw / 2.0) * scale;
+                let ty = (by + bh) * scale;
+                line_emit(&mut items, sx, sy, tx, sy);
+                line_emit(&mut items, tx, sy, tx, ty);
                 if head_at_end {
                     let tip = (tx, ty);
-                    let base = (tx, ty + ah);
+                    let base = (tx, ty + head_h_px);
                     items.push(Placed::Triangle {
-                        p1: tip, p2: (base.0 + aw, base.1), p3: (base.0 - aw, base.1),
+                        p1: tip,
+                        p2: (base.0 + head_w_px, base.1),
+                        p3: (base.0 - head_w_px, base.1),
                         color: stroke,
                     });
                 }
                 if head_at_start {
+                    // Back L exits source leftward — base sits to the LEFT
+                    // of the tip so the arrow still points INTO source.
                     let tip = (sx, sy);
-                    let base = (sx + ah, sy);
+                    let base = (sx - head_h_px, sy);
                     items.push(Placed::Triangle {
-                        p1: tip, p2: (base.0, base.1 + aw), p3: (base.0, base.1 - aw),
+                        p1: tip,
+                        p2: (base.0, base.1 + head_w_px),
+                        p3: (base.0, base.1 - head_w_px),
                         color: stroke,
                     });
                 }
@@ -693,129 +1331,141 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
             continue;
         }
 
-        if is_back {
-            let lane_n = back_edges
-                .iter()
-                .find(|(i, _)| *i == ei)
+        if is_side {
+            let lane_n = orig_to_projected
+                .get(&ei)
+                .and_then(|pj| side_edges.iter().find(|(i, _)| *i == *pj))
                 .map(|(_, n)| *n)
                 .unwrap_or(0.0);
             let lane_off = lane_gap * (lane_n + 1.5);
+            let head_h_px = 9.0 * scale;
+            let head_w_px = 6.0 * scale;
             match graph.direction {
                 Direction::LeftRight | Direction::RightLeft => {
-                    // Exit bottom of source, run left along a lane below all
-                    // nodes, come up into bottom of target.
-                    let sx = (a.x + a.w / 2.0) * scale;
-                    let sy = (a.y + a.h) * scale;
-                    let tx = (b.x + b.w / 2.0) * scale;
-                    let ty = (b.y + b.h) * scale;
+                    // Detour through a lane *below* all columns: exit the
+                    // source's bottom, run along the lane, rise into the
+                    // target's bottom. Symmetric in x, so it serves both
+                    // back- and skip-edges.
+                    let sx = (ax + aw / 2.0) * scale;
+                    let sy = (ay + ah) * scale;
+                    let tx = (bx + bw / 2.0) * scale;
+                    let ty = (by + bh) * scale;
                     let lane_y = content_h + lane_off;
-                    items.push(Placed::Line { x1: sx, y1: sy, x2: sx, y2: lane_y, thickness: thick, color: stroke });
-                    items.push(Placed::Line { x1: sx, y1: lane_y, x2: tx, y2: lane_y, thickness: thick, color: stroke });
-                    items.push(Placed::Line { x1: tx, y1: lane_y, x2: tx, y2: ty, thickness: thick, color: stroke });
+                    line_emit(&mut items, sx, sy, sx, lane_y);
+                    line_emit(&mut items, sx, lane_y, tx, lane_y);
+                    line_emit(&mut items, tx, lane_y, tx, ty);
                     if head_at_end {
-                        // arrowhead pointing up into target's bottom edge
-                        let ah = 9.0 * scale;
-                        let aw = 6.0 * scale;
                         let tip = (tx, ty);
-                        let base = (tx, ty + ah);
+                        let base = (tx, ty + head_h_px);
                         items.push(Placed::Triangle {
                             p1: tip,
-                            p2: (base.0 + aw, base.1),
-                            p3: (base.0 - aw, base.1),
+                            p2: (base.0 + head_w_px, base.1),
+                            p3: (base.0 - head_w_px, base.1),
                             color: stroke,
                         });
                     }
                     if head_at_start {
-                        let ah = 9.0 * scale;
-                        let aw = 6.0 * scale;
                         let tip = (sx, sy);
-                        let base = (sx, sy + ah);
+                        let base = (sx, sy + head_h_px);
                         items.push(Placed::Triangle {
                             p1: tip,
-                            p2: (base.0 + aw, base.1),
-                            p3: (base.0 - aw, base.1),
+                            p2: (base.0 + head_w_px, base.1),
+                            p3: (base.0 - head_w_px, base.1),
                             color: stroke,
                         });
                     }
                 }
-                Direction::Diagonal => unreachable!("diagonal back-edges handled above"),
                 Direction::TopBottom | Direction::BottomTop => {
-                    // Mirror for TD: route around the right side.
-                    let sx = (a.x + a.w) * scale;
-                    let sy = (a.y + a.h / 2.0) * scale;
-                    let tx = (b.x + b.w) * scale;
-                    let ty = (b.y + b.h / 2.0) * scale;
+                    // Detour through a lane to the *right* of all rows: exit
+                    // the source's right edge, run out to the lane, travel
+                    // vertically to the target's row, come back into the
+                    // target's right edge. Symmetric in y, so it serves both
+                    // back-edges (target above) and skip-edges (target more
+                    // than one row below).
+                    let sx = (ax + aw) * scale;
+                    let sy = (ay + ah / 2.0) * scale;
+                    let tx = (bx + bw) * scale;
+                    let ty = (by + bh / 2.0) * scale;
                     let lane_x = content_w + lane_off;
-                    items.push(Placed::Line { x1: sx, y1: sy, x2: lane_x, y2: sy, thickness: thick, color: stroke });
-                    items.push(Placed::Line { x1: lane_x, y1: sy, x2: lane_x, y2: ty, thickness: thick, color: stroke });
-                    items.push(Placed::Line { x1: lane_x, y1: ty, x2: tx, y2: ty, thickness: thick, color: stroke });
+                    line_emit(&mut items, sx, sy, lane_x, sy);
+                    line_emit(&mut items, lane_x, sy, lane_x, ty);
+                    line_emit(&mut items, lane_x, ty, tx, ty);
                     if head_at_end {
-                        let ah = 9.0 * scale;
-                        let aw = 6.0 * scale;
                         let tip = (tx, ty);
-                        let base = (tx + ah, ty);
+                        let base = (tx + head_h_px, ty);
                         items.push(Placed::Triangle {
                             p1: tip,
-                            p2: (base.0, base.1 + aw),
-                            p3: (base.0, base.1 - aw),
+                            p2: (base.0, base.1 + head_w_px),
+                            p3: (base.0, base.1 - head_w_px),
+                            color: stroke,
+                        });
+                    }
+                    if head_at_start {
+                        let tip = (sx, sy);
+                        let base = (sx + head_h_px, sy);
+                        items.push(Placed::Triangle {
+                            p1: tip,
+                            p2: (base.0, base.1 + head_w_px),
+                            p3: (base.0, base.1 - head_w_px),
                             color: stroke,
                         });
                     }
                 }
+                Direction::Diagonal => unreachable!(),
             }
-        } else {
-            let start = anchor_out(a, &graph.direction, scale);
-            let end = anchor_in(b, &graph.direction, scale);
-            items.push(Placed::Line {
-                x1: start.0, y1: start.1,
-                x2: end.0, y2: end.1,
-                thickness: thick,
-                color: stroke,
-            });
-            if head_at_end || head_at_start {
-                let ah = 9.0 * scale;
-                let aw = 6.0 * scale;
-                let dx = end.0 - start.0;
-                let dy = end.1 - start.1;
-                let len = (dx * dx + dy * dy).sqrt().max(0.001);
-                let ux = dx / len;
-                let uy = dy / len;
-                let px = -uy;
-                let py = ux;
-                if head_at_end {
-                    let tip = (end.0, end.1);
-                    let base_cx = end.0 - ux * ah;
-                    let base_cy = end.1 - uy * ah;
-                    items.push(Placed::Triangle {
-                        p1: tip,
-                        p2: (base_cx + px * aw, base_cy + py * aw),
-                        p3: (base_cx - px * aw, base_cy - py * aw),
-                        color: stroke,
-                    });
-                }
-                if head_at_start {
-                    let tip = (start.0, start.1);
-                    let base_cx = start.0 + ux * ah;
-                    let base_cy = start.1 + uy * ah;
-                    items.push(Placed::Triangle {
-                        p1: tip,
-                        p2: (base_cx + px * aw, base_cy + py * aw),
-                        p3: (base_cx - px * aw, base_cy - py * aw),
-                        color: stroke,
-                    });
-                }
+            continue;
+        }
+
+        // Forward edge — straight line between anchor points.
+        let start = anchor_bbox_out(ax, ay, aw, ah, &edge_dir, scale);
+        let end = anchor_bbox_in(bx, by, bw, bh, &edge_dir, scale);
+        line_emit(&mut items, start.0, start.1, end.0, end.1);
+        if head_at_end || head_at_start {
+            let head_h_px = 9.0 * scale;
+            let head_w_px = 6.0 * scale;
+            let dx = end.0 - start.0;
+            let dy = end.1 - start.1;
+            let len = (dx * dx + dy * dy).sqrt().max(0.001);
+            let ux = dx / len;
+            let uy = dy / len;
+            let px = -uy;
+            let py = ux;
+            if head_at_end {
+                let tip = (end.0, end.1);
+                let base_cx = end.0 - ux * head_h_px;
+                let base_cy = end.1 - uy * head_h_px;
+                items.push(Placed::Triangle {
+                    p1: tip,
+                    p2: (base_cx + px * head_w_px, base_cy + py * head_w_px),
+                    p3: (base_cx - px * head_w_px, base_cy - py * head_w_px),
+                    color: stroke,
+                });
+            }
+            if head_at_start {
+                let tip = (start.0, start.1);
+                let base_cx = start.0 + ux * head_h_px;
+                let base_cy = start.1 + uy * head_h_px;
+                items.push(Placed::Triangle {
+                    p1: tip,
+                    p2: (base_cx + px * head_w_px, base_cy + py * head_w_px),
+                    p3: (base_cx - px * head_w_px, base_cy - py * head_w_px),
+                    color: stroke,
+                });
             }
         }
     }
 
-    // Pass 2: node boxes + their labels. Drawn after edge lines so any
-    // back-edge polyline stub that touches a node is covered cleanly.
+    // 10. Node boxes + their labels. Style overrides win over the default
+    //     code-block fill / foreground stroke.
     for id in &graph.order {
         if let Some(n) = graph.nodes.get(id) {
+            let style = graph.styles.get(id).copied().unwrap_or_default();
+            let node_fill = style.fill.unwrap_or(fill);
+            let node_text = style.text.unwrap_or(stroke);
             let (nx, ny, nw, nh) = (n.x * scale, n.y * scale, n.w * scale, n.h * scale);
             match n.shape {
                 Shape::Rect => {
-                    items.push(Placed::Rect { x: nx, y: ny, w: nw, h: nh, color: fill });
+                    items.push(Placed::Rect { x: nx, y: ny, w: nw, h: nh, color: node_fill });
                     let t = 1.5 * scale;
                     items.push(Placed::Rect { x: nx, y: ny, w: nw, h: t, color: stroke });
                     items.push(Placed::Rect { x: nx, y: ny + nh - t, w: nw, h: t, color: stroke });
@@ -825,28 +1475,27 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
                 Shape::Rounded => {
                     let t = 1.5 * scale;
                     let radius = nh.min(nw) * 0.22;
+                    items.push(Placed::RoundRect { x: nx, y: ny, w: nw, h: nh, radius, color: stroke });
                     items.push(Placed::RoundRect {
-                        x: nx, y: ny, w: nw, h: nh, radius, color: stroke,
-                    });
-                    items.push(Placed::RoundRect {
-                        x: nx + t, y: ny + t,
-                        w: (nw - 2.0 * t).max(0.0), h: (nh - 2.0 * t).max(0.0),
+                        x: nx + t,
+                        y: ny + t,
+                        w: (nw - 2.0 * t).max(0.0),
+                        h: (nh - 2.0 * t).max(0.0),
                         radius: (radius - t).max(0.0),
-                        color: fill,
+                        color: node_fill,
                     });
                 }
                 Shape::Circle => {
                     let t = 1.5 * scale;
                     let cx = nx + nw / 2.0;
                     let cy = ny + nh / 2.0;
+                    items.push(Placed::Ellipse { cx, cy, rx: nw / 2.0, ry: nh / 2.0, color: stroke });
                     items.push(Placed::Ellipse {
-                        cx, cy, rx: nw / 2.0, ry: nh / 2.0, color: stroke,
-                    });
-                    items.push(Placed::Ellipse {
-                        cx, cy,
+                        cx,
+                        cy,
                         rx: (nw / 2.0 - t).max(0.0),
                         ry: (nh / 2.0 - t).max(0.0),
-                        color: fill,
+                        color: node_fill,
                     });
                 }
                 Shape::Diamond => {
@@ -856,8 +1505,8 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
                     let right = (nx + nw, cy);
                     let bottom = (cx, ny + nh);
                     let left = (nx, cy);
-                    items.push(Placed::Triangle { p1: top, p2: right, p3: bottom, color: fill });
-                    items.push(Placed::Triangle { p1: top, p2: bottom, p3: left, color: fill });
+                    items.push(Placed::Triangle { p1: top, p2: right, p3: bottom, color: node_fill });
+                    items.push(Placed::Triangle { p1: top, p2: bottom, p3: left, color: node_fill });
                     let t = 1.5 * scale;
                     items.push(Placed::Line { x1: top.0, y1: top.1, x2: right.0, y2: right.1, thickness: t, color: stroke });
                     items.push(Placed::Line { x1: right.0, y1: right.1, x2: bottom.0, y2: bottom.1, thickness: t, color: stroke });
@@ -866,74 +1515,88 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
                 }
             }
             emit_label_lines(
-                &mut items, &n.label, font,
+                &mut items,
+                &n.label,
+                font,
                 label_size * scale,
-                nx + nw / 2.0, ny + nh / 2.0,
-                stroke,
+                nx + nw / 2.0,
+                ny + nh / 2.0,
+                node_text,
             );
         }
     }
 
-    // Pass 3: edge labels — drawn last so they always sit on top of both
-    // edge lines and any stray crossings. Forward labels go on the line
-    // midpoint; back-edge labels sit on the lane.
+    // 11. Edge labels — drawn last so they sit on top of lines and any
+    //     stray crossings.
     for (ei, e) in graph.edges.iter().enumerate() {
         let Some(lab) = &e.label else { continue };
-        let (Some(a), Some(b)) = (graph.nodes.get(&e.from), graph.nodes.get(&e.to)) else { continue };
-        let from_layer = *layers.get(&e.from).unwrap_or(&0);
-        let to_layer = *layers.get(&e.to).unwrap_or(&0);
-        let is_back = from_layer > to_layer;
+        let (Some((ax, ay, aw, ah)), Some((bx, by, bw, bh))) =
+            (bbox_of(&e.from, &graph), bbox_of(&e.to, &graph))
+        else {
+            continue;
+        };
+        let from_tl = top_level_of(&e.from, &graph);
+        let to_tl = top_level_of(&e.to, &graph);
+        let cross_container = from_tl != to_tl;
+        let edge_dir = if cross_container { graph.direction } else { inner_dir };
+        let (is_back, is_skip) = if cross_container {
+            let fl = top_layers
+                .get(from_tl.as_deref().unwrap_or(""))
+                .copied()
+                .unwrap_or(0);
+            let tl = top_layers
+                .get(to_tl.as_deref().unwrap_or(""))
+                .copied()
+                .unwrap_or(0);
+            (fl > tl, tl > fl + 1)
+        } else {
+            (false, false)
+        };
+        let is_side = is_back || is_skip;
         let lsize = label_size * 0.75 * scale;
         let (lw, _lh) = measure_label(lab, lsize, font);
         let pad = 4.0 * scale;
 
-        let (mid_x, mid_y) = if matches!(graph.direction, Direction::Diagonal) {
-            // Diagonal labels sit on the horizontal segment of the L, hugging
-            // the 90° bend. The bend is where edges cluster together (each L
-            // turns at its target's column), so anchoring the chip there
-            // keeps multiple edges' labels visually tied to their own corner
-            // instead of piling up at segment midpoints.
-            let sy_mid = (a.y + a.h / 2.0) * scale;
+        let (mid_x, mid_y) = if cross_container && matches!(graph.direction, Direction::Diagonal) {
+            let sy_mid = (ay + ah / 2.0) * scale;
             let (sx, tx_mid) = if !is_back {
-                ((a.x + a.w) * scale, (b.x + b.w / 2.0) * scale)
+                ((ax + aw) * scale, (bx + bw / 2.0) * scale)
             } else {
-                (a.x * scale, (b.x + b.w / 2.0) * scale)
+                (ax * scale, (bx + bw / 2.0) * scale)
             };
             let bend_clear = 10.0 * scale;
             let half = lw / 2.0 + pad;
             let cx = if !is_back {
-                // horizontal runs sx → tx_mid (left-to-right); bend at tx_mid.
                 let want = tx_mid - half - bend_clear;
                 want.max(sx + half + bend_clear)
             } else {
-                // horizontal runs sx → tx_mid (right-to-left); bend at tx_mid.
                 let want = tx_mid + half + bend_clear;
                 want.min(sx - half - bend_clear)
             };
             (cx, sy_mid)
-        } else if is_back {
-            let lane_n = back_edges
-                .iter()
-                .find(|(i, _)| *i == ei)
+        } else if is_side {
+            let lane_n = orig_to_projected
+                .get(&ei)
+                .and_then(|pj| side_edges.iter().find(|(i, _)| *i == *pj))
                 .map(|(_, n)| *n)
                 .unwrap_or(0.0);
             let lane_off = lane_gap * (lane_n + 1.5);
             match graph.direction {
                 Direction::LeftRight | Direction::RightLeft => {
-                    let sx = (a.x + a.w / 2.0) * scale;
-                    let tx = (b.x + b.w / 2.0) * scale;
+                    let sx = (ax + aw / 2.0) * scale;
+                    let tx = (bx + bw / 2.0) * scale;
                     ((sx + tx) / 2.0, content_h + lane_off)
                 }
                 Direction::TopBottom | Direction::BottomTop => {
-                    let sy = (a.y + a.h / 2.0) * scale;
-                    let ty = (b.y + b.h / 2.0) * scale;
+                    let sy = (ay + ah / 2.0) * scale;
+                    let ty = (by + bh / 2.0) * scale;
                     (content_w + lane_off, (sy + ty) / 2.0)
                 }
                 Direction::Diagonal => unreachable!(),
             }
         } else {
-            let start = anchor_out(a, &graph.direction, scale);
-            let end = anchor_in(b, &graph.direction, scale);
+            let start = anchor_bbox_out(ax, ay, aw, ah, &edge_dir, scale);
+            let end = anchor_bbox_in(bx, by, bw, bh, &edge_dir, scale);
             ((start.0 + end.0) / 2.0, (start.1 + end.1) / 2.0)
         };
         emit_label_lines(&mut items, lab, font, lsize, mid_x, mid_y, theme.muted);
@@ -944,9 +1607,9 @@ fn layout(mut graph: Graph, max_width: f32, theme: &Theme, fonts: &Fonts) -> Mer
         Direction::TopBottom | Direction::BottomTop => content_w + back_lane_depth,
         Direction::Diagonal => content_w,
     };
-    let render_h = total_render_h;
-    MermaidRender { items, width: render_w, height: render_h }
+    MermaidRender { items, width: render_w, height: total_render_h }
 }
+
 
 /// Emit glyph items for a possibly multi-line label, centered on
 /// `(cx, cy)`. Each `\n`-separated line is horizontally centered
@@ -984,76 +1647,6 @@ fn emit_label_lines(
     }
 }
 
-fn assign_layers(graph: &Graph) -> HashMap<String, usize> {
-    let mut idx_of: HashMap<&str, usize> = HashMap::new();
-    for (i, id) in graph.order.iter().enumerate() {
-        idx_of.insert(id.as_str(), i);
-    }
-    let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
-    for id in &graph.order {
-        preds.insert(id.as_str(), Vec::new());
-    }
-    // Only forward edges (by declaration order) contribute to layering. Back
-    // edges still render, but are ignored here so cycles don't push layers
-    // to runaway values.
-    for e in &graph.edges {
-        if graph.nodes.contains_key(&e.from) && graph.nodes.contains_key(&e.to) {
-            let fi = idx_of.get(e.from.as_str()).copied().unwrap_or(0);
-            let ti = idx_of.get(e.to.as_str()).copied().unwrap_or(0);
-            if fi < ti {
-                preds.entry(e.to.as_str()).or_default().push(e.from.as_str());
-            }
-        }
-    }
-    let mut layer: HashMap<String, usize> = HashMap::new();
-    let mut changed = true;
-    let mut guard = 0;
-    while changed && guard < graph.order.len() * 2 + 5 {
-        changed = false;
-        for id in &graph.order {
-            let ps = preds.get(id.as_str()).cloned().unwrap_or_default();
-            let l = ps
-                .iter()
-                .map(|p| *layer.get(*p).unwrap_or(&0) + 1)
-                .max()
-                .unwrap_or(0);
-            let cur = *layer.get(id).unwrap_or(&0);
-            if l != cur && (cur == 0 || l > cur) {
-                layer.insert(id.clone(), l);
-                changed = true;
-            }
-        }
-        guard += 1;
-    }
-    for id in &graph.order {
-        layer.entry(id.clone()).or_insert(0);
-    }
-    layer
-}
-
-fn anchor_out(n: &Node, dir: &Direction, scale: f32) -> (f32, f32) {
-    // Outgoing side = the edge that faces the *next* layer in visual flow.
-    // For flipped directions (BT / RL), the flow reverses so the outgoing
-    // side flips with it. Diagonal is unused by this helper (edges route
-    // via their own L-path) but included so the match stays exhaustive.
-    match dir {
-        Direction::TopBottom => ((n.x + n.w / 2.0) * scale, (n.y + n.h) * scale),
-        Direction::BottomTop => ((n.x + n.w / 2.0) * scale, n.y * scale),
-        Direction::LeftRight => ((n.x + n.w) * scale, (n.y + n.h / 2.0) * scale),
-        Direction::RightLeft => (n.x * scale, (n.y + n.h / 2.0) * scale),
-        Direction::Diagonal => ((n.x + n.w / 2.0) * scale, (n.y + n.h / 2.0) * scale),
-    }
-}
-
-fn anchor_in(n: &Node, dir: &Direction, scale: f32) -> (f32, f32) {
-    match dir {
-        Direction::TopBottom => ((n.x + n.w / 2.0) * scale, n.y * scale),
-        Direction::BottomTop => ((n.x + n.w / 2.0) * scale, (n.y + n.h) * scale),
-        Direction::LeftRight => (n.x * scale, (n.y + n.h / 2.0) * scale),
-        Direction::RightLeft => ((n.x + n.w) * scale, (n.y + n.h / 2.0) * scale),
-        Direction::Diagonal => ((n.x + n.w / 2.0) * scale, (n.y + n.h / 2.0) * scale),
-    }
-}
 
 // ───── sequence diagrams ───────────────────────────────────────────────────
 //

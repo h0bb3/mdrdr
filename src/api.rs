@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use winit::event_loop::EventLoopProxy;
 
-use crate::render::{measure, render, RenderInput, Viewport};
+use crate::render::{measure, RenderInput, Viewport};
 use crate::tree::{TreeEntry, TreeKind};
 use crate::window::{click_at, Shared, SynthKey, UserEvent};
 
@@ -68,7 +68,18 @@ fn handle(
         Some((p, q)) => (p, q),
         None => (path_query, ""),
     };
-    let q = parse_query(qs);
+    let mut q = parse_query(qs);
+    // Also accept params from a urlencoded request body (so callers can
+    // POST long/awkward values like a comment reply via curl
+    // `--data-urlencode` instead of hand-escaping the URL). Query-string
+    // params win on conflict.
+    if let Some((_, body)) = req.split_once("\r\n\r\n") {
+        if !body.is_empty() {
+            for (k, v) in parse_query(body) {
+                q.entry(k).or_insert(v);
+            }
+        }
+    }
 
     match (method, path) {
         ("GET", "/state") => ok_json(&mut stream, &state_json(&shared)),
@@ -84,7 +95,12 @@ fn handle(
         ("POST", "/sidebar") => do_sidebar(&mut stream, &shared, &proxy, &q),
         ("POST", "/select") => do_select(&mut stream, &shared, &proxy, &q),
         ("POST", "/select/clear") => do_select_clear(&mut stream, &shared, &proxy),
-        ("POST", "/copy") | ("GET", "/selection") => do_copy(&mut stream, &shared),
+        ("POST", "/copy") => do_copy(&mut stream, &shared),
+        ("GET", "/selection") => do_selection(&mut stream, &shared),
+        ("GET", "/comments") => ok_json(&mut stream, &comments_json(&shared, &q)),
+        ("POST", "/comment") => do_comment_create(&mut stream, &shared, &proxy, &q),
+        ("POST", "/comments/reply") => do_comment_reply(&mut stream, &shared, &proxy, &q),
+        ("POST", "/comments/resolve") => do_comment_resolve(&mut stream, &shared, &proxy, &q),
         ("POST", "/quit") => do_quit(&mut stream, &proxy),
         // Test-driver hooks. Synthesize keystrokes through the same
         // dispatch path that real keyboard events use, so the API can
@@ -181,34 +197,42 @@ fn screenshot(
         (Some(hx), Some(hy)) => Some((hx, hy)),
         _ => None,
     };
-    let mut images = shared.images.lock().unwrap();
-    let mut fb = render(
-        &RenderInput {
-            source: &snap.source,
-            viewport: snap.viewport,
-            scroll: snap.scroll,
-            theme: &snap.theme,
-            fonts: &shared.fonts,
-            tree: snap.tree_flat.as_deref(),
-            active_path: snap.source_path.as_deref(),
-            base_dir: base_dir.as_deref(),
-            sidebar_width: snap.sidebar_width,
-            sidebar_scroll: snap.sidebar_scroll,
-            content_zoom: snap.content_zoom,
-            sidebar_zoom: snap.sidebar_zoom,
-            selection: snap.selection,
-            hover_pos,
-            search: snap.search.as_ref().filter(|s| !s.query.is_empty()).map(|s| crate::render::SearchHighlights {
-                query: &s.query,
-                current: if s.match_count > 0 { Some(s.current) } else { None },
-            }),
-            mermaid_overrides: Some(&snap.mermaid_overrides),
-            text_column_width: snap.text_column_width,
-            text_column_offset_x: snap.text_column_offset_x,
-        },
-        &mut images,
+    let input = RenderInput {
+        source: &snap.source,
+        viewport: snap.viewport,
+        scroll: snap.scroll,
+        theme: &snap.theme,
+        fonts: &shared.fonts,
+        tree: snap.tree_flat.as_deref(),
+        active_path: snap.source_path.as_deref(),
+        base_dir: base_dir.as_deref(),
+        sidebar_width: snap.sidebar_width,
+        sidebar_scroll: snap.sidebar_scroll,
+        content_zoom: snap.content_zoom,
+        sidebar_zoom: snap.sidebar_zoom,
+        selection: snap.selection,
+        hover_pos,
+        search: snap.search.as_ref().filter(|s| !s.query.is_empty()).map(|s| crate::render::SearchHighlights {
+            query: &s.query,
+            current: if s.match_count > 0 { Some(s.current) } else { None },
+        }),
+        mermaid_overrides: Some(&snap.mermaid_overrides),
+        text_column_width: snap.text_column_width,
+        text_column_offset_x: snap.text_column_offset_x,
+    };
+    let lay = shared.layout_for(&snap);
+    let mut fb = crate::render::paint(&lay, &input);
+    crate::render::draw_comment_bubbles(
+        &mut fb,
+        &lay,
+        snap.viewport,
+        snap.scroll,
+        &snap.theme,
+        &shared.fonts,
+        &snap.comments,
+        snap.active_comment,
+        snap.comment_compose.as_ref(),
     );
-    drop(images);
 
     // Draw overlay panels last so the test API screenshots match what the
     // user actually sees in the live window.
@@ -309,9 +333,14 @@ fn do_open(
     {
         let mut s = shared.state.lock().unwrap();
         s.source = source;
+        s.source_version = s.source_version.wrapping_add(1);
         s.source_path = Some(PathBuf::from(path));
         s.scroll = 0.0;
         s.read_cursor = Some(0.0);
+        s.comments.clear();
+        s.comment_seq = 0;
+        s.active_comment = None;
+        s.comment_compose = None;
     }
     let _ = proxy.send_event(UserEvent::Redraw);
     ok_json(stream, &state_json(shared))
@@ -329,6 +358,12 @@ fn do_click(
     let Some(y) = q.get("y").and_then(|v| v.parse::<f32>().ok()) else {
         return bad_request(stream, "missing ?y=");
     };
+    // Comment bubbles float over content in the right margin — give them
+    // first refusal, matching the live mouse handler.
+    if crate::window::click_comment_bubble(shared, x, y) {
+        let _ = proxy.send_event(UserEvent::Redraw);
+        return ok_json(stream, "{\"hit\":true,\"action\":{\"kind\":\"comment\"}}");
+    }
     let action = click_at(shared, x, y);
     let _ = proxy.send_event(UserEvent::Redraw);
     let body = match action {
@@ -587,6 +622,177 @@ fn do_copy(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> 
     ok_json(stream, &body)
 }
 
+/// `GET /selection` — the marked region resolved to a precise source-line
+/// target an external editor (Claude Code) can act on. Returns
+/// `{selected, path, start_line, end_line, text}`. Resolves against the
+/// shared layout cache, so the block→line mapping matches exactly what the
+/// user sees on screen. `selected:false` when nothing is marked.
+fn do_selection(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> {
+    let snap = shared.snapshot();
+    let Some((anchor, head)) = snap.selection else {
+        return ok_json(stream, "{\"selected\":false}");
+    };
+    let lay = shared.layout_for(&snap);
+    let range = crate::render::selection_line_range(&lay.block_spans, anchor, head);
+    let text = crate::render::selection_text_from_layout(&lay, anchor, head, &shared.fonts);
+    let path_json = match snap.source_path.as_ref() {
+        Some(p) => format!("\"{}\"", json_escape(&p.display().to_string())),
+        None => "null".into(),
+    };
+    let (start_line, end_line) = range.unwrap_or((0, 0));
+    let body = format!(
+        "{{\"selected\":true,\"path\":{path_json},\"start_line\":{start_line},\"end_line\":{end_line},\"text\":\"{}\"}}",
+        json_escape(&text)
+    );
+    ok_json(stream, &body)
+}
+
+// ───── comment threads ───────────────────────────────────────────────────────
+
+fn comment_msg_json(m: &crate::window::CommentMsg) -> String {
+    format!(
+        "{{\"author\":\"{}\",\"text\":\"{}\"}}",
+        m.author.as_str(),
+        json_escape(&m.text)
+    )
+}
+
+fn comment_json(c: &crate::window::Comment) -> String {
+    let msgs: Vec<String> = c.messages.iter().map(comment_msg_json).collect();
+    format!(
+        "{{\"id\":{},\"line_start\":{},\"line_end\":{},\"resolved\":{},\"pending\":{},\"quote\":\"{}\",\"messages\":[{}]}}",
+        c.id,
+        c.line_start,
+        c.line_end,
+        c.resolved,
+        c.pending(),
+        json_escape(&c.quote),
+        msgs.join(",")
+    )
+}
+
+/// `GET /comments` — every thread, or only those awaiting the agent with
+/// `?pending=1`. The poller (`/mdrdr-chat`) uses `?pending=1`.
+fn comments_json(shared: &Arc<Shared>, q: &HashMap<String, String>) -> String {
+    let only_pending = flag(q, "pending");
+    let s = shared.state.lock().unwrap();
+    let path = s
+        .source_path
+        .as_ref()
+        .map(|p| format!("\"{}\"", json_escape(&p.display().to_string())))
+        .unwrap_or_else(|| "null".into());
+    let items: Vec<String> = s
+        .comments
+        .iter()
+        .filter(|c| !only_pending || c.pending())
+        .map(comment_json)
+        .collect();
+    format!("{{\"path\":{path},\"comments\":[{}]}}", items.join(","))
+}
+
+/// `POST /comment?text=&start=N&end=M[&quote=]` — create a thread with an
+/// opening user message. Mainly a test/automation hook; the in-app flow
+/// creates threads directly. Returns the new thread.
+fn do_comment_create(
+    stream: &mut TcpStream,
+    shared: &Arc<Shared>,
+    proxy: &EventLoopProxy<UserEvent>,
+    q: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    let Some(text) = q.get("text").filter(|t| !t.is_empty()) else {
+        return bad_request(stream, "missing ?text=");
+    };
+    let start = q.get("start").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+    let end = q.get("end").and_then(|v| v.parse::<u32>().ok()).unwrap_or(start);
+    let quote = q.get("quote").cloned().unwrap_or_default();
+    let created = {
+        let mut s = shared.state.lock().unwrap();
+        s.comment_seq += 1;
+        let id = s.comment_seq;
+        let c = crate::window::Comment {
+            id,
+            line_start: start,
+            line_end: end.max(start),
+            quote,
+            messages: vec![crate::window::CommentMsg {
+                author: crate::window::CommentAuthor::User,
+                text: text.clone(),
+            }],
+            resolved: false,
+        };
+        s.comments.push(c.clone());
+        c
+    };
+    let _ = proxy.send_event(UserEvent::Redraw);
+    ok_json(stream, &comment_json(&created))
+}
+
+/// `POST /comments/reply?id=N&text=...` — append the agent's reply to a
+/// thread. This is how Claude Code answers a comment.
+fn do_comment_reply(
+    stream: &mut TcpStream,
+    shared: &Arc<Shared>,
+    proxy: &EventLoopProxy<UserEvent>,
+    q: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    let Some(id) = q.get("id").and_then(|v| v.parse::<u64>().ok()) else {
+        return bad_request(stream, "missing ?id=");
+    };
+    let Some(text) = q.get("text").filter(|t| !t.is_empty()) else {
+        return bad_request(stream, "missing ?text=");
+    };
+    let found = {
+        let mut s = shared.state.lock().unwrap();
+        match s.comments.iter_mut().find(|c| c.id == id) {
+            Some(c) => {
+                c.messages.push(crate::window::CommentMsg {
+                    author: crate::window::CommentAuthor::Agent,
+                    text: text.clone(),
+                });
+                Some(c.clone())
+            }
+            None => None,
+        }
+    };
+    match found {
+        Some(c) => {
+            let _ = proxy.send_event(UserEvent::Redraw);
+            ok_json(stream, &comment_json(&c))
+        }
+        None => bad_request(stream, "no such comment id"),
+    }
+}
+
+/// `POST /comments/resolve?id=N[&resolved=0|1]` — mark a thread resolved
+/// (default) or reopen it.
+fn do_comment_resolve(
+    stream: &mut TcpStream,
+    shared: &Arc<Shared>,
+    proxy: &EventLoopProxy<UserEvent>,
+    q: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    let Some(id) = q.get("id").and_then(|v| v.parse::<u64>().ok()) else {
+        return bad_request(stream, "missing ?id=");
+    };
+    let resolved = q.get("resolved").map(|v| v != "0" && !v.eq_ignore_ascii_case("false")).unwrap_or(true);
+    let ok = {
+        let mut s = shared.state.lock().unwrap();
+        match s.comments.iter_mut().find(|c| c.id == id) {
+            Some(c) => {
+                c.resolved = resolved;
+                true
+            }
+            None => false,
+        }
+    };
+    if ok {
+        let _ = proxy.send_event(UserEvent::Redraw);
+        ok_json(stream, "{\"ok\":true}")
+    } else {
+        bad_request(stream, "no such comment id")
+    }
+}
+
 fn do_quit(stream: &mut TcpStream, proxy: &EventLoopProxy<UserEvent>) -> std::io::Result<()> {
     let _ = proxy.send_event(UserEvent::Quit);
     ok_text(stream, "bye\n")
@@ -719,7 +925,12 @@ mdrdr api
   POST /sidebar?visible=0|1
   POST /select?x1=&y1=&x2=&y2=  — select a range (screen coords)
   POST /select/clear
-  POST /copy                    — copy selection to clipboard (also GET /selection)
+  POST /copy                    — copy selection to clipboard
+  GET  /selection               — selection as {selected,path,start_line,end_line,text}
+  GET  /comments[?pending=1]     — comment threads (optionally only those awaiting a reply)
+  POST /comment?text=&start=N&end=M[&quote=]  — create a thread
+  POST /comments/reply?id=N&text=             — append an agent reply
+  POST /comments/resolve?id=N[&resolved=0|1]  — resolve / reopen a thread
   POST /quit             — exit
 
   Test driver — used by automated checks; would not normally be hand-driven.

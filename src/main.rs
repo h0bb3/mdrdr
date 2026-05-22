@@ -32,10 +32,10 @@ fn usage() -> ExitCode {
         "usage:\n  \
          mdrdr                       (same as `mdrdr open`)\n  \
          mdrdr <FILE_OR_DIR>         shorthand for `mdrdr open <FILE_OR_DIR>`\n  \
-         mdrdr open   [FILE_OR_DIR] [--api] [--port N]\n  \
+         mdrdr open   [FILE_OR_DIR] [--api] [-p N | --port N]\n  \
          mdrdr render [FILE] [--tree DIR] [--out PATH] [--width W] [--height H] [--scroll Y]\n\n\
-         --api         enable the HTTP control API on a random port\n  \
-         --port N      bind the API on port N (implies --api)"
+         --api         enable the HTTP control API on the default port (7779)\n  \
+         -p, --port N  bind the API on port N (implies --api)"
     );
     ExitCode::from(2)
 }
@@ -130,10 +130,17 @@ fn cmd_render(args: &[String]) -> ExitCode {
     }
 }
 
+/// Default control-API port. Fixed (not ephemeral) so the companion
+/// `/edit-selection` Claude Code command can reach it without any
+/// discovery file dropped in the workspace. Override with `-p <port>`.
+const DEFAULT_API_PORT: u16 = 7779;
+
 fn cmd_open(args: &[String]) -> ExitCode {
     let mut path: Option<PathBuf> = None;
     let mut api_enabled = false;
-    let mut api_port: u16 = 0;
+    // `None` until a port is given explicitly; resolved to DEFAULT_API_PORT
+    // when the API is on but no port was passed.
+    let mut explicit_port: Option<u16> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -141,15 +148,15 @@ fn cmd_open(args: &[String]) -> ExitCode {
             "--api" => {
                 api_enabled = true;
             }
-            "--port" => {
+            "--port" | "-p" => {
                 i += 1;
                 match args.get(i).and_then(|s| s.parse::<u16>().ok()) {
                     Some(p) => {
-                        api_port = p;
+                        explicit_port = Some(p);
                         api_enabled = true;
                     }
                     None => {
-                        eprintln!("--port expects a number 0..=65535");
+                        eprintln!("{} expects a number 0..=65535", args[i - 1]);
                         return ExitCode::from(2);
                     }
                 }
@@ -167,6 +174,6 @@ fn cmd_open(args: &[String]) -> ExitCode {
 
     window::run(window::WindowOptions {
         path,
-        api_port: api_enabled.then_some(api_port),
+        api_port: api_enabled.then(|| explicit_port.unwrap_or(DEFAULT_API_PORT)),
     })
 }
