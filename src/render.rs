@@ -274,6 +274,10 @@ pub struct RenderInput<'a> {
     pub base_dir: Option<&'a Path>,
     pub sidebar_width: f32,
     pub sidebar_scroll: f32,
+    /// Width reserved on the right for the comment column. Shrinks the
+    /// content area so document text doesn't render under the column.
+    /// 0 → no column.
+    pub comment_col_width: f32,
     pub content_zoom: f32,
     pub sidebar_zoom: f32,
     /// (anchor, head) in document coordinates. None = no selection.
@@ -332,6 +336,7 @@ pub fn lay_out(input: &RenderInput, images: &mut ImageCache) -> Layout {
             fonts: input.fonts,
             sidebar_width: input.sidebar_width,
             sidebar_scroll: input.sidebar_scroll,
+            comment_col_width: input.comment_col_width,
             content_zoom: input.content_zoom,
             sidebar_zoom: input.sidebar_zoom,
             mermaid_overrides: input.mermaid_overrides,
@@ -355,6 +360,7 @@ pub fn paint(lay: &Layout, input: &RenderInput) -> Framebuffer {
         input.selection,
         input.hover_pos,
         input.search.as_ref(),
+        input.comment_col_width,
     )
 }
 
@@ -365,6 +371,7 @@ pub fn measure(
     viewport_h: u32,
     base_dir: Option<&Path>,
     sidebar_width: f32,
+    comment_col_width: f32,
     content_zoom: f32,
     text_column_width: f32,
     text_column_offset_x: f32,
@@ -386,6 +393,7 @@ pub fn measure(
             fonts,
             sidebar_width,
             sidebar_scroll: 0.0,
+            comment_col_width,
             content_zoom,
             sidebar_zoom: 1.0,
             mermaid_overrides: None,
@@ -530,6 +538,7 @@ pub fn compute_all_hit_targets(
             fonts: input.fonts,
             sidebar_width: input.sidebar_width,
             sidebar_scroll: input.sidebar_scroll,
+            comment_col_width: input.comment_col_width,
             content_zoom: input.content_zoom,
             sidebar_zoom: input.sidebar_zoom,
             mermaid_overrides: input.mermaid_overrides,
@@ -559,6 +568,7 @@ pub fn compute_copy_zones(input: &RenderInput, images: &mut ImageCache) -> Vec<C
             fonts: input.fonts,
             sidebar_width: input.sidebar_width,
             sidebar_scroll: input.sidebar_scroll,
+            comment_col_width: input.comment_col_width,
             content_zoom: input.content_zoom,
             sidebar_zoom: input.sidebar_zoom,
             mermaid_overrides: input.mermaid_overrides,
@@ -590,6 +600,7 @@ pub fn compute_baselines(input: &RenderInput, images: &mut ImageCache) -> Vec<f3
             fonts: input.fonts,
             sidebar_width: input.sidebar_width,
             sidebar_scroll: input.sidebar_scroll,
+            comment_col_width: input.comment_col_width,
             content_zoom: input.content_zoom,
             sidebar_zoom: input.sidebar_zoom,
             mermaid_overrides: input.mermaid_overrides,
@@ -629,6 +640,7 @@ pub fn compute_outline(input: &RenderInput, images: &mut ImageCache) -> Vec<Outl
             fonts: input.fonts,
             sidebar_width: input.sidebar_width,
             sidebar_scroll: input.sidebar_scroll,
+            comment_col_width: input.comment_col_width,
             content_zoom: input.content_zoom,
             sidebar_zoom: input.sidebar_zoom,
             mermaid_overrides: input.mermaid_overrides,
@@ -640,6 +652,7 @@ pub fn compute_outline(input: &RenderInput, images: &mut ImageCache) -> Vec<Outl
     lay.outline
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw(
     lay: &Layout,
     viewport: Viewport,
@@ -649,6 +662,7 @@ fn draw(
     selection: Option<((f32, f32), (f32, f32))>,
     hover_pos: Option<(f32, f32)>,
     search: Option<&SearchHighlights>,
+    comment_col_width: f32,
 ) -> Framebuffer {
     let mut fb = Framebuffer::new(viewport.width, viewport.height, theme.bg);
 
@@ -704,7 +718,13 @@ fn draw(
         }
     }
 
-    draw_scrollbar(&mut fb, viewport, scroll, lay.doc_height, theme);
+    // The scrollbar sits at the content area's right edge — left of the
+    // comment column when one is open.
+    let sb_viewport = Viewport {
+        width: (viewport.width as f32 - comment_col_width.max(0.0)).max(1.0) as u32,
+        height: viewport.height,
+    };
+    draw_scrollbar(&mut fb, sb_viewport, scroll, lay.doc_height, theme);
     fb
 }
 
@@ -826,6 +846,7 @@ pub fn extract_selection(
             fonts: input.fonts,
             sidebar_width: input.sidebar_width,
             sidebar_scroll: input.sidebar_scroll,
+            comment_col_width: input.comment_col_width,
             content_zoom: input.content_zoom,
             sidebar_zoom: input.sidebar_zoom,
             mermaid_overrides: input.mermaid_overrides,
@@ -1283,15 +1304,9 @@ fn block_y_for_line(lay: &Layout, line: u32) -> Option<f32> {
     best.map(|(s, _)| s.y0)
 }
 
-const BUBBLE_W: f32 = 256.0;
 const BUBBLE_PAD: f32 = 9.0;
 const BUBBLE_GAP: f32 = 8.0;
 const BUBBLE_MARGIN: f32 = 12.0;
-
-/// Screen-x of the bubble column's left edge for a given viewport.
-pub fn bubble_column_x(viewport_w: u32) -> f32 {
-    viewport_w as f32 - BUBBLE_W - BUBBLE_MARGIN
-}
 
 /// One laid-out bubble: where it sits on screen and which comment it shows.
 /// `id == 0` marks the live composer rather than a stored thread.
@@ -1304,24 +1319,59 @@ pub struct BubbleRect {
     pub h: f32,
 }
 
-/// Lay out (but don't draw) the right-margin bubbles for the given comments
-/// and optional live composer. Returns each bubble's on-screen rect, in the
-/// same draw/stack order, so the caller can hit-test clicks. Bubbles stack
-/// downward from their anchor line, never overlapping.
+/// Geometry of the comment column for a given viewport and column width.
+/// `width <= 1` means the column is hidden.
+struct ColGeom {
+    left: f32,
+    bubble_x: f32,
+    bubble_w: f32,
+    inner_w: f32,
+}
+
+fn col_geom(viewport: Viewport, col_width: f32) -> ColGeom {
+    let left = viewport.width as f32 - col_width;
+    let bubble_x = left + BUBBLE_MARGIN;
+    let bubble_w = (col_width - BUBBLE_MARGIN * 2.0).max(40.0);
+    ColGeom { left, bubble_x, bubble_w, inner_w: bubble_w - BUBBLE_PAD * 2.0 }
+}
+
+/// Height reserved for the fixed "Comments" header at the top of the column.
+/// Bubbles scroll underneath it, so it must match in both layout and draw.
+fn comment_header_h(theme: &Theme, zoom: f32) -> f32 {
+    let tag_size = theme.body_size * 0.82 * zoom * 0.92;
+    BUBBLE_MARGIN + tag_size * 1.4
+}
+
+/// Total scrollable content height of the column for the given laid-out
+/// bubbles — drives the column's own vertical scrollbar. The rects are in
+/// content space (see `layout_comment_bubbles`).
+pub fn comment_col_content_height(rects: &[BubbleRect]) -> f32 {
+    rects.last().map(|r| r.y + r.h + BUBBLE_MARGIN).unwrap_or(0.0)
+}
+
+/// Lay out the comment bubbles as a top-to-bottom list in *content space*:
+/// `y` is measured from the top of the column before the `comment_col_scroll`
+/// offset is applied. Threads are ordered by anchor line. The column scrolls
+/// independently of the document (like the sidebar), so this no longer
+/// depends on the document scroll or layout. `col_width` ≤ 1 → no column.
+#[allow(clippy::too_many_arguments)]
 pub fn layout_comment_bubbles(
-    lay: &Layout,
     viewport: Viewport,
-    scroll: f32,
     theme: &Theme,
     fonts: &Fonts,
     comments: &[crate::window::Comment],
     compose: Option<&crate::window::CommentCompose>,
+    col_width: f32,
+    zoom: f32,
 ) -> Vec<BubbleRect> {
-    let size = theme.body_size * 0.82;
+    if col_width <= 1.0 {
+        return Vec::new();
+    }
+    let size = theme.body_size * 0.82 * zoom;
     let tag_size = size * 0.92;
     let line_h = size * 1.3;
-    let inner_w = BUBBLE_W - BUBBLE_PAD * 2.0;
-    let x = bubble_column_x(viewport.width);
+    let g = col_geom(viewport, col_width);
+    let inner_w = g.inner_w;
 
     // Build the ordered list of (id, anchor_line, body_height) entries.
     struct Entry {
@@ -1369,23 +1419,22 @@ pub fn layout_comment_bubbles(
         }
     }
 
-    // Stack by anchor line, top-down, no overlap.
+    // List, top-to-bottom in document (anchor-line) order, below the header.
     entries.sort_by_key(|e| e.anchor_line);
     let mut rects = Vec::new();
-    let mut next_top = f32::MIN;
+    let mut top = comment_header_h(theme, zoom);
     for e in &entries {
-        let Some(anchor_doc_y) = block_y_for_line(lay, e.anchor_line) else { continue };
-        let want = anchor_doc_y - scroll;
-        let top = want.max(next_top + BUBBLE_GAP).max(BUBBLE_MARGIN);
-        rects.push(BubbleRect { id: e.id, x, y: top, w: BUBBLE_W, h: e.h });
-        next_top = top + e.h;
+        rects.push(BubbleRect { id: e.id, x: g.bubble_x, y: top, w: g.bubble_w, h: e.h });
+        top += e.h + BUBBLE_GAP;
     }
     rects
 }
 
-/// Draw the right-margin comment bubbles. Highlights the active thread's
-/// commented line range in the text column, draws each thread's
-/// conversation, and renders the live composer's input + caret.
+/// Draw the comment column: a resizable right-side panel that holds the
+/// comment threads. Paints the column background + left divider, highlights
+/// the active thread's commented lines back in the text body, draws each
+/// thread's conversation, and renders the live composer's input + caret.
+/// `col_width` ≤ 1 hides the column entirely; `zoom` scales the text.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_comment_bubbles(
     fb: &mut Framebuffer,
@@ -1397,19 +1446,31 @@ pub fn draw_comment_bubbles(
     comments: &[crate::window::Comment],
     active: Option<u64>,
     compose: Option<&crate::window::CommentCompose>,
+    col_width: f32,
+    zoom: f32,
+    col_scroll: f32,
 ) {
-    if comments.is_empty() && compose.is_none() {
+    if col_width <= 1.0 {
         return;
     }
-    let size = theme.body_size * 0.82;
+    let dark = theme_is_dark(theme);
+    let size = theme.body_size * 0.82 * zoom;
     let tag_size = size * 0.92;
     let line_h = size * 1.3;
-    let inner_w = BUBBLE_W - BUBBLE_PAD * 2.0;
+    let g = col_geom(viewport, col_width);
+    let inner_w = g.inner_w;
     let vh = viewport.height as f32;
     let body = &fonts.body;
     let bold = &fonts.bold;
 
-    let panel_bg: Rgba = if theme_is_dark(theme) { [44, 48, 56, 245] } else { [252, 250, 244, 250] };
+    // Column background, drawn first so bubbles sit on it. The divider and
+    // header are drawn last (after the bubbles) so scrolled bubbles tuck
+    // neatly under them.
+    let col_bg: Rgba = if dark { [32, 35, 41, 255] } else { [245, 243, 236, 255] };
+    let divider: Rgba = if dark { [70, 75, 84, 255] } else { [214, 209, 196, 255] };
+    fb.fill_rect(g.left as i32, 0, col_width.ceil() as i32, vh as i32, col_bg);
+
+    let panel_bg: Rgba = if dark { [44, 48, 56, 255] } else { [252, 250, 244, 255] };
     let user_tag: Rgba = theme.muted;
     let agent_tag: Rgba = theme.accent;
 
@@ -1423,13 +1484,20 @@ pub fn draw_comment_bubbles(
                 let sy1 = (y1 - scroll).max(sy0 + line_h);
                 let hl: Rgba = [theme.accent[0], theme.accent[1], theme.accent[2], 36];
                 let left = lay.sidebar_width as i32;
-                let w = (bubble_column_x(viewport.width) - lay.sidebar_width - BUBBLE_GAP) as i32;
+                let w = (g.left - lay.sidebar_width - BUBBLE_GAP) as i32;
                 fb.fill_rect(left, sy0 as i32, w.max(1), (sy1 - sy0).max(line_h) as i32, hl);
             }
         }
     }
 
-    let rects = layout_comment_bubbles(lay, viewport, scroll, theme, fonts, comments, compose);
+    // Lay out in content space, then offset by the column's own scroll.
+    let content_rects =
+        layout_comment_bubbles(viewport, theme, fonts, comments, compose, col_width, zoom);
+    let content_h = comment_col_content_height(&content_rects);
+    let rects: Vec<BubbleRect> = content_rects
+        .iter()
+        .map(|r| BubbleRect { y: r.y - col_scroll, ..*r })
+        .collect();
 
     for r in &rects {
         if r.y + r.h < 0.0 || r.y > vh {
@@ -1480,6 +1548,18 @@ pub fn draw_comment_bubbles(
             }
         }
     }
+
+    // Fixed header bar on top (covers bubbles scrolled up under it), then
+    // the full-height left divider, then the header label.
+    let header_h = comment_header_h(theme, zoom);
+    fb.fill_rect(g.left as i32, 0, col_width.ceil() as i32, header_h as i32, col_bg);
+    fb.fill_rect(g.left as i32, 0, 1, vh as i32, divider);
+    draw_tag(fb, bold, tag_size, g.bubble_x, BUBBLE_MARGIN + tag_size, "Comments", theme.muted);
+
+    // The column's own vertical scrollbar at the far-right edge. Reuses the
+    // document scrollbar geometry against the full viewport (the document's
+    // own bar sits at the content edge / left of the column).
+    draw_scrollbar(fb, viewport, col_scroll, content_h, theme);
 }
 
 fn theme_is_dark(theme: &Theme) -> bool {

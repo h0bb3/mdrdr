@@ -38,6 +38,7 @@ pub fn render_to_png(
             base_dir,
             sidebar_width: if flat.is_some() { 260.0 } else { 0.0 },
             sidebar_scroll: 0.0,
+            comment_col_width: 0.0,
             content_zoom: 1.0,
             sidebar_zoom: 1.0,
             selection: None,

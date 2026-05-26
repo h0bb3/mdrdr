@@ -133,7 +133,7 @@ fn state_json(shared: &Arc<Shared>) -> String {
         .map(|t| format!("\"{}\"", json_escape(&t.root.display().to_string())))
         .unwrap_or_else(|| "null".to_string());
     format!(
-        "{{\"source_path\":{path_json},\"scroll\":{:.3},\"viewport\":{{\"w\":{},\"h\":{}}},\"source_len\":{},\"tree_root\":{root_json},\"sidebar_width\":{:.1},\"sidebar_scroll\":{:.3},\"content_zoom\":{:.3},\"sidebar_zoom\":{:.3},\"text_column_width\":{:.1},\"text_column_offset_x\":{:.1},\"dark\":{}}}",
+        "{{\"source_path\":{path_json},\"scroll\":{:.3},\"viewport\":{{\"w\":{},\"h\":{}}},\"source_len\":{},\"tree_root\":{root_json},\"sidebar_width\":{:.1},\"sidebar_scroll\":{:.3},\"content_zoom\":{:.3},\"sidebar_zoom\":{:.3},\"comment_col_width\":{:.1},\"comment_col_zoom\":{:.3},\"comment_col_scroll\":{:.1},\"text_column_width\":{:.1},\"text_column_offset_x\":{:.1},\"dark\":{}}}",
         s.scroll,
         s.viewport.width,
         s.viewport.height,
@@ -142,6 +142,9 @@ fn state_json(shared: &Arc<Shared>) -> String {
         s.sidebar_scroll,
         s.content_zoom,
         s.sidebar_zoom,
+        s.comment_col_width,
+        s.comment_col_zoom,
+        s.comment_col_scroll,
         s.text_column_width,
         s.text_column_offset_x,
         s.dark,
@@ -208,6 +211,7 @@ fn screenshot(
         base_dir: base_dir.as_deref(),
         sidebar_width: snap.sidebar_width,
         sidebar_scroll: snap.sidebar_scroll,
+        comment_col_width: snap.comment_col_width,
         content_zoom: snap.content_zoom,
         sidebar_zoom: snap.sidebar_zoom,
         selection: snap.selection,
@@ -232,6 +236,9 @@ fn screenshot(
         &snap.comments,
         snap.active_comment,
         snap.comment_compose.as_ref(),
+        snap.comment_col_width,
+        snap.comment_col_zoom,
+        snap.comment_col_scroll,
     );
 
     // Draw overlay panels last so the test API screenshots match what the
@@ -270,6 +277,11 @@ fn do_scroll(
         } else if let Some(dy) = q.get("dy").and_then(|v| v.parse::<f32>().ok()) {
             s.scroll = (s.scroll + dy).clamp(0.0, max_scroll);
         }
+        // Independent comment-column scroll (px from top, clamped ≥ 0; the
+        // window thread re-clamps against content height on interaction).
+        if let Some(c) = q.get("comment").and_then(|v| v.parse::<f32>().ok()) {
+            s.comment_col_scroll = c.max(0.0);
+        }
     }
     let _ = proxy.send_event(UserEvent::Redraw);
     ok_json(stream, &state_json(shared))
@@ -285,6 +297,7 @@ fn compute_max_scroll(shared: &Arc<Shared>) -> f32 {
         snap.viewport.height,
         base_dir.as_deref(),
         snap.sidebar_width,
+        snap.comment_col_width,
         snap.content_zoom,
         snap.text_column_width,
         snap.text_column_offset_x,
@@ -341,6 +354,7 @@ fn do_open(
         s.comment_seq = 0;
         s.active_comment = None;
         s.comment_compose = None;
+        s.comment_col_scroll = 0.0;
     }
     let _ = proxy.send_event(UserEvent::Redraw);
     ok_json(stream, &state_json(shared))
@@ -444,6 +458,9 @@ fn do_zoom(
         if let Some(v) = q.get("sidebar").and_then(|v| v.parse::<f32>().ok()) {
             s.sidebar_zoom = v.clamp(0.5, 3.0);
         }
+        if let Some(v) = q.get("comment").and_then(|v| v.parse::<f32>().ok()) {
+            s.comment_col_zoom = v.clamp(0.5, 3.0);
+        }
     }
     let _ = proxy.send_event(UserEvent::Redraw);
     ok_json(stream, &state_json(shared))
@@ -485,6 +502,7 @@ fn do_hits(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> 
                 base_dir: base_dir.as_deref(),
                 sidebar_width: snap.sidebar_width,
                 sidebar_scroll: snap.sidebar_scroll,
+                comment_col_width: snap.comment_col_width,
                 content_zoom: snap.content_zoom,
                 sidebar_zoom: snap.sidebar_zoom,
                 selection: None,
@@ -600,6 +618,7 @@ fn do_copy(stream: &mut TcpStream, shared: &Arc<Shared>) -> std::io::Result<()> 
                 base_dir: base_dir.as_deref(),
                 sidebar_width: snap.sidebar_width,
                 sidebar_scroll: snap.sidebar_scroll,
+                comment_col_width: snap.comment_col_width,
                 content_zoom: snap.content_zoom,
                 sidebar_zoom: snap.sidebar_zoom,
                 selection: snap.selection,

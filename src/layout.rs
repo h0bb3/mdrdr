@@ -246,6 +246,9 @@ pub struct LayoutInput<'a> {
     pub sidebar_width: f32,
     /// Scroll offset inside the sidebar. 0 → top.
     pub sidebar_scroll: f32,
+    /// Width reserved on the right for the comment column. Narrows the
+    /// content area's right edge. 0 → no column.
+    pub comment_col_width: f32,
     /// Font zoom for the main content panel (multiplier; 1.0 = default).
     pub content_zoom: f32,
     /// Font zoom for the sidebar tree panel (multiplier; 1.0 = default).
@@ -279,7 +282,8 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
     };
 
     let content_left = sidebar_width + input.theme.margin_x;
-    let content_right = (input.viewport_w as f32) - input.theme.margin_x;
+    let content_right =
+        (input.viewport_w as f32) - input.comment_col_width.max(0.0) - input.theme.margin_x;
 
     // Compute the narrow text-column edges. The column starts at
     // `content_left + offset_x` (clamped inside content), runs for

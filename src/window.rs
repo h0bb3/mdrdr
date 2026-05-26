@@ -88,6 +88,11 @@ pub enum MenuAction {
     /// Clear the per-block layout override so the diagram renders with
     /// whatever direction its source header declares.
     ResetMermaidLayout(usize),
+    /// Open the comment composer on the current selection. The anchor
+    /// (line range + quote) is captured at menu-build time so it survives
+    /// the selection being dropped when the menu closes — mirroring how
+    /// `CopyText` carries its payload.
+    Comment { line_start: u32, line_end: u32, quote: String },
 }
 
 /// A context menu floating near the cursor. Coordinates are the top-left in
@@ -324,6 +329,23 @@ pub struct AppState {
     /// editing model. `target` is `Some(id)` when replying/following-up on
     /// an existing thread, `None` when creating a new one from a selection.
     pub comment_compose: Option<CommentCompose>,
+
+    /// Right-side comment column. Mirrors the sidebar: `comment_col_width`
+    /// 0 → hidden, last non-zero cached in `_restore` so the `m` toggle
+    /// brings it back. On by default when launched with `--api`. Has its
+    /// own font zoom (Ctrl+wheel over the column), independent of content.
+    pub comment_col_width: f32,
+    pub comment_col_width_restore: f32,
+    /// True while dragging the column's left edge to resize.
+    pub comment_col_dragging: bool,
+    /// Font-size multiplier for the comment column (1.0 = default).
+    pub comment_col_zoom: f32,
+    /// The column scrolls independently of the document (a long dialogue can
+    /// overflow it). 0 → top.
+    pub comment_col_scroll: f32,
+    /// Column scrollbar drag state — grip is the press offset within the thumb.
+    pub comment_scrollbar_dragging: bool,
+    pub comment_scrollbar_grip: f32,
 }
 
 /// In-app comment composer state — a single-line input plus what it's
@@ -380,6 +402,9 @@ pub struct LayoutKey {
     pub source_version: u64,
     pub viewport_w: u32,
     pub viewport_h: u32,
+    /// Comment-column width reserves content space, so it affects layout.
+    /// (Column *zoom* only affects the bubble paint pass, not layout.)
+    pub comment_col_width_bits: u32,
     pub sidebar_width_bits: u32,
     pub sidebar_scroll_bits: u32,
     pub content_zoom_bits: u32,
@@ -438,7 +463,9 @@ impl Shared {
         let quiet = !s.is_selecting
             && !s.sidebar_dragging
             && !s.scrollbar_dragging
-            && !s.sidebar_scrollbar_dragging;
+            && !s.sidebar_scrollbar_dragging
+            && !s.comment_col_dragging
+            && !s.comment_scrollbar_dragging;
         let hover_pos = if quiet {
             Some((s.last_mouse.x as f32, s.last_mouse.y as f32))
         } else {
@@ -477,6 +504,9 @@ impl Shared {
             comments: s.comments.clone(),
             active_comment: s.active_comment,
             comment_compose: s.comment_compose.clone(),
+            comment_col_width: s.comment_col_width,
+            comment_col_zoom: s.comment_col_zoom,
+            comment_col_scroll: s.comment_col_scroll,
         }
     }
 
@@ -518,6 +548,7 @@ impl Shared {
             base_dir: base_dir.as_deref(),
             sidebar_width: snap.sidebar_width,
             sidebar_scroll: snap.sidebar_scroll,
+            comment_col_width: snap.comment_col_width,
             content_zoom: snap.content_zoom,
             sidebar_zoom: snap.sidebar_zoom,
             selection: None,
@@ -546,6 +577,7 @@ fn build_layout_key(snap: &Snapshot) -> LayoutKey {
         source_version: snap.source_version,
         viewport_w: snap.viewport.width,
         viewport_h: snap.viewport.height,
+        comment_col_width_bits: snap.comment_col_width.to_bits(),
         sidebar_width_bits: snap.sidebar_width.to_bits(),
         sidebar_scroll_bits: snap.sidebar_scroll.to_bits(),
         content_zoom_bits: snap.content_zoom.to_bits(),
@@ -595,6 +627,9 @@ pub struct Snapshot {
     pub comments: Vec<Comment>,
     pub active_comment: Option<u64>,
     pub comment_compose: Option<CommentCompose>,
+    pub comment_col_width: f32,
+    pub comment_col_zoom: f32,
+    pub comment_col_scroll: f32,
 }
 
 struct App {
@@ -688,11 +723,18 @@ impl ApplicationHandler<UserEvent> for App {
                         && s.sidebar_width > 0.0
                         && (s.last_mouse.x as f32) < s.sidebar_width
                 };
+                let over_comment_col = {
+                    let s = self.shared.state.lock().unwrap();
+                    s.comment_col_width > 0.0
+                        && (s.last_mouse.x as f32) >= (s.viewport.width as f32 - s.comment_col_width)
+                };
                 if ctrl {
                     // Ctrl+wheel: zoom the panel under the cursor.
                     let factor = (1.0 + zoom_step * 0.1).clamp(0.5, 2.0);
                     let mut s = self.shared.state.lock().unwrap();
-                    if over_sidebar {
+                    if over_comment_col {
+                        s.comment_col_zoom = (s.comment_col_zoom * factor).clamp(0.5, 3.0);
+                    } else if over_sidebar {
                         s.sidebar_zoom = (s.sidebar_zoom * factor).clamp(0.5, 3.0);
                     } else {
                         s.content_zoom = (s.content_zoom * factor).clamp(0.5, 3.0);
@@ -700,6 +742,12 @@ impl ApplicationHandler<UserEvent> for App {
                     drop(s);
                     self.clamp_scroll();
                     self.clamp_sidebar_scroll();
+                } else if over_comment_col {
+                    {
+                        let mut s = self.shared.state.lock().unwrap();
+                        s.comment_col_scroll = (s.comment_col_scroll + dy).max(0.0);
+                    }
+                    self.clamp_comment_col_scroll();
                 } else if over_sidebar {
                     {
                         let mut s = self.shared.state.lock().unwrap();
@@ -717,7 +765,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                let (dragging_sidebar, dragging_scrollbar, dragging_sb_sidebar, selecting, scroll, grip, sb_sidebar_grip, sidebar_w, tree_visible, viewport, menu_open) = {
+                let (dragging_sidebar, dragging_scrollbar, dragging_sb_sidebar, selecting, scroll, grip, sb_sidebar_grip, sidebar_w, tree_visible, viewport, comment_col_dragging, comment_sb_dragging, comment_sb_grip, menu_open) = {
                     let mut s = self.shared.state.lock().unwrap();
                     s.last_mouse = position;
                     (
@@ -731,6 +779,9 @@ impl ApplicationHandler<UserEvent> for App {
                         s.sidebar_width,
                         s.tree.is_some(),
                         s.viewport,
+                        s.comment_col_dragging,
+                        s.comment_scrollbar_dragging,
+                        s.comment_scrollbar_grip,
                         s.context_menu.is_some(),
                     )
                 };
@@ -812,7 +863,7 @@ impl ApplicationHandler<UserEvent> for App {
                     position.x as f32,
                     position.y as f32,
                     dragging_sidebar,
-                    dragging_scrollbar || dragging_sb_sidebar,
+                    dragging_scrollbar || dragging_sb_sidebar || comment_sb_dragging,
                     selecting,
                     sidebar_w,
                     tree_visible,
@@ -821,6 +872,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if cursor_changed
                     && !dragging_scrollbar
                     && !dragging_sb_sidebar
+                    && !comment_sb_dragging
                     && !dragging_sidebar
                     && !selecting
                 {
@@ -858,12 +910,36 @@ impl ApplicationHandler<UserEvent> for App {
                         self.clamp_sidebar_scroll();
                         self.request_redraw();
                     }
+                } else if comment_sb_dragging {
+                    if let Some(g) = self.current_comment_scrollbar_geom() {
+                        let vh = g.track_h;
+                        let track_avail = (vh - g.thumb_h).max(1.0);
+                        let new_thumb_top =
+                            (position.y as f32 - comment_sb_grip).clamp(0.0, vh - g.thumb_h);
+                        let frac = new_thumb_top / track_avail;
+                        let new_scroll = frac * g.max_scroll;
+                        {
+                            let mut s = self.shared.state.lock().unwrap();
+                            s.comment_col_scroll = new_scroll;
+                        }
+                        self.clamp_comment_col_scroll();
+                        self.request_redraw();
+                    }
                 } else if dragging_sidebar {
                     let new_w = (position.x as f32).clamp(120.0, 640.0);
                     {
                         let mut s = self.shared.state.lock().unwrap();
                         s.sidebar_width = new_w;
                         s.sidebar_width_restore = new_w;
+                    }
+                    self.request_redraw();
+                } else if comment_col_dragging {
+                    // Column's left edge: width grows as the cursor moves left.
+                    let new_w = (viewport.width as f32 - position.x as f32).clamp(180.0, 900.0);
+                    {
+                        let mut s = self.shared.state.lock().unwrap();
+                        s.comment_col_width = new_w;
+                        s.comment_col_width_restore = new_w;
                     }
                     self.request_redraw();
                 } else if selecting {
@@ -983,7 +1059,8 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // 1. Scrollbar (highest priority — it sits on top of content).
                 if let Some(g) = self.current_scrollbar_geom() {
-                    if in_scrollbar_strip(&g, viewport, x, y) {
+                    let ccw = self.shared.state.lock().unwrap().comment_col_width;
+                    if in_scrollbar_strip(&g, sb_viewport(viewport, ccw), x, y) {
                         if y >= g.thumb_y && y < g.thumb_y + g.thumb_h {
                             // Grab the thumb.
                             let mut s = self.shared.state.lock().unwrap();
@@ -1005,9 +1082,31 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
+                // 1a. Comment column's own scrollbar (far-right edge).
+                if let Some(g) = self.current_comment_scrollbar_geom() {
+                    if in_scrollbar_strip(&g, viewport, x, y) {
+                        if y >= g.thumb_y && y < g.thumb_y + g.thumb_h {
+                            let mut s = self.shared.state.lock().unwrap();
+                            s.comment_scrollbar_dragging = true;
+                            s.comment_scrollbar_grip = y - g.thumb_y;
+                        } else {
+                            let page = g.track_h * 0.9;
+                            let mut s = self.shared.state.lock().unwrap();
+                            if y < g.thumb_y {
+                                s.comment_col_scroll = (s.comment_col_scroll - page).max(0.0);
+                            } else {
+                                s.comment_col_scroll = (s.comment_col_scroll + page).min(g.max_scroll);
+                            }
+                        }
+                        self.clamp_comment_col_scroll();
+                        self.request_redraw();
+                        return;
+                    }
+                }
+
                 // 1b. Comment bubble click — focus the thread and open a
-                //     reply composer on it. Bubbles float in the right
-                //     margin over content, so check before content selection.
+                //     reply composer on it. Bubbles sit in the column over
+                //     its background, so check before content selection.
                 if click_comment_bubble(&self.shared, x, y) {
                     self.request_redraw();
                     return;
@@ -1022,6 +1121,25 @@ impl ApplicationHandler<UserEvent> for App {
                     s.sidebar_dragging = true;
                     self.request_redraw();
                     return;
+                }
+
+                // 2b. Comment column: grab the left-edge strip to resize, or
+                //     absorb clicks that land inside the column so they don't
+                //     start a text selection in the body. (Bubble clicks were
+                //     already handled in 1b.)
+                {
+                    let ccw = self.shared.state.lock().unwrap().comment_col_width;
+                    if ccw > 0.0 {
+                        let col_left = viewport.width as f32 - ccw;
+                        if (x - col_left).abs() <= 6.0 {
+                            self.shared.state.lock().unwrap().comment_col_dragging = true;
+                            self.request_redraw();
+                            return;
+                        }
+                        if x >= col_left {
+                            return;
+                        }
+                    }
                 }
 
                 // 3. Sidebar's internal scrollbar strip (intercept before
@@ -1107,6 +1225,7 @@ impl ApplicationHandler<UserEvent> for App {
                     .find(|z| px >= z.x && px < z.x + z.w && doc_y >= z.y && doc_y < z.y + z.h)
                     .cloned();
                 let copy_selection = self.current_selection_text();
+                let comment_anchor = self.current_comment_anchor();
                 let outline_items = outline_to_menu_items(&self.current_outline());
                 let mermaid_items = zone_hit
                     .as_ref()
@@ -1117,6 +1236,7 @@ impl ApplicationHandler<UserEvent> for App {
                     copy_path,
                     !outline_items.is_empty(),
                     copy_selection,
+                    comment_anchor,
                     zone_hit.as_ref(),
                 );
                 let menu_w = context_menu_width(&items, &self.shared.fonts);
@@ -1153,6 +1273,8 @@ impl ApplicationHandler<UserEvent> for App {
                     s.is_selecting = false;
                     s.scrollbar_dragging = false;
                     s.sidebar_scrollbar_dragging = false;
+                    s.comment_col_dragging = false;
+                    s.comment_scrollbar_dragging = false;
                     if let Some(su) = s.search.as_mut() {
                         su.drag_grip = None;
                     }
@@ -1394,9 +1516,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     Key::Named(NamedKey::End) => {
                         let theme = Theme::light();
-                        let (sidebar_w, content_zoom, tcw, tcox) = {
+                        let (sidebar_w, ccw, content_zoom, tcw, tcox) = {
                             let s = self.shared.state.lock().unwrap();
-                            (s.sidebar_width, s.content_zoom, s.text_column_width, s.text_column_offset_x)
+                            (s.sidebar_width, s.comment_col_width, s.content_zoom, s.text_column_width, s.text_column_offset_x)
                         };
                         let mut images = self.shared.images.lock().unwrap();
                         let doc_h = measure(
@@ -1405,6 +1527,7 @@ impl ApplicationHandler<UserEvent> for App {
                             vh as u32,
                             base_dir.as_deref(),
                             sidebar_w,
+                            ccw,
                             content_zoom,
                             tcw,
                             tcox,
@@ -1441,6 +1564,21 @@ impl ApplicationHandler<UserEvent> for App {
                                 s.sidebar_width_restore
                             } else {
                                 260.0
+                            };
+                        }
+                        None
+                    }
+                    Key::Character(c) if c == "m" && !self.shortcut_mod() => {
+                        // Toggle the comment column (mirrors `b` for the sidebar).
+                        let mut s = self.shared.state.lock().unwrap();
+                        if s.comment_col_width > 0.0 {
+                            s.comment_col_width_restore = s.comment_col_width;
+                            s.comment_col_width = 0.0;
+                        } else {
+                            s.comment_col_width = if s.comment_col_width_restore > 0.0 {
+                                s.comment_col_width_restore
+                            } else {
+                                340.0
                             };
                         }
                         None
@@ -1600,15 +1738,20 @@ impl App {
     /// Resolves the selection to a source line range (via the cached
     /// layout) and captures the selected text as the thread's quote.
     /// Returns false (and does nothing) when there's no selection.
-    fn start_comment_from_selection(&self) -> bool {
+    /// The current selection resolved to `(line_start, line_end, quote)` for
+    /// anchoring a new comment, or `None` when nothing usable is marked.
+    /// Shared by the `c` shortcut and the right-click "Comment" menu item.
+    fn current_comment_anchor(&self) -> Option<(u32, u32, String)> {
         let snap = self.shared.snapshot();
-        let Some((anchor, head)) = snap.selection else { return false };
+        let (anchor, head) = snap.selection?;
         let lay = self.shared.layout_for(&snap);
-        let Some((ls, le)) = crate::render::selection_line_range(&lay.block_spans, anchor, head)
-        else {
-            return false;
-        };
+        let (ls, le) = crate::render::selection_line_range(&lay.block_spans, anchor, head)?;
         let quote = crate::render::selection_text_from_layout(&lay, anchor, head, &self.shared.fonts);
+        Some((ls, le, quote))
+    }
+
+    fn start_comment_from_selection(&self) -> bool {
+        let Some((ls, le, quote)) = self.current_comment_anchor() else { return false };
         let mut s = self.shared.state.lock().unwrap();
         s.comment_compose = Some(CommentCompose {
             text: String::new(),
@@ -1619,6 +1762,9 @@ impl App {
             quote,
             target: None,
         });
+        // A comment with nowhere to show is the bug we're avoiding — make
+        // sure the column is open so the composer is visible.
+        open_comment_col(&mut s);
         // Drop the text selection so its highlight doesn't sit under the bubble.
         s.sel_anchor = None;
         s.sel_head = None;
@@ -1991,6 +2137,7 @@ impl App {
                 fonts: &self.shared.fonts,
                 sidebar_width: snap.sidebar_width,
                 sidebar_scroll: snap.sidebar_scroll,
+                comment_col_width: snap.comment_col_width,
                 content_zoom: snap.content_zoom,
                 sidebar_zoom: snap.sidebar_zoom,
                 mermaid_overrides: Some(&snap.mermaid_overrides),
@@ -2006,7 +2153,7 @@ impl App {
     /// Centre the current match in the viewport, clamped to doc bounds.
     fn scroll_to_match(&self, doc_y: f32) {
         let theme = Theme::light();
-        let (source, vw, vh, base_dir, sidebar_w, content_zoom, tcw, tcox) = {
+        let (source, vw, vh, base_dir, sidebar_w, ccw, content_zoom, tcw, tcox) = {
             let s = self.shared.state.lock().unwrap();
             (
                 s.source.clone(),
@@ -2014,6 +2161,7 @@ impl App {
                 s.viewport.height as f32,
                 s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
                 s.sidebar_width,
+                s.comment_col_width,
                 s.content_zoom,
                 s.text_column_width,
                 s.text_column_offset_x,
@@ -2022,7 +2170,7 @@ impl App {
         let mut images = self.shared.images.lock().unwrap();
         let doc_h = measure(
             &source, vw, vh as u32,
-            base_dir.as_deref(), sidebar_w, content_zoom,
+            base_dir.as_deref(), sidebar_w, ccw, content_zoom,
             tcw, tcox,
             &theme, &self.shared.fonts, &mut images,
         );
@@ -2481,6 +2629,7 @@ impl App {
             .find(|z| px >= z.x && px < z.x + z.w && doc_y >= z.y && doc_y < z.y + z.h)
             .cloned();
         let copy_selection = self.current_selection_text();
+        let comment_anchor = self.current_comment_anchor();
         let outline_items = outline_to_menu_items(&self.current_outline());
         let mermaid_items = zone_hit
             .as_ref()
@@ -2491,6 +2640,7 @@ impl App {
             copy_path,
             !outline_items.is_empty(),
             copy_selection,
+            comment_anchor,
             zone_hit.as_ref(),
         );
         let menu_w = context_menu_width(&items, &self.shared.fonts);
@@ -2644,10 +2794,16 @@ impl App {
             }
             return changed;
         }
+        let (ccw, dragging_col) = {
+            let s = self.shared.state.lock().unwrap();
+            (s.comment_col_width, s.comment_col_dragging)
+        };
+        let col_left = _viewport.width as f32 - ccw;
+
         // Compute hover rect once so we can both pick the cursor and
         // notice when the hovered target changes between equal-cursor rects
         // (e.g., two adjacent tree rows both want CursorIcon::Pointer).
-        let hover_rect = if dragging_scrollbar || dragging_sidebar || selecting {
+        let hover_rect = if dragging_scrollbar || dragging_sidebar || dragging_col || selecting {
             None
         } else {
             self.hovered_rect(x, y)
@@ -2656,12 +2812,17 @@ impl App {
         let icon = if dragging_scrollbar {
             // Keep default while scroll-dragging — no grab cursor per user ask.
             CursorIcon::Default
-        } else if dragging_sidebar {
+        } else if dragging_sidebar || dragging_col {
             CursorIcon::EwResize
         } else if selecting {
             CursorIcon::Text
+        } else if ccw > 0.0 && (x - col_left).abs() <= 6.0 {
+            CursorIcon::EwResize
         } else if tree_visible && sidebar_w > 0.0 && (x - sidebar_w).abs() <= 6.0 {
             CursorIcon::EwResize
+        } else if ccw > 0.0 && x >= col_left {
+            // Inside the comment column — a panel, not selectable body text.
+            CursorIcon::Default
         } else if hover_rect.is_some() {
             CursorIcon::Pointer
         } else if x < sidebar_w {
@@ -2716,6 +2877,7 @@ impl App {
                 base_dir: base_dir.as_deref(),
                 sidebar_width: snap.sidebar_width,
                 sidebar_scroll: snap.sidebar_scroll,
+                comment_col_width: snap.comment_col_width,
                 content_zoom: snap.content_zoom,
                 sidebar_zoom: snap.sidebar_zoom,
                 selection: snap.selection,
@@ -2814,7 +2976,45 @@ impl App {
         // the connection.
         let snap = self.shared.snapshot();
         let lay = self.shared.layout_for(&snap);
-        scrollbar_geom(snap.viewport, snap.scroll, lay.doc_height)
+        scrollbar_geom(sb_viewport(snap.viewport, snap.comment_col_width), snap.scroll, lay.doc_height)
+    }
+
+    /// Geometry of the comment column's own scrollbar (far-right edge). Reuses
+    /// the document scrollbar geometry against the full viewport — the
+    /// document's bar lives at the content edge, this one at the window edge.
+    fn current_comment_scrollbar_geom(&self) -> Option<SbGeom> {
+        let snap = self.shared.snapshot();
+        if snap.comment_col_width <= 0.0 {
+            return None;
+        }
+        let content_h = self.comment_col_content_height(&snap);
+        scrollbar_geom(snap.viewport, snap.comment_col_scroll, content_h)
+    }
+
+    /// Total height of the column's stacked threads, for scroll clamping and
+    /// the scrollbar.
+    fn comment_col_content_height(&self, snap: &Snapshot) -> f32 {
+        let rects = crate::render::layout_comment_bubbles(
+            snap.viewport,
+            &snap.theme,
+            &self.shared.fonts,
+            &snap.comments,
+            snap.comment_compose.as_ref(),
+            snap.comment_col_width,
+            snap.comment_col_zoom,
+        );
+        crate::render::comment_col_content_height(&rects)
+    }
+
+    fn clamp_comment_col_scroll(&self) {
+        let snap = self.shared.snapshot();
+        if snap.comment_col_width <= 0.0 {
+            return;
+        }
+        let content_h = self.comment_col_content_height(&snap);
+        let max_scroll = (content_h - snap.viewport.height as f32).max(0.0);
+        let mut s = self.shared.state.lock().unwrap();
+        s.comment_col_scroll = s.comment_col_scroll.clamp(0.0, max_scroll);
     }
 
     fn copy_selection(&self) {
@@ -2837,6 +3037,7 @@ impl App {
                     base_dir: base_dir.as_deref(),
                     sidebar_width: snap.sidebar_width,
                     sidebar_scroll: snap.sidebar_scroll,
+                    comment_col_width: snap.comment_col_width,
                     content_zoom: snap.content_zoom,
                     sidebar_zoom: snap.sidebar_zoom,
                     selection: snap.selection,
@@ -2905,6 +3106,7 @@ impl App {
                 base_dir: base_dir.as_deref(),
                 sidebar_width: snap.sidebar_width,
                 sidebar_scroll: snap.sidebar_scroll,
+                comment_col_width: snap.comment_col_width,
                 content_zoom: snap.content_zoom,
                 sidebar_zoom: snap.sidebar_zoom,
                 selection: snap.selection,
@@ -2921,8 +3123,8 @@ impl App {
             },
         );
 
-        // Comment thread bubbles in the right margin. Drawn over content but
-        // under the modal overlays (search / quick-open / context menu).
+        // Comment column on the right. Drawn over content but under the
+        // modal overlays (search / quick-open / context menu).
         crate::render::draw_comment_bubbles(
             &mut fb,
             &lay,
@@ -2933,6 +3135,9 @@ impl App {
             &snap.comments,
             snap.active_comment,
             snap.comment_compose.as_ref(),
+            snap.comment_col_width,
+            snap.comment_col_zoom,
+            snap.comment_col_scroll,
         );
 
         // Read cursor — thin vertical caret in the left margin at the
@@ -2992,6 +3197,28 @@ impl App {
     }
 }
 
+/// Viewport narrowed by the comment column, so the document scrollbar
+/// geometry / hit-strip sits at the content area's right edge rather than
+/// underneath the column.
+fn sb_viewport(viewport: Viewport, comment_col_width: f32) -> Viewport {
+    Viewport {
+        width: (viewport.width as f32 - comment_col_width.max(0.0)).max(1.0) as u32,
+        height: viewport.height,
+    }
+}
+
+/// Open the comment column if it's currently collapsed, restoring its last
+/// width (or a default). Called when a comment/composer needs to be visible.
+fn open_comment_col(s: &mut AppState) {
+    if s.comment_col_width <= 1.0 {
+        s.comment_col_width = if s.comment_col_width_restore > 0.0 {
+            s.comment_col_width_restore
+        } else {
+            340.0
+        };
+    }
+}
+
 /// If screen point (x, y) lands on a comment bubble, focus that thread and
 /// open a reply composer on it. Returns true when a bubble was hit (caller
 /// should stop further click dispatch). Shared by the live mouse handler
@@ -3001,19 +3228,20 @@ pub fn click_comment_bubble(shared: &Arc<Shared>, x: f32, y: f32) -> bool {
     if snap.comments.is_empty() {
         return false;
     }
-    let lay = shared.layout_for(&snap);
     let rects = crate::render::layout_comment_bubbles(
-        &lay,
         snap.viewport,
-        snap.scroll,
         &snap.theme,
         &shared.fonts,
         &snap.comments,
         snap.comment_compose.as_ref(),
+        snap.comment_col_width,
+        snap.comment_col_zoom,
     );
+    // Rects are content-space; apply the column's own scroll for screen y.
+    let sc = snap.comment_col_scroll;
     let hit = rects
         .iter()
-        .find(|r| r.id != 0 && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h)
+        .find(|r| r.id != 0 && x >= r.x && x <= r.x + r.w && y >= r.y - sc && y <= r.y - sc + r.h)
         .map(|r| r.id);
     let Some(id) = hit else { return false };
     let mut s = shared.state.lock().unwrap();
@@ -3142,7 +3370,7 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
             // Clamp against the actual doc height so clicking "Smallest
             // heading" near the end doesn't scroll past the bottom.
             let theme = Theme::light();
-            let (source, vw, vh, base_dir, sidebar_w, content_zoom, tcw, tcox) = {
+            let (source, vw, vh, base_dir, sidebar_w, ccw, content_zoom, tcw, tcox) = {
                 let s = shared.state.lock().unwrap();
                 (
                     s.source.clone(),
@@ -3150,6 +3378,7 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
                     s.viewport.height as f32,
                     s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
                     s.sidebar_width,
+                    s.comment_col_width,
                     s.content_zoom,
                     s.text_column_width,
                     s.text_column_offset_x,
@@ -3162,6 +3391,7 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
                 vh as u32,
                 base_dir.as_deref(),
                 sidebar_w,
+                ccw,
                 content_zoom,
                 tcw,
                 tcox,
@@ -3202,6 +3432,9 @@ pub fn run(opts: WindowOptions) -> ExitCode {
     let arg = opts.path;
     let fonts = Fonts::load();
     let viewport = Viewport { width: 1200, height: 900 };
+    // The comment column starts open when the control API is on — that's
+    // the signal the agent-chat loop is in play. `m` toggles it either way.
+    let api_on = opts.api_port.is_some();
 
     let (source, source_path, tree) = resolve_open_arg(arg);
 
@@ -3248,6 +3481,13 @@ pub fn run(opts: WindowOptions) -> ExitCode {
             comment_seq: 0,
             active_comment: None,
             comment_compose: None,
+            comment_col_width: if api_on { 340.0 } else { 0.0 },
+            comment_col_width_restore: 340.0,
+            comment_col_dragging: false,
+            comment_col_zoom: 1.0,
+            comment_col_scroll: 0.0,
+            comment_scrollbar_dragging: false,
+            comment_scrollbar_grip: 0.0,
         }),
     });
 
@@ -3733,12 +3973,21 @@ fn build_context_menu_items(
     copy_path: Option<PathBuf>,
     has_outline: bool,
     copy_selection: Option<String>,
+    comment_anchor: Option<(u32, u32, String)>,
     copy_zone: Option<&crate::layout::CopyZone>,
 ) -> Vec<(String, MenuAction)> {
     let mut items: Vec<(String, MenuAction)> = Vec::new();
     // Copy actions come first — they're the most common right-click intent.
     if let Some(text) = copy_selection {
         items.push(("Copy text".to_string(), MenuAction::CopyText(text)));
+    }
+    // "Comment" sits next to "Copy text" since both act on the selection.
+    // Only offered when the selection maps to a source line range.
+    if let Some((line_start, line_end, quote)) = comment_anchor {
+        items.push((
+            "Comment  (c)".to_string(),
+            MenuAction::Comment { line_start, line_end, quote },
+        ));
     }
     if let Some(z) = copy_zone {
         // Zones can offer multiple formats (e.g. tables: CSV + Markdown).
@@ -4100,11 +4349,27 @@ fn apply_menu_action(shared: &Arc<Shared>, proxy: &EventLoopProxy<UserEvent>, ac
             let key = (s.source_path.clone(), *idx);
             s.mermaid_overrides.remove(&key);
         }
+        MenuAction::Comment { line_start, line_end, quote } => {
+            let mut s = shared.state.lock().unwrap();
+            s.comment_compose = Some(CommentCompose {
+                text: String::new(),
+                cursor: 0,
+                anchor: 0,
+                line_start: *line_start,
+                line_end: *line_end,
+                quote: quote.clone(),
+                target: None,
+            });
+            open_comment_col(&mut s);
+            // Drop the selection so its highlight doesn't sit under the bubble.
+            s.sel_anchor = None;
+            s.sel_head = None;
+        }
         MenuAction::ScrollTo(doc_y) => {
             // Mirror the HitAction::ScrollTo flow in click_at so clamping
             // against the real doc height stays consistent.
             let theme = Theme::light();
-            let (source, vw, vh, base_dir, sidebar_w, content_zoom, tcw, tcox) = {
+            let (source, vw, vh, base_dir, sidebar_w, ccw, content_zoom, tcw, tcox) = {
                 let s = shared.state.lock().unwrap();
                 (
                     s.source.clone(),
@@ -4112,6 +4377,7 @@ fn apply_menu_action(shared: &Arc<Shared>, proxy: &EventLoopProxy<UserEvent>, ac
                     s.viewport.height as f32,
                     s.source_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
                     s.sidebar_width,
+                    s.comment_col_width,
                     s.content_zoom,
                     s.text_column_width,
                     s.text_column_offset_x,
@@ -4120,7 +4386,7 @@ fn apply_menu_action(shared: &Arc<Shared>, proxy: &EventLoopProxy<UserEvent>, ac
             let mut images = shared.images.lock().unwrap();
             let doc_h = measure(
                 &source, vw, vh as u32,
-                base_dir.as_deref(), sidebar_w, content_zoom,
+                base_dir.as_deref(), sidebar_w, ccw, content_zoom,
                 tcw, tcox,
                 &theme, &shared.fonts, &mut images,
             );
