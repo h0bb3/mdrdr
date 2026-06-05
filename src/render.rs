@@ -1287,21 +1287,24 @@ fn wrap_text(text: &str, font: &fontdue::Font, size: f32, max_w: f32) -> Vec<Str
 /// Document-y of the top of the block containing `line` (1-based), using the
 /// layout's block spans. Falls back to the nearest block by line distance so
 /// a comment whose anchor drifted slightly after edits still finds a home.
-fn block_y_for_line(lay: &Layout, line: u32) -> Option<f32> {
+/// `(top_y, bottom_y)` of the block containing `line`, or the nearest block.
+/// Returns the full vertical extent so a highlight can span a whole block
+/// (a multi-line paragraph is one block), not just its first line.
+fn block_span_for_line(lay: &Layout, line: u32) -> Option<(f32, f32)> {
     if lay.block_spans.is_empty() {
         return None;
     }
     let mut best: Option<(&crate::layout::BlockSpan, u32)> = None;
     for s in &lay.block_spans {
         if line >= s.line_start && line <= s.line_end {
-            return Some(s.y0);
+            return Some((s.y0, s.y1));
         }
         let dist = if line < s.line_start { s.line_start - line } else { line - s.line_end };
         if best.map(|(_, d)| dist < d).unwrap_or(true) {
             best = Some((s, dist));
         }
     }
-    best.map(|(s, _)| s.y0)
+    best.map(|(s, _)| (s.y0, s.y1))
 }
 
 const BUBBLE_PAD: f32 = 9.0;
@@ -1474,19 +1477,32 @@ pub fn draw_comment_bubbles(
     let user_tag: Rgba = theme.muted;
     let agent_tag: Rgba = theme.accent;
 
-    // Highlight the active thread's commented lines in the text column.
-    if let Some(aid) = active {
-        if let Some(c) = comments.iter().find(|c| c.id == aid) {
-            let y0 = block_y_for_line(lay, c.line_start);
-            let y1 = block_y_for_line(lay, c.line_end);
-            if let (Some(y0), Some(y1)) = (y0, y1) {
-                let sy0 = y0 - scroll;
-                let sy1 = (y1 - scroll).max(sy0 + line_h);
-                let hl: Rgba = [theme.accent[0], theme.accent[1], theme.accent[2], 36];
-                let left = lay.sidebar_width as i32;
-                let w = (g.left - lay.sidebar_width - BUBBLE_GAP) as i32;
-                fb.fill_rect(left, sy0 as i32, w.max(1), (sy1 - sy0).max(line_h) as i32, hl);
-            }
+    // Highlight the commented line range in the body. While a new-thread
+    // composer is open, highlight its range so the marking stays visible as
+    // you type (the text selection itself was dropped when the composer
+    // opened); otherwise highlight the active / replied-to thread. Spans the
+    // full extent from the first block's top to the last block's bottom, so a
+    // multi-line / multi-section mark stays fully lit, not just its first line.
+    let hl_range: Option<(u32, u32)> = if let Some(cp) = compose {
+        match cp.target {
+            None => Some((cp.line_start, cp.line_end)),
+            Some(id) => comments.iter().find(|c| c.id == id).map(|c| (c.line_start, c.line_end)),
+        }
+    } else if let Some(aid) = active {
+        comments.iter().find(|c| c.id == aid).map(|c| (c.line_start, c.line_end))
+    } else {
+        None
+    };
+    if let Some((ls, le)) = hl_range {
+        if let (Some((top, _)), Some((_, bot))) =
+            (block_span_for_line(lay, ls), block_span_for_line(lay, le))
+        {
+            let sy0 = top - scroll;
+            let sy1 = (bot - scroll).max(sy0 + line_h);
+            let hl: Rgba = [theme.accent[0], theme.accent[1], theme.accent[2], 36];
+            let left = lay.sidebar_width as i32;
+            let w = (g.left - lay.sidebar_width - BUBBLE_GAP) as i32;
+            fb.fill_rect(left, sy0 as i32, w.max(1), (sy1 - sy0).max(line_h) as i32, hl);
         }
     }
 
@@ -1596,37 +1612,53 @@ fn draw_input_line(
     cursor: usize,
     theme: &Theme,
 ) {
-    // Wrap the in-progress text and draw it; place a caret after `cursor`
-    // chars (counted across wrapped lines).
-    let wrapped = wrap_text(text, font, size, max_w);
+    // Lay out the in-progress text char-by-char with the same greedy
+    // word-wrap as `wrap_text`, but over the *original* string so every
+    // char (including spaces wrap_text would drop) keeps a position. This
+    // lets the caret map straight from `cursor` (a char index into `text`)
+    // to a screen point — otherwise a trailing/again-typed space desyncs
+    // the displayed-char count from the cursor and the caret jumps home.
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let space_w = font.metrics(' ', size).advance_width;
     let baseline0 = top + size;
-    let mut drawn = 0usize;
-    let mut caret_drawn = false;
+    let mut cx = x;
     let mut y = baseline0;
-    for line in &wrapped {
-        let mut cx = x;
-        for ch in line.chars() {
-            if !caret_drawn && drawn == cursor {
-                fb.fill_rect(cx as i32, (y - size) as i32, 2, (size * 1.2) as i32, theme.accent);
-                caret_drawn = true;
+    let mut caret: Option<(f32, f32)> = None;
+    let mut i = 0;
+    while i < n {
+        if chars[i] == ' ' {
+            if caret.is_none() && i == cursor {
+                caret = Some((cx, y));
             }
-            fb.draw_glyph(font, ch, size, cx, y, theme.fg);
-            cx += font.metrics(ch, size).advance_width;
-            drawn += 1;
+            cx += space_w;
+            i += 1;
+        } else {
+            // Measure the upcoming word; wrap before it if it would overflow
+            // (matches wrap_text, which never splits a word).
+            let mut j = i;
+            let mut ww = 0.0;
+            while j < n && chars[j] != ' ' {
+                ww += font.metrics(chars[j], size).advance_width;
+                j += 1;
+            }
+            if cx > x && cx + ww > x + max_w {
+                cx = x;
+                y += line_h;
+            }
+            while i < j {
+                if caret.is_none() && i == cursor {
+                    caret = Some((cx, y));
+                }
+                fb.draw_glyph(font, chars[i], size, cx, y, theme.fg);
+                cx += font.metrics(chars[i], size).advance_width;
+                i += 1;
+            }
         }
-        // account for the space that wrap dropped between lines
-        if !caret_drawn && drawn == cursor {
-            fb.fill_rect(cx as i32, (y - size) as i32, 2, (size * 1.2) as i32, theme.accent);
-            caret_drawn = true;
-        }
-        y += line_h;
     }
-    if !caret_drawn {
-        // Empty input or caret past end: draw at the start of the last line.
-        let cx = x;
-        let cy = baseline0 + (wrapped.len().saturating_sub(1)) as f32 * line_h;
-        fb.fill_rect(cx as i32, (cy - size) as i32, 2, (size * 1.2) as i32, theme.accent);
-    }
+    // Caret at end of text (cursor == n) or empty input.
+    let (caret_x, caret_y) = caret.unwrap_or((cx, y));
+    fb.fill_rect(caret_x as i32, (caret_y - size) as i32, 2, (size * 1.2) as i32, theme.accent);
 }
 
 /// 1px rounded-rect outline (four sides + corner pixels approximated by the

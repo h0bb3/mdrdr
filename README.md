@@ -27,6 +27,7 @@ Everything above the primitive layer (window, pixels, font raster, image decode)
 - **Scrollbars** — content and sidebar both get thin scrollbars when content overflows.
 - **Inline images** — PNG / JPEG, resolved relative to the current file, mtime-cached.
 - **Claude-drivable API** — localhost HTTP for screenshots, scroll, click, selection, theme, zoom, etc.
+- **AI agent review loop** — drop comments in the right margin and have a coding agent (Claude Code, Codex) answer them in place: it reads the anchored lines, edits the file (which live-reloads), and replies in the bubble. See [Driving mdrdr from an AI agent](#driving-mdrdr-from-an-ai-agent-claude-code--codex).
 
 ## Install
 
@@ -179,6 +180,36 @@ curl -X POST 'http://127.0.0.1:$PORT/select?x1=50&y1=60&x2=400&y2=80'
 curl -X POST  http://127.0.0.1:$PORT/copy
 curl -X POST  http://127.0.0.1:$PORT/quit
 ```
+
+### Driving mdrdr from an AI agent (Claude Code / Codex)
+
+mdrdr doubles as a review surface for coding agents: you read a doc in the window, drop comments in the right margin, and an agent answers them in place — editing the file (which live-reloads) and replying in the bubble.
+
+Launch with the API on a known port so the agent can find it:
+
+```
+mdrdr open NOTES.md --port 7779
+```
+
+The comment endpoints the agent uses:
+
+```
+curl      'http://127.0.0.1:7779/comments?pending=1'        # threads awaiting a reply
+curl -X POST 'http://127.0.0.1:7779/comments/reply?id=1' --data-urlencode 'text=...'
+curl -X POST 'http://127.0.0.1:7779/comments/resolve?id=1'  # resolve (or &resolved=0 to reopen)
+```
+
+Each pending thread carries its anchored `line_start`/`line_end`, the `quote` that was marked, and the message history — enough for the agent to reorient in the file, make an `Edit`, and reply. Edits hot-reload in the viewer immediately. Leave threads open (don't auto-resolve) so the human can follow up.
+
+**Claude Code** — the `/mdrdr-chat` skill wraps this loop: it pulls pending threads, edits the doc, and posts replies. Drive it as a live chat with the loop skill:
+
+```
+/loop 8s /mdrdr-chat
+```
+
+Set `MDRDR_PORT` first if you launched on a non-default port. There's also `/mdrdr-edit` for editing the region currently selected in the viewer.
+
+**Codex** (or any other agent) — there's no bundled skill, so point it at the endpoints directly: tell it to poll `GET /comments?pending=1`, read the file around each thread's anchor, edit, and `POST /comments/reply`. The same curl contract applies.
 
 ## Architecture
 

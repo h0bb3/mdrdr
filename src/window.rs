@@ -203,7 +203,7 @@ impl CommentAuthor {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CommentMsg {
     pub author: CommentAuthor,
     pub text: String,
@@ -211,8 +211,9 @@ pub struct CommentMsg {
 
 /// One comment thread anchored to a source line range. The conversation is
 /// the `messages` list, alternating (loosely) between the user and the
-/// agent. In-memory only — cleared when the open file changes.
-#[derive(Debug, Clone)]
+/// agent. Persisted in a trailing `<!-- mdrdr-comments -->` block in the
+/// document itself (see `parse_comment_doc` / `embed_comment_doc`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct Comment {
     pub id: u64,
     pub line_start: u32,
@@ -231,6 +232,132 @@ impl Comment {
         !self.resolved
             && matches!(self.messages.last().map(|m| m.author), Some(CommentAuthor::User))
     }
+}
+
+const COMMENT_BLOCK_OPEN: &str = "<!-- mdrdr-comments";
+const COMMENT_BLOCK_CLOSE: &str = "-->";
+
+/// Neutralise text so it can't break the HTML-comment block: collapse
+/// newlines (messages are single-line) and escape a literal `-->` (which
+/// would close the comment early in mdrdr *and* any other viewer).
+fn esc_comment_text(s: &str) -> String {
+    s.replace(['\n', '\r'], " ").replace("-->", "--\\>")
+}
+fn unesc_comment_text(s: &str) -> String {
+    s.replace("--\\>", "-->")
+}
+
+/// Split a document into (renderable content, threads, max thread id). The
+/// threads live in a trailing `<!-- mdrdr-comments ... -->` block. Parsing
+/// is deliberately forgiving: any unrecognised line is ignored, never
+/// fatal, so a hand-edit that slightly mangles the block costs at most one
+/// thread — never the document. No block → whole file is content.
+pub fn parse_comment_doc(file: &str) -> (String, Vec<Comment>, u64) {
+    let lines: Vec<&str> = file.lines().collect();
+    let Some(open) = lines.iter().position(|l| l.trim() == COMMENT_BLOCK_OPEN) else {
+        return (file.to_string(), Vec::new(), 0);
+    };
+    let content = lines[..open].join("\n").trim_end().to_string();
+
+    let mut comments: Vec<Comment> = Vec::new();
+    let mut max_id = 0u64;
+    for &raw in &lines[open + 1..] {
+        let t = raw.trim();
+        if t == COMMENT_BLOCK_CLOSE {
+            break;
+        }
+        if t.starts_with('[') {
+            let Some(rb) = t.find(']') else { continue };
+            let id: u64 = t[1..rb].trim().parse().unwrap_or(max_id + 1);
+            let rest = &t[rb + 1..];
+            let (mut ls, mut le) = (0u32, 0u32);
+            if let Some(lp) = rest.find("lines ") {
+                let span: String = rest[lp + 6..]
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '-')
+                    .collect();
+                match span.split_once('-') {
+                    Some((a, b)) => {
+                        ls = a.trim().parse().unwrap_or(0);
+                        le = b.trim().parse().unwrap_or(ls);
+                    }
+                    None => {
+                        ls = span.trim().parse().unwrap_or(0);
+                        le = ls;
+                    }
+                }
+            }
+            let resolved = rest.contains("resolved:yes");
+            max_id = max_id.max(id);
+            comments.push(Comment {
+                id,
+                line_start: ls,
+                line_end: le,
+                quote: String::new(),
+                messages: Vec::new(),
+                resolved,
+            });
+            continue;
+        }
+        let Some(cur) = comments.last_mut() else { continue };
+        if let Some(q) = t.strip_prefix("quote:") {
+            cur.quote = unesc_comment_text(q.trim());
+        } else if let Some(u) = t.strip_prefix("user:") {
+            cur.messages.push(CommentMsg { author: CommentAuthor::User, text: unesc_comment_text(u.trim()) });
+        } else if let Some(a) = t.strip_prefix("agent:") {
+            cur.messages.push(CommentMsg { author: CommentAuthor::Agent, text: unesc_comment_text(a.trim()) });
+        }
+    }
+    (content, comments, max_id)
+}
+
+/// Serialise content + threads into a full document. With no threads the
+/// content is returned untouched (no block added), so docs without comments
+/// are never rewritten gratuitously.
+pub fn embed_comment_doc(content: &str, comments: &[Comment]) -> String {
+    let content = content.trim_end();
+    if comments.is_empty() {
+        return format!("{content}\n");
+    }
+    let mut out = String::with_capacity(content.len() + 256);
+    out.push_str(content);
+    out.push_str("\n\n");
+    out.push_str(COMMENT_BLOCK_OPEN);
+    out.push('\n');
+    for c in comments {
+        let res = if c.resolved { "yes" } else { "no" };
+        out.push_str(&format!("[{}] lines {}-{} resolved:{}\n", c.id, c.line_start, c.line_end, res));
+        if !c.quote.is_empty() {
+            out.push_str(&format!("  quote: {}\n", esc_comment_text(&c.quote)));
+        }
+        for m in &c.messages {
+            out.push_str(&format!("  {}: {}\n", m.author.as_str(), esc_comment_text(&m.text)));
+        }
+    }
+    out.push_str(COMMENT_BLOCK_CLOSE);
+    out.push('\n');
+    out
+}
+
+/// Replace the rendered document from freshly-read file text: split off the
+/// trailing comment block, set the renderable source + threads, bump the
+/// layout version. Returns false (and changes nothing) when content and
+/// threads are byte-for-byte what we already have — which is how the file
+/// watcher ignores mdrdr's own writes and other no-op touches. Preserves an
+/// open composer; keeps the active thread only if it still exists.
+pub fn apply_doc_text(s: &mut AppState, text: &str) -> bool {
+    let (content, comments, max_id) = parse_comment_doc(text);
+    if content == s.source && comments == s.comments {
+        return false;
+    }
+    let keep_active = s.active_comment.filter(|id| comments.iter().any(|c| c.id == *id));
+    s.source = content;
+    s.source_version = s.source_version.wrapping_add(1);
+    s.comment_seq = s.comment_seq.max(max_id);
+    s.comments = comments;
+    s.active_comment = keep_active;
+    true
 }
 
 pub struct AppState {
@@ -1868,6 +1995,27 @@ impl App {
                 s.active_comment = Some(id);
             }
         }
+        drop(s);
+        // mdrdr is the canonical writer: persist the threads back into the
+        // document's trailing comment block.
+        self.persist_comments();
+    }
+
+    /// Write the current threads into the open document's trailing comment
+    /// block (temp file + atomic rename). The watcher will see the write,
+    /// re-read, and find nothing changed — so it doesn't loop.
+    fn persist_comments(&self) {
+        let (path, text) = {
+            let s = self.shared.state.lock().unwrap();
+            let Some(path) = s.source_path.clone() else { return };
+            (path, embed_comment_doc(&s.source, &s.comments))
+        };
+        let mut tmp = path.clone();
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        tmp.set_file_name(format!(".{name}.mdrdr.tmp"));
+        if std::fs::write(&tmp, text.as_bytes()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 
 
@@ -2439,19 +2587,18 @@ impl App {
     /// updating scroll / path state. Shared between quick-open and sidebar
     /// clicks.
     fn open_path(&self, p: &Path, _event_loop: &winit::event_loop::ActiveEventLoop) {
-        let Ok(content) = std::fs::read_to_string(p) else { return };
+        let Ok(text) = std::fs::read_to_string(p) else { return };
         let mut s = self.shared.state.lock().unwrap();
-        s.source = content;
-        s.source_version = s.source_version.wrapping_add(1);
+        // Loads the new file's content + its own comment threads.
+        apply_doc_text(&mut s, &text);
         s.source_path = Some(p.to_path_buf());
         s.scroll = 0.0;
         s.sel_anchor = None;
         s.sel_head = None;
-        // Comments are per-file and in-memory; drop them on file switch.
-        s.comments.clear();
-        s.comment_seq = 0;
+        // Don't carry comment focus / composer / column scroll across files.
         s.active_comment = None;
         s.comment_compose = None;
+        s.comment_col_scroll = 0.0;
         // Park the read cursor at the top of the new doc so keyboard
         // navigation has a starting line without the user having to
         // "wake" the cursor first.
@@ -3436,7 +3583,10 @@ pub fn run(opts: WindowOptions) -> ExitCode {
     // the signal the agent-chat loop is in play. `m` toggles it either way.
     let api_on = opts.api_port.is_some();
 
-    let (source, source_path, tree) = resolve_open_arg(arg);
+    let (raw, source_path, tree) = resolve_open_arg(arg);
+    // Split the trailing comment block out of the file so the renderer sees
+    // only content and the threads populate the column.
+    let (source, comments, comment_seq) = parse_comment_doc(&raw);
 
     let shared = Arc::new(Shared {
         fonts,
@@ -3477,8 +3627,8 @@ pub fn run(opts: WindowOptions) -> ExitCode {
             // `move_read_cursor` snaps to the nearest baseline on the
             // first ↑/↓.
             read_cursor: Some(0.0),
-            comments: Vec::new(),
-            comment_seq: 0,
+            comments,
+            comment_seq,
             active_comment: None,
             comment_compose: None,
             comment_col_width: if api_on { 340.0 } else { 0.0 },

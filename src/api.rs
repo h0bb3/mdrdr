@@ -97,10 +97,9 @@ fn handle(
         ("POST", "/select/clear") => do_select_clear(&mut stream, &shared, &proxy),
         ("POST", "/copy") => do_copy(&mut stream, &shared),
         ("GET", "/selection") => do_selection(&mut stream, &shared),
+        // Read-only. Comment *writes* go through the document's trailing
+        // `<!-- mdrdr-comments -->` block — agents edit the file directly.
         ("GET", "/comments") => ok_json(&mut stream, &comments_json(&shared, &q)),
-        ("POST", "/comment") => do_comment_create(&mut stream, &shared, &proxy, &q),
-        ("POST", "/comments/reply") => do_comment_reply(&mut stream, &shared, &proxy, &q),
-        ("POST", "/comments/resolve") => do_comment_resolve(&mut stream, &shared, &proxy, &q),
         ("POST", "/quit") => do_quit(&mut stream, &proxy),
         // Test-driver hooks. Synthesize keystrokes through the same
         // dispatch path that real keyboard events use, so the API can
@@ -345,13 +344,11 @@ fn do_open(
     let source = std::fs::read_to_string(&path).unwrap_or_default();
     {
         let mut s = shared.state.lock().unwrap();
-        s.source = source;
-        s.source_version = s.source_version.wrapping_add(1);
+        // Splits the trailing comment block out; loads the file's threads.
+        crate::window::apply_doc_text(&mut s, &source);
         s.source_path = Some(PathBuf::from(path));
         s.scroll = 0.0;
         s.read_cursor = Some(0.0);
-        s.comments.clear();
-        s.comment_seq = 0;
         s.active_comment = None;
         s.comment_compose = None;
         s.comment_col_scroll = 0.0;
@@ -707,109 +704,6 @@ fn comments_json(shared: &Arc<Shared>, q: &HashMap<String, String>) -> String {
         .map(comment_json)
         .collect();
     format!("{{\"path\":{path},\"comments\":[{}]}}", items.join(","))
-}
-
-/// `POST /comment?text=&start=N&end=M[&quote=]` — create a thread with an
-/// opening user message. Mainly a test/automation hook; the in-app flow
-/// creates threads directly. Returns the new thread.
-fn do_comment_create(
-    stream: &mut TcpStream,
-    shared: &Arc<Shared>,
-    proxy: &EventLoopProxy<UserEvent>,
-    q: &HashMap<String, String>,
-) -> std::io::Result<()> {
-    let Some(text) = q.get("text").filter(|t| !t.is_empty()) else {
-        return bad_request(stream, "missing ?text=");
-    };
-    let start = q.get("start").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
-    let end = q.get("end").and_then(|v| v.parse::<u32>().ok()).unwrap_or(start);
-    let quote = q.get("quote").cloned().unwrap_or_default();
-    let created = {
-        let mut s = shared.state.lock().unwrap();
-        s.comment_seq += 1;
-        let id = s.comment_seq;
-        let c = crate::window::Comment {
-            id,
-            line_start: start,
-            line_end: end.max(start),
-            quote,
-            messages: vec![crate::window::CommentMsg {
-                author: crate::window::CommentAuthor::User,
-                text: text.clone(),
-            }],
-            resolved: false,
-        };
-        s.comments.push(c.clone());
-        c
-    };
-    let _ = proxy.send_event(UserEvent::Redraw);
-    ok_json(stream, &comment_json(&created))
-}
-
-/// `POST /comments/reply?id=N&text=...` — append the agent's reply to a
-/// thread. This is how Claude Code answers a comment.
-fn do_comment_reply(
-    stream: &mut TcpStream,
-    shared: &Arc<Shared>,
-    proxy: &EventLoopProxy<UserEvent>,
-    q: &HashMap<String, String>,
-) -> std::io::Result<()> {
-    let Some(id) = q.get("id").and_then(|v| v.parse::<u64>().ok()) else {
-        return bad_request(stream, "missing ?id=");
-    };
-    let Some(text) = q.get("text").filter(|t| !t.is_empty()) else {
-        return bad_request(stream, "missing ?text=");
-    };
-    let found = {
-        let mut s = shared.state.lock().unwrap();
-        match s.comments.iter_mut().find(|c| c.id == id) {
-            Some(c) => {
-                c.messages.push(crate::window::CommentMsg {
-                    author: crate::window::CommentAuthor::Agent,
-                    text: text.clone(),
-                });
-                Some(c.clone())
-            }
-            None => None,
-        }
-    };
-    match found {
-        Some(c) => {
-            let _ = proxy.send_event(UserEvent::Redraw);
-            ok_json(stream, &comment_json(&c))
-        }
-        None => bad_request(stream, "no such comment id"),
-    }
-}
-
-/// `POST /comments/resolve?id=N[&resolved=0|1]` — mark a thread resolved
-/// (default) or reopen it.
-fn do_comment_resolve(
-    stream: &mut TcpStream,
-    shared: &Arc<Shared>,
-    proxy: &EventLoopProxy<UserEvent>,
-    q: &HashMap<String, String>,
-) -> std::io::Result<()> {
-    let Some(id) = q.get("id").and_then(|v| v.parse::<u64>().ok()) else {
-        return bad_request(stream, "missing ?id=");
-    };
-    let resolved = q.get("resolved").map(|v| v != "0" && !v.eq_ignore_ascii_case("false")).unwrap_or(true);
-    let ok = {
-        let mut s = shared.state.lock().unwrap();
-        match s.comments.iter_mut().find(|c| c.id == id) {
-            Some(c) => {
-                c.resolved = resolved;
-                true
-            }
-            None => false,
-        }
-    };
-    if ok {
-        let _ = proxy.send_event(UserEvent::Redraw);
-        ok_json(stream, "{\"ok\":true}")
-    } else {
-        bad_request(stream, "no such comment id")
-    }
 }
 
 fn do_quit(stream: &mut TcpStream, proxy: &EventLoopProxy<UserEvent>) -> std::io::Result<()> {

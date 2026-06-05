@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use winit::event_loop::EventLoopProxy;
 
-use crate::window::{Shared, UserEvent};
+use crate::window::{apply_doc_text, Shared, UserEvent};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -46,14 +46,18 @@ pub fn spawn(shared: Arc<Shared>, proxy: EventLoopProxy<UserEvent>) {
                 let Ok(new_source) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                {
+                // Split content + comment threads and apply. Returns false
+                // when nothing actually changed, which is how we ignore
+                // mdrdr's own writes (it just persisted the same state) and
+                // any other no-op touch — no redraw, no churn.
+                let changed = {
                     let mut s = shared.state.lock().unwrap();
-                    if s.source_path.as_deref() == Some(path.as_path()) {
-                        s.source = new_source;
-                        s.source_version = s.source_version.wrapping_add(1);
-                    }
+                    s.source_path.as_deref() == Some(path.as_path())
+                        && apply_doc_text(&mut s, &new_source)
+                };
+                if changed {
+                    let _ = proxy.send_event(UserEvent::Redraw);
                 }
-                let _ = proxy.send_event(UserEvent::Redraw);
             }
         })
         .expect("spawn watcher thread");
