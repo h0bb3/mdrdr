@@ -676,8 +676,8 @@ impl<'a> Ctx<'a> {
                 });
             }
             Block::Paragraph(inlines) => {
-                if let Some((alt, src)) = single_image(inlines) {
-                    if self.emit_block_image(alt, src, indent) {
+                if let Some((alt, src, width)) = single_image(inlines) {
+                    if self.emit_block_image(alt, src, width, indent) {
                         self.y += self.theme.body_size * 0.55;
                         return;
                     }
@@ -1092,7 +1092,7 @@ impl<'a> Ctx<'a> {
     /// return the cached pixels. Used by table layout to render image
     /// cells as actual images rather than `[image: alt]` placeholders.
     fn cell_image(&mut self, cell: &[Inline]) -> Option<Arc<CachedImage>> {
-        let (_, src) = single_image(cell)?;
+        let (_, src, _) = single_image(cell)?;
         let resolved = ImageCache::resolve(src, self.base_dir)?;
         self.images.get_or_load(&resolved)
     }
@@ -1293,7 +1293,7 @@ impl<'a> Ctx<'a> {
 
     /// Try to place an image as a block element. Returns true if placed;
     /// false if the image could not be loaded (caller falls back to alt text).
-    fn emit_block_image(&mut self, alt: &str, src: &str, indent: f32) -> bool {
+    fn emit_block_image(&mut self, alt: &str, src: &str, width: Option<f32>, indent: f32) -> bool {
         let Some(resolved) = ImageCache::resolve(src, self.base_dir) else {
             return false;
         };
@@ -1302,12 +1302,12 @@ impl<'a> Ctx<'a> {
         };
         let avail_w = (self.content_right - self.content_left - indent).max(1.0);
         let (nat_w, nat_h) = (data.width as f32, data.height as f32);
-        let (w, h) = if nat_w > avail_w {
-            let scale = avail_w / nat_w;
-            (avail_w, nat_h * scale)
-        } else {
-            (nat_w, nat_h)
-        };
+        // Honor an explicit width (e.g. HTML `width="280"`) but never exceed
+        // the available content width; otherwise fall back to natural size,
+        // also capped to the content width.
+        let target_w = width.unwrap_or(nat_w).min(avail_w).max(1.0);
+        let scale = target_w / nat_w;
+        let (w, h) = (target_w, nat_h * scale);
         let x = self.content_left + indent;
         let y = self.y;
         self.items.push(Placed::Image { x, y, w, h, data });
@@ -1575,7 +1575,7 @@ fn inlines_to_markdown(inlines: &[Inline]) -> String {
                 out.push_str(href);
                 out.push(')');
             }
-            Inline::Image { alt, src } => {
+            Inline::Image { alt, src, .. } => {
                 out.push_str("![");
                 out.push_str(alt);
                 out.push_str("](");
@@ -1608,15 +1608,15 @@ fn inlines_to_plain(inlines: &[Inline]) -> String {
 
 /// If `inlines` reduces to a single Image (optionally surrounded by
 /// whitespace-only Text runs), return (alt, src). Otherwise None.
-fn single_image(inlines: &[Inline]) -> Option<(&str, &str)> {
-    let mut found: Option<(&str, &str)> = None;
+fn single_image(inlines: &[Inline]) -> Option<(&str, &str, Option<f32>)> {
+    let mut found: Option<(&str, &str, Option<f32>)> = None;
     for i in inlines {
         match i {
-            Inline::Image { alt, src } => {
+            Inline::Image { alt, src, width } => {
                 if found.is_some() {
                     return None;
                 }
-                found = Some((alt.as_str(), src.as_str()));
+                found = Some((alt.as_str(), src.as_str(), *width));
             }
             Inline::Text(t) if t.trim().is_empty() => {}
             _ => return None,

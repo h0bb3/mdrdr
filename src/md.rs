@@ -16,7 +16,7 @@ pub enum Inline {
     Italic(Vec<Inline>),
     Code(String),
     Link { text: Vec<Inline>, href: String },
-    Image { alt: String, src: String },
+    Image { alt: String, src: String, width: Option<f32> },
     Math(String),
 }
 
@@ -328,7 +328,13 @@ fn parse_lines(
             i += 1;
         }
         if !buf.is_empty() {
-            out.push(Block::Paragraph(parse_inlines(&buf)));
+            let inlines = parse_inlines(&buf);
+            // A line that was nothing but dropped HTML (e.g. a `<div>`
+            // page-break helper) parses to no inlines — emit no block so it
+            // leaves no stray gap.
+            if !inlines.is_empty() {
+                out.push(Block::Paragraph(inlines));
+            }
         }
         rec!();
     }
@@ -556,7 +562,7 @@ impl<'a> InlineParser<'a> {
                 b'!' if self.i + 1 < self.src.len() && self.src[self.i + 1] == b'[' => {
                     if let Some((alt, src, end)) = self.parse_bracket_paren(self.i + 2) {
                         flush(&mut buf, &mut out);
-                        out.push(Inline::Image { alt, src });
+                        out.push(Inline::Image { alt, src, width: None });
                         self.i = end;
                     } else {
                         buf.push('!');
@@ -570,6 +576,22 @@ impl<'a> InlineParser<'a> {
                         self.i = end;
                     } else {
                         buf.push('[');
+                        self.i += 1;
+                    }
+                }
+                b'<' => {
+                    // Raw HTML tag. We recognize <img ...> (rendered as an
+                    // image) and silently drop every other tag / comment —
+                    // they're layout-only HTML (e.g. <div>, <br>, page-break
+                    // helpers) that have no place in a CPU-rendered doc.
+                    if let Some((img, end)) = self.parse_html_tag(self.i) {
+                        if let Some((alt, src, width)) = img {
+                            flush(&mut buf, &mut out);
+                            out.push(Inline::Image { alt, src, width });
+                        }
+                        self.i = end;
+                    } else {
+                        buf.push('<');
                         self.i += 1;
                     }
                 }
@@ -634,10 +656,78 @@ impl<'a> InlineParser<'a> {
         Some((text, url, end_paren + 1))
     }
 
+    /// Parse a raw HTML tag starting at `start` (the `<`). Returns
+    /// `(img, end)` where `end` is one-past the closing `>`. `img` is
+    /// `Some((alt, src, width))` only for an `<img>` tag carrying a `src`;
+    /// it's `None` for any other tag or comment (caller drops those).
+    /// Returns the outer `None` when the bytes at `start` aren't a tag at
+    /// all (e.g. `a < b`), so the `<` is kept as literal text.
+    fn parse_html_tag(&self, start: usize) -> Option<(Option<(String, String, Option<f32>)>, usize)> {
+        let s = &self.src;
+        let next = *s.get(start + 1)?;
+        // HTML comment / declaration: <!-- ... --> or <! ... >
+        if next == b'!' {
+            let end = if s[start..].starts_with(b"<!--") {
+                start + 4 + find_seq(&s[start + 4..], b"-->")? + 3
+            } else {
+                start + find_u8(&s[start..], b'>')? + 1
+            };
+            return Some((None, end));
+        }
+        // A tag must start with `/` (close) or an ASCII letter.
+        if !(next == b'/' || next.is_ascii_alphabetic()) {
+            return None;
+        }
+        let gt = start + find_u8(&s[start..], b'>')?;
+        let inner = std::str::from_utf8(&s[start + 1..gt]).ok()?;
+        let end = gt + 1;
+        // Tag name = leading run of letters (after an optional `/`).
+        let name: String = inner
+            .trim_start_matches('/')
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .flat_map(char::to_lowercase)
+            .collect();
+        if name != "img" {
+            return Some((None, end));
+        }
+        let src = html_attr(inner, "src")?;
+        let alt = html_attr(inner, "alt").unwrap_or_default();
+        let width = html_attr(inner, "width").and_then(|w| {
+            w.trim().trim_end_matches("px").trim().parse::<f32>().ok()
+        });
+        Some((Some((alt, src, width)), end))
+    }
+
     fn peek(&self, needle: &[u8]) -> bool {
         self.i + needle.len() <= self.src.len()
             && &self.src[self.i..self.i + needle.len()] == needle
     }
+}
+
+/// Extract a quoted attribute value (`name="..."` or `name='...'`) from the
+/// inside of an HTML tag. Case-insensitive on the attribute name.
+fn html_attr(tag_inner: &str, name: &str) -> Option<String> {
+    let lower = tag_inner.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find(name) {
+        let at = from + rel;
+        // Require a word boundary before the name (space or tag start).
+        let boundary = at == 0 || lower.as_bytes()[at - 1].is_ascii_whitespace();
+        let rest = lower[at + name.len()..].trim_start();
+        if boundary && rest.starts_with('=') {
+            let after_eq = lower[at + name.len()..].find('=').unwrap() + at + name.len() + 1;
+            let val = tag_inner[after_eq..].trim_start();
+            let quote = val.chars().next()?;
+            if quote == '"' || quote == '\'' {
+                let body = &val[1..];
+                let close = body.find(quote)?;
+                return Some(body[..close].to_string());
+            }
+        }
+        from = at + name.len();
+    }
+    None
 }
 
 fn find_u8(slice: &[u8], b: u8) -> Option<usize> {
@@ -677,6 +767,33 @@ mod tests {
         assert_eq!(spans[1], (3, 4), "paragraph spans both lines");
         assert_eq!(spans[2], (6, 8), "code fence incl. both ``` lines");
         assert_eq!(spans[3], (10, 11), "list spans both items");
+    }
+
+    #[test]
+    fn html_img_tag_becomes_image() {
+        let src = "<img src=\"pic.png\" alt=\"a caption\" width=\"280\">\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            Block::Paragraph(inl) => match &inl[..] {
+                [Inline::Image { alt, src, width }] => {
+                    assert_eq!(alt, "a caption");
+                    assert_eq!(src, "pic.png");
+                    assert_eq!(*width, Some(280.0));
+                }
+                other => panic!("expected one image inline, got {other:?}"),
+            },
+            other => panic!("expected paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn layout_only_html_is_dropped() {
+        // A standalone <div> (page-break helper) and an HTML comment must
+        // not show up as text blocks.
+        let src = "<div style=\"page-break-before: always;\"></div>\n\n<!-- note -->\n";
+        let blocks = parse(src);
+        assert!(blocks.is_empty(), "got {blocks:?}");
     }
 
     #[test]
