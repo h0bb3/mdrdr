@@ -266,11 +266,15 @@ fn parse_lines(
 
         if let Some((ordered, _)) = list_marker(trim) {
             let mut items: Vec<ListItem> = Vec::new();
+            // Source of the item being accumulated. Kept as text rather than
+            // parsed inlines so lazy continuation lines can join it first.
+            let mut cur: Option<(String, Option<TaskState>)> = None;
             while i < lines.len() {
                 let ln = lines[i];
                 let tln = ln.trim_start();
                 if let Some((o, me)) = list_marker(tln) {
                     if o != ordered { break; }
+                    close_list_item(&mut items, &mut cur);
                     let rest = &tln[me..];
                     // GFM task-list marker: `[ ]` or `[x]` / `[X]` right
                     // after the list marker, followed by whitespace.
@@ -283,10 +287,7 @@ fn parse_lines(
                         })
                     });
                     let inline_src = if task.is_some() { &rest[4..] } else { rest };
-                    items.push(ListItem {
-                        inlines: parse_inlines(inline_src),
-                        task,
-                    });
+                    cur = Some((inline_src.to_string(), task));
                     i += 1;
                 } else if ln.trim().is_empty() {
                     // tolerate one blank line between items
@@ -295,10 +296,19 @@ fn parse_lines(
                         continue;
                     }
                     break;
+                } else if cur.is_some() && continues_list_item(tln) {
+                    // Lazy continuation: a wrapped item body. Joins the item
+                    // so it wraps under the marker instead of escaping to the
+                    // left margin as its own paragraph.
+                    let (src, _) = cur.as_mut().expect("checked above");
+                    src.push('\n');
+                    src.push_str(tln);
+                    i += 1;
                 } else {
                     break;
                 }
             }
+            close_list_item(&mut items, &mut cur);
             out.push(Block::List { ordered, items });
             rec!();
             continue;
@@ -468,6 +478,33 @@ fn is_thematic_break(s: &str) -> bool {
     let first = collapsed.chars().next().unwrap();
     if !matches!(first, '-' | '*' | '_') { return false; }
     collapsed.chars().all(|c| c == first)
+}
+
+/// Parse the accumulated source of a list item and push it, if any.
+fn close_list_item(
+    items: &mut Vec<ListItem>,
+    cur: &mut Option<(String, Option<TaskState>)>,
+) {
+    if let Some((src, task)) = cur.take() {
+        items.push(ListItem {
+            inlines: parse_inlines(&src),
+            task,
+        });
+    }
+}
+
+/// True when a non-blank line inside a list continues the current item's
+/// text rather than starting a block of its own. Markdown's "lazy
+/// continuation" — indentation is conventional, not required, so the test is
+/// purely about what else the line could be.
+fn continues_list_item(t: &str) -> bool {
+    !(heading_level(t).is_some()
+        || t.starts_with("```")
+        || t.starts_with("$$")
+        || t.starts_with('>')
+        || t.starts_with("<!--")
+        || is_thematic_break(t)
+        || looks_like_table_row(t))
 }
 
 fn list_marker(s: &str) -> Option<(bool, usize)> {
@@ -918,6 +955,36 @@ mod tests {
             })
             .collect();
         assert!(!text.contains('<'), "raw HTML leaked: {text:?}");
+    }
+
+    #[test]
+    fn list_item_absorbs_wrapped_continuation() {
+        // Hand-wrapped item bodies are indented by convention only. They
+        // belong to the item, not to a paragraph of their own — otherwise
+        // they escape the list's hanging indent when rendered.
+        let src = "- first line\n  continued here\n- second\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 1, "got {blocks:?}");
+        let Block::List { items, .. } = &blocks[0] else {
+            panic!("expected a list, got {blocks:?}")
+        };
+        assert_eq!(items.len(), 2, "got {items:?}");
+        let first = format!("{:?}", items[0].inlines);
+        assert!(first.contains("continued here"), "got {first}");
+    }
+
+    #[test]
+    fn list_still_ends_at_a_new_block() {
+        // A continuation must not swallow the next real block.
+        for after in ["## Heading", "```\ncode\n```", "> quote", "---"] {
+            let src = format!("- item\n{after}\n");
+            let blocks = parse(&src);
+            assert!(
+                blocks.len() >= 2,
+                "list swallowed {after:?}: {blocks:?}"
+            );
+            assert!(matches!(blocks[0], Block::List { .. }), "got {blocks:?}");
+        }
     }
 
     #[test]

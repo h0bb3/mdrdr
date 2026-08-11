@@ -23,7 +23,8 @@ Everything above the primitive layer (window, pixels, font raster, image decode)
   - **Dark / Light Theme** toggle
 - **Dark mode** — `t` to toggle (or via the context menu). Tables, code blocks and Mermaid diagrams track the theme.
 - **Zoom** — `Ctrl+wheel` over a panel changes its font size independently (content vs sidebar).
-- **Internal anchor links** — `[text](#heading)` scrolls to the matching heading (GitHub-style slug).
+- **Internal anchor links** — `[text](#heading)` scrolls to the matching heading (GitHub-style slug), or to an explicit `<a id="…">` anywhere in the document.
+- **Raw HTML** — `<img>` renders as an image, `<a id="…">` becomes an invisible link target; comments (including multi-line ones) and layout-only tags are dropped rather than echoed as source.
 - **Scrollbars** — content and sidebar both get thin scrollbars when content overflows.
 - **Inline images** — PNG / JPEG, resolved relative to the current file, mtime-cached.
 - **Claude-drivable API** — localhost HTTP for screenshots, scroll, click, selection, theme, zoom, etc.
