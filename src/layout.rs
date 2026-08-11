@@ -309,6 +309,7 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
     let mut content_hit_targets: Vec<HitTarget> = Vec::new();
     let mut copy_zones: Vec<CopyZone> = Vec::new();
     let mut outline: Vec<OutlineEntry> = Vec::new();
+    let mut anchors: Vec<(String, f32)> = Vec::new();
     let mut block_spans: Vec<BlockSpan> = Vec::new();
     let doc_height = {
         let mut ctx = Ctx {
@@ -316,6 +317,7 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
             content_hits: &mut content_hit_targets,
             copy_zones: &mut copy_zones,
             outline: &mut outline,
+            anchors: &mut anchors,
             y: content_theme.margin_y,
             content_left,
             content_right,
@@ -367,14 +369,20 @@ pub fn layout(input: LayoutInput, images: &mut ImageCache) -> Layout {
         );
     }
 
-    // Resolve internal anchor links (href="#slug") against the outline so
-    // clicking one scrolls instead of trying to xdg-open "#slug". Slugs
-    // follow the common GitHub convention: lowercase, non-alphanumerics
-    // collapsed to single hyphens.
+    // Resolve internal anchor links (href="#slug") against the outline and
+    // against explicit HTML anchors (`<a id="…">`) so clicking one scrolls
+    // instead of trying to xdg-open "#slug". Heading slugs follow the common
+    // GitHub convention: lowercase, non-alphanumerics collapsed to single
+    // hyphens; explicit ids go through the same normalization so `#REQ-1`
+    // finds `<a id="req-1">` and vice versa.
     let mut slug_y: std::collections::HashMap<String, f32> =
-        std::collections::HashMap::with_capacity(outline.len());
+        std::collections::HashMap::with_capacity(outline.len() + anchors.len());
     for o in &outline {
         slug_y.entry(slugify(&o.text)).or_insert(o.doc_y);
+    }
+    // Explicit ids win over a heading that happens to slugify the same way.
+    for (id, y) in &anchors {
+        slug_y.insert(slugify(id), *y);
     }
     for hit in &mut content_hit_targets {
         if let HitAction::OpenUrl(href) = &hit.action {
@@ -623,6 +631,8 @@ struct Ctx<'a> {
     content_hits: &'a mut Vec<HitTarget>,
     copy_zones: &'a mut Vec<CopyZone>,
     outline: &'a mut Vec<OutlineEntry>,
+    /// `(anchor id, doc y)` for every `<a id=…>` seen, in document order.
+    anchors: &'a mut Vec<(String, f32)>,
     y: f32,
     content_left: f32,
     content_right: f32,
@@ -683,8 +693,10 @@ impl<'a> Ctx<'a> {
                     }
                 }
                 let style = body_style(self.theme);
-                self.paragraph(inlines, style, indent);
-                self.y += self.theme.body_size * 0.55;
+                // An anchor-only paragraph draws nothing — don't leave its gap.
+                if self.paragraph(inlines, style, indent) {
+                    self.y += self.theme.body_size * 0.55;
+                }
             }
             Block::CodeBlock { text, .. } => {
                 let pad = 12.0;
@@ -1316,7 +1328,14 @@ impl<'a> Ctx<'a> {
         true
     }
 
-    fn paragraph(&mut self, inlines: &[Inline], base: Style, indent: f32) {
+    /// Lay out an inline run as wrapped lines. Returns false when it produced
+    /// no visible words (e.g. the line held nothing but an HTML anchor), so
+    /// the caller can skip the trailing paragraph gap.
+    fn paragraph(&mut self, inlines: &[Inline], base: Style, indent: f32) -> bool {
+        // Anchors render nothing; record them at the top of the run so
+        // `[…](#id)` can scroll here.
+        collect_anchors(inlines, self.y, self.anchors);
+
         let left = self.content_left + indent;
         let right = self.content_right;
         let avail = (right - left).max(1.0);
@@ -1327,7 +1346,7 @@ impl<'a> Ctx<'a> {
         }
         let words = collector.finish();
         if words.is_empty() {
-            return;
+            return false;
         }
 
         // One line at a time. Collect (word, x_offset) pairs, then at flush
@@ -1440,6 +1459,19 @@ impl<'a> Ctx<'a> {
         }
         y_top = emit_line(self, &mut line, &words, left, y_top);
         self.y = y_top;
+        true
+    }
+}
+
+/// Walk an inline tree and record every `Inline::Anchor` at `y`.
+fn collect_anchors(inlines: &[Inline], y: f32, out: &mut Vec<(String, f32)>) {
+    for i in inlines {
+        match i {
+            Inline::Anchor(id) => out.push((id.clone(), y)),
+            Inline::Bold(inner) | Inline::Italic(inner) => collect_anchors(inner, y, out),
+            Inline::Link { text, .. } => collect_anchors(text, y, out),
+            _ => {}
+        }
     }
 }
 
@@ -1582,6 +1614,12 @@ fn inlines_to_markdown(inlines: &[Inline]) -> String {
                 out.push_str(src);
                 out.push(')');
             }
+            // Round-trip the anchor so an edit doesn't drop the link target.
+            Inline::Anchor(id) => {
+                out.push_str("<a id=\"");
+                out.push_str(id);
+                out.push_str("\"></a>");
+            }
         }
     }
     out
@@ -1601,6 +1639,7 @@ fn inlines_to_plain(inlines: &[Inline]) -> String {
                 out.push_str(&inlines_to_plain(text));
             }
             Inline::Image { alt, .. } => out.push_str(alt),
+            Inline::Anchor(_) => {}
         }
     }
     out
@@ -1846,6 +1885,8 @@ impl WordCollector {
                 let s = Style { italic: true, color: theme.muted, underline: false, ..base };
                 self.emit_text(&label, s, fonts);
             }
+            // Invisible link target — `layout()` records where it landed.
+            Inline::Anchor(_) => {}
             Inline::Math(src) => {
                 self.flush();
                 let size = base.size;
@@ -1947,4 +1988,83 @@ fn line_width(words: &[Word], indices: &[usize], fonts: &Fonts) -> f32 {
         w += word.width;
     }
     w
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lay(src: &str) -> Layout {
+        let theme = Theme::light();
+        let fonts = Fonts::load();
+        let blocks = crate::md::parse(src);
+        let mut images = ImageCache::new();
+        layout(
+            LayoutInput {
+                blocks: &blocks,
+                block_lines: None,
+                tree: None,
+                active_path: None,
+                base_dir: None,
+                viewport_w: 900,
+                viewport_h: 600,
+                theme: &theme,
+                fonts: &fonts,
+                sidebar_width: 0.0,
+                sidebar_scroll: 0.0,
+                comment_col_width: 0.0,
+                content_zoom: 1.0,
+                sidebar_zoom: 1.0,
+                mermaid_overrides: None,
+                text_column_width: f32::INFINITY,
+                text_column_offset_x: 0.0,
+            },
+            &mut images,
+        )
+    }
+
+    /// A `[…](#REQ-1)` link must resolve to a scroll onto the `<a id="REQ-1">`
+    /// far down the page, not to an xdg-open of the literal "#REQ-1".
+    #[test]
+    fn html_anchor_is_a_scroll_target() {
+        let mut src = String::from("See [the req](#REQ-1).\n\n");
+        for i in 0..40 {
+            src.push_str(&format!("Filler paragraph {i}.\n\n"));
+        }
+        src.push_str("**REQ-1: Onboarding** <a id=\"REQ-1\"></a>\nBody.\n");
+
+        let l = lay(&src);
+        let scrolls: Vec<f32> = l
+            .content_hit_targets
+            .iter()
+            .filter_map(|h| match h.action {
+                HitAction::ScrollTo(y) => Some(y),
+                _ => None,
+            })
+            .collect();
+        assert!(!scrolls.is_empty(), "link did not resolve to a scroll");
+        assert!(
+            scrolls[0] > 300.0,
+            "anchor y {} looks wrong — should be far down the doc",
+            scrolls[0]
+        );
+    }
+
+    /// Case differences between the href fragment and the id must not matter.
+    #[test]
+    fn html_anchor_matches_case_insensitively() {
+        let l = lay("[go](#req-1)\n\nText <a id=\"REQ-1\"></a>\n");
+        assert!(l
+            .content_hit_targets
+            .iter()
+            .any(|h| matches!(h.action, HitAction::ScrollTo(_))));
+    }
+
+    /// An anchor sitting alone on a line renders nothing and leaves no gap.
+    #[test]
+    fn anchor_only_paragraph_adds_no_height() {
+        let plain = lay("Alpha.\n\nBravo.\n").doc_height;
+        let anchored = lay("Alpha.\n\n<a id=\"x\"></a>\n\nBravo.\n").doc_height;
+        assert_eq!(plain, anchored);
+    }
 }

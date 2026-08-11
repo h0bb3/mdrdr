@@ -5,9 +5,13 @@
 //!               thematic breaks (---, ***, ___).
 //! Inline level: **bold**, *italic*, `code`, [text](url), ![alt](src),
 //!               backslash escapes.
+//! Raw HTML:     `<img>` renders as an image, `<a id=…>` / `<a name=…>`
+//!               becomes an invisible link target, comments (including
+//!               multi-line ones) and everything else are dropped. We never
+//!               echo HTML source into the page.
 //!
 //! Not handled yet: nested lists, setext headings, reference-style links,
-//! HTML passthrough, tables. They land as we need them.
+//! hard line breaks (two trailing spaces). They land as we need them.
 
 #[derive(Debug, Clone)]
 pub enum Inline {
@@ -18,6 +22,10 @@ pub enum Inline {
     Link { text: Vec<Inline>, href: String },
     Image { alt: String, src: String, width: Option<f32> },
     Math(String),
+    /// A link target declared by raw HTML (`<a id="X">`, `<a name="X">`, or
+    /// any tag carrying an `id`). Renders nothing; layout records where it
+    /// landed so `[text](#X)` can scroll to it.
+    Anchor(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +153,22 @@ fn parse_lines(
         }
         let line = lines[i];
         let trim = line.trim_start();
+
+        // A *multi-line* HTML comment swallows every line up to and including
+        // the one that closes it — comments routinely span blank lines and
+        // heading-ish text, which the inline parser (which only ever sees one
+        // paragraph buffer) can't look past. Emits no block. Comments that
+        // open and close on the same line fall through to the inline parser,
+        // which already drops them and keeps any text around them.
+        if trim.starts_with("<!--") && !trim[4..].contains("-->") {
+            if let Some(rel) = lines[i + 1..].iter().position(|l| l.contains("-->")) {
+                i += 1 + rel + 1;
+                rec!();
+                continue;
+            }
+            // Unterminated — fall through and treat it as ordinary text
+            // rather than eating the rest of the document.
+        }
 
         if trim.starts_with("$$") {
             let mut body = String::new();
@@ -581,13 +605,14 @@ impl<'a> InlineParser<'a> {
                 }
                 b'<' => {
                     // Raw HTML tag. We recognize <img ...> (rendered as an
-                    // image) and silently drop every other tag / comment —
-                    // they're layout-only HTML (e.g. <div>, <br>, page-break
-                    // helpers) that have no place in a CPU-rendered doc.
-                    if let Some((img, end)) = self.parse_html_tag(self.i) {
-                        if let Some((alt, src, width)) = img {
+                    // image) and id-carrying tags (kept as invisible anchors),
+                    // and silently drop every other tag / comment — they're
+                    // layout-only HTML (e.g. <div>, <br>, page-break helpers)
+                    // that have no place in a CPU-rendered doc.
+                    if let Some((inline, end)) = self.parse_html_tag(self.i) {
+                        if let Some(inline) = inline {
                             flush(&mut buf, &mut out);
-                            out.push(Inline::Image { alt, src, width });
+                            out.push(inline);
                         }
                         self.i = end;
                     } else {
@@ -657,12 +682,13 @@ impl<'a> InlineParser<'a> {
     }
 
     /// Parse a raw HTML tag starting at `start` (the `<`). Returns
-    /// `(img, end)` where `end` is one-past the closing `>`. `img` is
-    /// `Some((alt, src, width))` only for an `<img>` tag carrying a `src`;
-    /// it's `None` for any other tag or comment (caller drops those).
+    /// `(inline, end)` where `end` is one-past the closing `>`. `inline` is
+    /// `Some(Image)` for an `<img>` carrying a `src`, `Some(Anchor)` for a
+    /// tag carrying an `id`/`name`, and `None` for anything else — comments,
+    /// `<div>`, closing tags (caller drops those).
     /// Returns the outer `None` when the bytes at `start` aren't a tag at
     /// all (e.g. `a < b`), so the `<` is kept as literal text.
-    fn parse_html_tag(&self, start: usize) -> Option<(Option<(String, String, Option<f32>)>, usize)> {
+    fn parse_html_tag(&self, start: usize) -> Option<(Option<Inline>, usize)> {
         let s = &self.src;
         let next = *s.get(start + 1)?;
         // HTML comment / declaration: <!-- ... --> or <! ... >
@@ -688,15 +714,24 @@ impl<'a> InlineParser<'a> {
             .take_while(|c| c.is_ascii_alphabetic())
             .flat_map(char::to_lowercase)
             .collect();
-        if name != "img" {
+        if name == "img" {
+            if let Some(src) = html_attr(inner, "src") {
+                let alt = html_attr(inner, "alt").unwrap_or_default();
+                let width = html_attr(inner, "width").and_then(|w| {
+                    w.trim().trim_end_matches("px").trim().parse::<f32>().ok()
+                });
+                return Some((Some(Inline::Image { alt, src, width }), end));
+            }
             return Some((None, end));
         }
-        let src = html_attr(inner, "src")?;
-        let alt = html_attr(inner, "alt").unwrap_or_default();
-        let width = html_attr(inner, "width").and_then(|w| {
-            w.trim().trim_end_matches("px").trim().parse::<f32>().ok()
-        });
-        Some((Some((alt, src, width)), end))
+        // Any tag can declare a link target; `<a name=...>` is the old form.
+        let anchor = html_attr(inner, "id").or_else(|| html_attr(inner, "name"));
+        match anchor {
+            Some(id) if !id.trim().is_empty() => {
+                Some((Some(Inline::Anchor(id.trim().to_string())), end))
+            }
+            _ => Some((None, end)),
+        }
     }
 
     fn peek(&self, needle: &[u8]) -> bool {
@@ -794,6 +829,81 @@ mod tests {
         let src = "<div style=\"page-break-before: always;\"></div>\n\n<!-- note -->\n";
         let blocks = parse(src);
         assert!(blocks.is_empty(), "got {blocks:?}");
+    }
+
+    #[test]
+    fn multiline_html_comment_is_dropped() {
+        // Blank lines and heading-ish text inside a comment must not break it
+        // back open — the whole run is invisible.
+        let src = "Alpha.\n\n<!--\nhidden\n\n## not a heading\n-->\n\nBravo.\n";
+        let blocks = parse(src);
+        let text: Vec<String> = blocks
+            .iter()
+            .map(|b| match b {
+                Block::Paragraph(inl) => format!("{inl:?}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(blocks.len(), 2, "got {text:?}");
+        assert!(!text.join(" ").contains("hidden"), "got {text:?}");
+    }
+
+    #[test]
+    fn same_line_comment_keeps_surrounding_text() {
+        let blocks = parse("<!-- note --> Bravo.\n");
+        match &blocks[..] {
+            [Block::Paragraph(inl)] => {
+                let s = format!("{inl:?}");
+                assert!(s.contains("Bravo"), "got {s}");
+                assert!(!s.contains("note"), "got {s}");
+            }
+            other => panic!("expected one paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unterminated_comment_does_not_eat_the_document() {
+        let blocks = parse("<!-- oops\n\nBravo.\n");
+        let s = format!("{blocks:?}");
+        assert!(s.contains("Bravo"), "got {s}");
+    }
+
+    #[test]
+    fn html_anchor_becomes_invisible_target() {
+        // `<a id=...>` is the usual way to hang a link target off a line that
+        // isn't a heading. It must survive parsing (so links can find it) but
+        // contribute no text.
+        let src = "**REQ-1: Onboarding** <a id=\"REQ-1\"></a>\nBody text.\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 1, "got {blocks:?}");
+        let Block::Paragraph(inl) = &blocks[0] else {
+            panic!("expected paragraph, got {blocks:?}")
+        };
+        assert!(
+            inl.iter().any(|i| matches!(i, Inline::Anchor(id) if id == "REQ-1")),
+            "no anchor in {inl:?}"
+        );
+        // The closing </a> and the tag itself leave no literal text behind.
+        let text: String = inl
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Text(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!text.contains('<'), "raw HTML leaked: {text:?}");
+    }
+
+    #[test]
+    fn html_anchor_old_name_form() {
+        let blocks = parse("<a name=\"top\"></a>\n");
+        match &blocks[..] {
+            [Block::Paragraph(inl)] => match &inl[..] {
+                [Inline::Anchor(id)] => assert_eq!(id, "top"),
+                other => panic!("expected one anchor, got {other:?}"),
+            },
+            other => panic!("expected one paragraph, got {other:?}"),
+        }
     }
 
     #[test]
