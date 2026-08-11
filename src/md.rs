@@ -4,14 +4,15 @@
 //!               bullet lists (-, *, +), ordered lists (1.), blockquotes (>),
 //!               thematic breaks (---, ***, ___).
 //! Inline level: **bold**, *italic*, `code`, [text](url), ![alt](src),
-//!               backslash escapes.
+//!               backslash escapes, hard breaks (two trailing spaces or a
+//!               trailing backslash).
 //! Raw HTML:     `<img>` renders as an image, `<a id=…>` / `<a name=…>`
 //!               becomes an invisible link target, comments (including
 //!               multi-line ones) and everything else are dropped. We never
 //!               echo HTML source into the page.
 //!
-//! Not handled yet: nested lists, setext headings, reference-style links,
-//! hard line breaks (two trailing spaces). They land as we need them.
+//! Not handled yet: nested lists, setext headings, reference-style links.
+//! They land as we need them.
 
 #[derive(Debug, Clone)]
 pub enum Inline {
@@ -26,6 +27,9 @@ pub enum Inline {
     /// any tag carrying an `id`). Renders nothing; layout records where it
     /// landed so `[text](#X)` can scroll to it.
     Anchor(String),
+    /// A hard line break — two trailing spaces or a trailing backslash. The
+    /// paragraph continues, but the next word starts on a fresh line.
+    LineBreak,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -648,7 +652,29 @@ impl<'a> InlineParser<'a> {
                     }
                 }
                 b'\n' => {
-                    buf.push(' ');
+                    // Hard break: the line ended in two-or-more spaces, or in
+                    // a single backslash. Otherwise the newline is just a
+                    // space — paragraphs reflow.
+                    let two_spaces = self.i >= 2
+                        && self.src[self.i - 1] == b' '
+                        && self.src[self.i - 2] == b' ';
+                    let backslash = self.i >= 1
+                        && self.src[self.i - 1] == b'\\'
+                        && buf.ends_with('\\');
+                    if two_spaces || backslash {
+                        // Drop the break marker itself from the text.
+                        if backslash {
+                            buf.pop();
+                        } else {
+                            while buf.ends_with(' ') {
+                                buf.pop();
+                            }
+                        }
+                        flush(&mut buf, &mut out);
+                        out.push(Inline::LineBreak);
+                    } else {
+                        buf.push(' ');
+                    }
                     self.i += 1;
                 }
                 _ => {
@@ -892,6 +918,37 @@ mod tests {
             })
             .collect();
         assert!(!text.contains('<'), "raw HTML leaked: {text:?}");
+    }
+
+    #[test]
+    fn hard_break_forms() {
+        // Two trailing spaces and a trailing backslash both break the line;
+        // a bare newline stays a soft break (paragraph reflows).
+        let inl = parse_inlines("red  \nblue\\\ngreen\nstill green");
+        let breaks = inl.iter().filter(|i| matches!(i, Inline::LineBreak)).count();
+        assert_eq!(breaks, 2, "got {inl:?}");
+        // The break markers themselves leave no text behind.
+        let text: String = inl
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Text(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!text.contains('\\'), "backslash leaked: {text:?}");
+        assert!(!text.contains("  "), "trailing spaces leaked: {text:?}");
+        assert!(text.contains("green still green"), "soft break lost: {text:?}");
+    }
+
+    #[test]
+    fn hard_break_after_inline_span() {
+        // The two spaces sit outside the `**…**`, so the run is flushed
+        // before the break is seen — the common REQ-doc shape.
+        let inl = parse_inlines("**Title** <a id=\"X\"></a>  \nBody.");
+        assert!(
+            inl.iter().any(|i| matches!(i, Inline::LineBreak)),
+            "got {inl:?}"
+        );
     }
 
     #[test]

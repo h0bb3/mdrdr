@@ -1445,10 +1445,10 @@ impl<'a> Ctx<'a> {
                 WordPayload::Text { style, .. } => space_advance(self.fonts, *style),
                 WordPayload::Math(_) => self.theme.body_size * 0.3,
             };
-            let needs_space = !line.is_empty() && word.leading_space;
+            let needs_space = !line.is_empty() && word.leading_space && !word.break_before;
             let gap = if needs_space { sw } else { 0.0 };
             let projected = pen + gap + word.width;
-            if !line.is_empty() && projected > avail {
+            if !line.is_empty() && (word.break_before || projected > avail) {
                 y_top = emit_line(self, &mut line, &words, left, y_top);
                 pen = 0.0;
             } else if needs_space {
@@ -1614,6 +1614,8 @@ fn inlines_to_markdown(inlines: &[Inline]) -> String {
                 out.push_str(src);
                 out.push(')');
             }
+            // Two trailing spaces — the canonical hard-break spelling.
+            Inline::LineBreak => out.push_str("  \n"),
             // Round-trip the anchor so an edit doesn't drop the link target.
             Inline::Anchor(id) => {
                 out.push_str("<a id=\"");
@@ -1639,6 +1641,7 @@ fn inlines_to_plain(inlines: &[Inline]) -> String {
                 out.push_str(&inlines_to_plain(text));
             }
             Inline::Image { alt, .. } => out.push_str(alt),
+            Inline::LineBreak => out.push('\n'),
             Inline::Anchor(_) => {}
         }
     }
@@ -1759,6 +1762,9 @@ struct Word {
     /// If set, every glyph in this word is part of a markdown link and
     /// clicking anywhere on the word should open this URL.
     link_href: Option<std::rc::Rc<str>>,
+    /// A hard line break (`Inline::LineBreak`) preceded this word — start a
+    /// fresh line regardless of how much room is left on the current one.
+    break_before: bool,
 }
 
 struct WordCollector {
@@ -1770,6 +1776,10 @@ struct WordCollector {
     pending_space: bool,
     /// Active link URL while walking inside an `Inline::Link`.
     cur_link: Option<std::rc::Rc<str>>,
+    /// A hard break was seen; the next word emitted claims it.
+    pending_break: bool,
+    /// Whether the word currently being built starts after a hard break.
+    cur_break: bool,
 }
 
 impl WordCollector {
@@ -1782,6 +1792,8 @@ impl WordCollector {
             cur_leading_space: false,
             pending_space: false,
             cur_link: None,
+            pending_break: false,
+            cur_break: false,
         }
     }
 
@@ -1803,8 +1815,10 @@ impl WordCollector {
                 descent: size * 0.25,
                 leading_space: self.cur_leading_space,
                 link_href: self.cur_link.clone(),
+                break_before: self.cur_break,
             });
             self.cur_leading_space = false;
+            self.cur_break = false;
         }
     }
 
@@ -1831,6 +1845,8 @@ impl WordCollector {
             if self.cur.is_empty() {
                 self.cur_leading_space = self.pending_space;
                 self.pending_space = false;
+                self.cur_break = self.pending_break;
+                self.pending_break = false;
                 self.cur_style = style;
             }
             let (g_font, fid) = if crate::font::is_emoji(ch) {
@@ -1887,6 +1903,12 @@ impl WordCollector {
             }
             // Invisible link target — `layout()` records where it landed.
             Inline::Anchor(_) => {}
+            Inline::LineBreak => {
+                self.flush();
+                // The break replaces any inter-word space.
+                self.pending_space = false;
+                self.pending_break = true;
+            }
             Inline::Math(src) => {
                 self.flush();
                 let size = base.size;
@@ -1896,6 +1918,8 @@ impl WordCollector {
                 let descent = mb.descent;
                 let leading_space = self.pending_space;
                 self.pending_space = false;
+                let break_before = self.pending_break;
+                self.pending_break = false;
                 self.out.push(Word {
                     payload: WordPayload::Math(mb),
                     width,
@@ -1903,6 +1927,7 @@ impl WordCollector {
                     descent,
                     leading_space,
                     link_href: self.cur_link.clone(),
+                    break_before,
                 });
             }
         }
@@ -1960,7 +1985,7 @@ fn count_wrapped_lines(
             WordPayload::Math(_) => theme.body_size * 0.3,
         };
         let gap = if !first_on_line && w.leading_space { sw } else { 0.0 };
-        if !first_on_line && cur_w + gap + w.width > width {
+        if !first_on_line && (w.break_before || cur_w + gap + w.width > width) {
             lines += 1;
             cur_w = 0.0;
             first_on_line = true;
@@ -2058,6 +2083,20 @@ mod tests {
             .content_hit_targets
             .iter()
             .any(|h| matches!(h.action, HitAction::ScrollTo(_))));
+    }
+
+    /// A hard break splits one paragraph across two lines without adding the
+    /// larger between-paragraph gap.
+    #[test]
+    fn hard_break_makes_a_line_but_not_a_paragraph() {
+        let soft = lay("red\nblue\n").doc_height;
+        let hard = lay("red  \nblue\n").doc_height;
+        let paras = lay("red\n\nblue\n").doc_height;
+        assert!(hard > soft, "hard break did not add a line ({hard} vs {soft})");
+        assert!(
+            hard < paras,
+            "hard break spaced like a paragraph ({hard} vs {paras})"
+        );
     }
 
     /// An anchor sitting alone on a line renders nothing and leaves no gap.
