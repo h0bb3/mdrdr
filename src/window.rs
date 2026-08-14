@@ -3562,7 +3562,36 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
 /// click that does nothing, which matches the prior "links aren't clickable"
 /// state anyway.
 fn open_url(url: &str) {
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    let target = strip_line_suffix(url);
+    let _ = std::process::Command::new("xdg-open").arg(&*target).spawn();
+}
+
+/// Editor-style links (`/path/file.py:82`, optionally `:82:5`, with or
+/// without a `file://` prefix) make xdg-open look for a literal file named
+/// `file.py:82`. Strip the suffix, but only when the stripped path actually
+/// exists — a colon is legal in filenames, and `http://host:8080` must pass
+/// through untouched (non-`/` targets are never candidates).
+fn strip_line_suffix(url: &str) -> std::borrow::Cow<'_, str> {
+    let path = url.strip_prefix("file://").unwrap_or(url);
+    if !path.starts_with('/') {
+        return std::borrow::Cow::Borrowed(url);
+    }
+    let mut base = path;
+    for _ in 0..2 {
+        match base.rsplit_once(':') {
+            Some((head, tail))
+                if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                base = head;
+            }
+            _ => break,
+        }
+    }
+    if base.len() != path.len() && std::path::Path::new(base).exists() {
+        std::borrow::Cow::Owned(base.to_string())
+    } else {
+        std::borrow::Cow::Borrowed(url)
+    }
 }
 
 /// Runtime options for the window shell.
@@ -4738,4 +4767,27 @@ fn open_dir(root: PathBuf) -> (String, Option<PathBuf>, Option<FileTree>) {
         return (src, Some(first), Some(tree));
     }
     (String::new(), None, Some(tree))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_line_suffix;
+
+    // A file guaranteed to exist when tests run.
+    const REAL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+
+    #[test]
+    fn strips_line_and_col_from_existing_file() {
+        assert_eq!(strip_line_suffix(&format!("{REAL}:82")), REAL);
+        assert_eq!(strip_line_suffix(&format!("{REAL}:82:5")), REAL);
+        assert_eq!(strip_line_suffix(&format!("file://{REAL}:82")), REAL);
+    }
+
+    #[test]
+    fn leaves_everything_else_alone() {
+        assert_eq!(strip_line_suffix(REAL), REAL);
+        assert_eq!(strip_line_suffix("http://host:8080/x"), "http://host:8080/x");
+        assert_eq!(strip_line_suffix("/no/such/file.py:82"), "/no/such/file.py:82");
+        assert_eq!(strip_line_suffix(&format!("{REAL}:abc")), format!("{REAL}:abc"));
+    }
 }
