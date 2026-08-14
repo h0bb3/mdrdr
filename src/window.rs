@@ -3558,23 +3558,48 @@ pub fn click_at(shared: &Arc<Shared>, x: f32, y: f32) -> Option<HitAction> {
     Some(action)
 }
 
-/// Shell out to `xdg-open` (Linux). Errors silently — the worst case is a
-/// click that does nothing, which matches the prior "links aren't clickable"
-/// state anyway.
+/// Open a clicked link. Links that resolve to an existing source file go to
+/// VS Code (`code --goto` understands `path:line:col`, so editor-style
+/// `models.py:82` links land on the right line). Markdown files are exempt —
+/// they keep going through xdg-open so the system association (the reader)
+/// still wins. Everything else (http, mailto, missing paths) also goes to
+/// xdg-open. Errors silently — the worst case is a click that does nothing,
+/// which matches the prior "links aren't clickable" state anyway.
 fn open_url(url: &str) {
-    let target = strip_line_suffix(url);
-    let _ = std::process::Command::new("xdg-open").arg(&*target).spawn();
+    if let Some((path, loc)) = split_file_target(url) {
+        if !path.ends_with(".md") {
+            let goto = format!("{path}{loc}");
+            if std::process::Command::new("code")
+                .arg("--goto")
+                .arg(goto)
+                .spawn()
+                .is_ok()
+            {
+                return;
+            }
+            // No `code` on PATH — at least open the bare file.
+            let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+            return;
+        }
+        // Markdown: strip the line suffix (xdg-open can't use it) and defer.
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+        return;
+    }
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
-/// Editor-style links (`/path/file.py:82`, optionally `:82:5`, with or
-/// without a `file://` prefix) make xdg-open look for a literal file named
-/// `file.py:82`. Strip the suffix, but only when the stripped path actually
-/// exists — a colon is legal in filenames, and `http://host:8080` must pass
-/// through untouched (non-`/` targets are never candidates).
-fn strip_line_suffix(url: &str) -> std::borrow::Cow<'_, str> {
+/// Split a link into (existing file path, `":line[:col]"` suffix, possibly
+/// empty). Accepts plain absolute paths and `file://` URLs; returns `None`
+/// for anything that isn't an existing file — a colon is legal in filenames
+/// (the full path is checked first), and `http://host:8080` is never a
+/// candidate because non-`/` targets are rejected outright.
+fn split_file_target(url: &str) -> Option<(&str, &str)> {
     let path = url.strip_prefix("file://").unwrap_or(url);
     if !path.starts_with('/') {
-        return std::borrow::Cow::Borrowed(url);
+        return None;
+    }
+    if std::path::Path::new(path).exists() {
+        return Some((path, ""));
     }
     let mut base = path;
     for _ in 0..2 {
@@ -3588,9 +3613,9 @@ fn strip_line_suffix(url: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     if base.len() != path.len() && std::path::Path::new(base).exists() {
-        std::borrow::Cow::Owned(base.to_string())
+        Some((base, &path[base.len()..]))
     } else {
-        std::borrow::Cow::Borrowed(url)
+        None
     }
 }
 
@@ -4771,23 +4796,24 @@ fn open_dir(root: PathBuf) -> (String, Option<PathBuf>, Option<FileTree>) {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_line_suffix;
+    use super::split_file_target;
 
     // A file guaranteed to exist when tests run.
     const REAL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
 
     #[test]
-    fn strips_line_and_col_from_existing_file() {
-        assert_eq!(strip_line_suffix(&format!("{REAL}:82")), REAL);
-        assert_eq!(strip_line_suffix(&format!("{REAL}:82:5")), REAL);
-        assert_eq!(strip_line_suffix(&format!("file://{REAL}:82")), REAL);
+    fn splits_line_and_col_from_existing_file() {
+        assert_eq!(split_file_target(&format!("{REAL}:82")), Some((REAL, ":82")));
+        assert_eq!(split_file_target(&format!("{REAL}:82:5")), Some((REAL, ":82:5")));
+        assert_eq!(split_file_target(&format!("file://{REAL}:82")), Some((REAL, ":82")));
+        assert_eq!(split_file_target(REAL), Some((REAL, "")));
     }
 
     #[test]
-    fn leaves_everything_else_alone() {
-        assert_eq!(strip_line_suffix(REAL), REAL);
-        assert_eq!(strip_line_suffix("http://host:8080/x"), "http://host:8080/x");
-        assert_eq!(strip_line_suffix("/no/such/file.py:82"), "/no/such/file.py:82");
-        assert_eq!(strip_line_suffix(&format!("{REAL}:abc")), format!("{REAL}:abc"));
+    fn rejects_non_file_targets() {
+        assert_eq!(split_file_target("http://host:8080/x"), None);
+        assert_eq!(split_file_target("/no/such/file.py:82"), None);
+        assert_eq!(split_file_target(&format!("{REAL}:abc")), None);
+        assert_eq!(split_file_target("#anchor"), None);
     }
 }
